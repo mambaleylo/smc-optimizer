@@ -35,6 +35,10 @@ SMC Optimizer v1.3
   /chart_monitor_status. На фронте — кнопка "🔔 Алерты" в баре графика и
   автообновление графика раз в ТФ (loadChart(true) по таймеру, с сохранением
   позиции/масштаба просмотра по времени свечи, а не по индексу).
+- v1.8: (1) удалено поле "Риск на сделку" из UI (осталось в HTML с прошлой
+  версии); (2) фикс приоритета малого числа сделок — добавлен trade_factor =
+  log(trades+1) * min(trades/20, 1.0): при <20 сделок fitness режется
+  пропорционально, конфиг с 18 сделками больше не обгоняет конфиг с 97.
 - v1.7: смягчён RR-фильтр. Жёсткий запрет tp<sl убран — он перекашивал
   оптимизатор в сторону огромных TP с малым числом сделок. Оставлен только
   мягкий rr_bonus = sqrt(clamp(tp/sl, 0.7, 2.5)) — штрафует плохой RR
@@ -76,7 +80,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "1.7"
+APP_VERSION  = "1.8"
 GATE_API     = "https://fx-api.gateio.ws/api/v4"
 PORT         = 8765
 GH_REPO      = os.environ.get("GH_REPO", "mambaleylo/smc-optimizer")
@@ -497,8 +501,10 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
     }
     # Fitness: WR × PF × log(trades) / (1+max_dd) — штраф за просадку
     rr_ratio = tp_pct / sl_pct if sl_pct > 0 else 1.0
-    rr_bonus = math.sqrt(min(max(rr_ratio, 0.7), 2.5))  # мягкий бонус, без жёсткого запрета
-    fitness = (wr * min(pf,5.0) * math.log(len(trades)+1) * rr_bonus) / (1 + max_dd)
+    rr_bonus = math.sqrt(min(max(rr_ratio, 0.7), 2.5))  # мягкий бонус за RR
+    # Штраф за малое число сделок: при <20 сделках fitness режется сильнее
+    trade_factor = math.log(len(trades) + 1) * min(len(trades) / 20.0, 1.0)
+    fitness = (wr * min(pf, 5.0) * trade_factor * rr_bonus) / (1 + max_dd)
     result["fitness"] = round(fitness, 6)
     result["rr"] = round(tp_pct / sl_pct if sl_pct > 0 else 1.0, 2)
 
@@ -906,7 +912,6 @@ input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;p
     <label>Дней истории</label><input id="days" type="number" value="30" min="7" max="365">
     <label>SL %</label><input id="sl_pct" type="number" value="0.6" step="0.05">
     <label>TP %</label><input id="tp_pct" type="number" value="1.2" step="0.05">
-    <label>Риск на сделку %</label><input id="risk_pct" type="number" value="2.0" step="0.5">
   </div>
   <div class="card">
     <h3>Лучший конфиг</h3>
