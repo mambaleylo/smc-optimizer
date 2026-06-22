@@ -608,7 +608,7 @@ def run_optimizer():
     with opt_lock: opt_state["running"] = False
 
 # ─── HTTP сервер ─────────────────────────────────────────────────────────────
-HTML = r"""<!DOCTYPE html><html lang="ru"><head>
+HTML = """<!DOCTYPE html><html lang="ru"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>SMC Optimizer</title>
 <style>
@@ -621,37 +621,32 @@ body{background:#0d0d0d;color:#e0e0e0;font-family:'JetBrains Mono',monospace,san
 .btn-go{background:#1a8f4a;color:#fff}.btn-go:hover{background:#22b85e}
 .btn-stop{background:#8f1a1a;color:#fff}.btn-stop:hover{background:#b82222}
 .btn-sm{background:#222;color:#aaa;padding:4px 10px;font-size:11px}
-.body{display:grid;grid-template-columns:320px 1fr;gap:0;height:calc(100vh - 45px)}
+.tabs{display:flex;gap:4px;padding:0 12px;background:#111;border-bottom:1px solid #222}
+.tab{padding:7px 16px;font-size:12px;cursor:pointer;color:#666;border-bottom:2px solid transparent;background:none;border:none}
+.tab.active{color:#f0b800;border-bottom:2px solid #f0b800}
+.tab-panel{display:none}.tab-panel.active{display:block}
+.body{display:grid;grid-template-columns:320px 1fr;gap:0;height:calc(100vh - 80px)}
 @media(max-width:700px){.body{grid-template-columns:1fr;height:auto}}
 .sidebar{background:#111;border-right:1px solid #1e1e1e;padding:10px;overflow-y:auto;height:100%}
 .main{padding:10px;overflow-y:auto;height:100%}
 .card{background:#161616;border:1px solid #222;border-radius:6px;padding:10px;margin-bottom:8px}
 .card h3{color:#f0b800;font-size:12px;margin-bottom:6px}
 label{display:block;color:#888;font-size:11px;margin-bottom:2px}
-input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;
-  padding:5px 7px;border-radius:4px;font-size:12px;margin-bottom:6px}
+input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;padding:5px 7px;border-radius:4px;font-size:12px;margin-bottom:6px}
 .stat-row{display:flex;justify-content:space-between;padding:2px 0;font-size:12px}
 .stat-label{color:#666}.stat-val{color:#e0e0e0;font-weight:600}
-.green{color:#0f9} .red{color:#f45} .yellow{color:#f0b800}
-.log-box{background:#0a0a0a;border:1px solid #1e1e1e;border-radius:4px;
-  height:200px;overflow-y:auto;padding:6px;font-size:11px;font-family:monospace}
+.green{color:#0f9}.red{color:#f45}.yellow{color:#f0b800}
+.log-box{background:#0a0a0a;border:1px solid #1e1e1e;border-radius:4px;height:200px;overflow-y:auto;padding:6px;font-size:11px;font-family:monospace}
 .log-line{padding:1px 0;border-bottom:1px solid #111}
 .prog-bar{background:#1e1e1e;border-radius:3px;height:6px;margin:6px 0}
 .prog-fill{background:#f0b800;height:6px;border-radius:3px;transition:width .3s}
-.top20-row{display:grid;grid-template-columns:24px 1fr 1fr 1fr 1fr 1fr;gap:4px;
-  padding:3px 0;border-bottom:1px solid #1a1a1a;font-size:11px;align-items:center}
-.top20-row:first-child{color:#555;font-size:10px}
+.top20-row{display:grid;grid-template-columns:24px 1fr 1fr 1fr 1fr 1fr;gap:4px;padding:3px 0;border-bottom:1px solid #1a1a1a;font-size:11px;align-items:center}
 .badge{display:inline-block;padding:1px 5px;border-radius:3px;font-size:10px;margin-right:3px}
-.badge-bull{background:#0a2a1a;color:#0f9}
-.badge-bear{background:#2a0a0a;color:#f45}
-.tabs{display:flex;gap:4px;padding:0 12px;background:#111;border-bottom:1px solid #222}
-.tab{padding:7px 16px;font-size:12px;cursor:pointer;color:#666;border-bottom:2px solid transparent;background:none;border-top:none;border-left:none;border-right:none}
-.tab.active{color:#f0b800;border-bottom-color:#f0b800}
-.tab-panel{display:none}.tab-panel.active{display:block}
+.badge-bull{background:#0a2a1a;color:#0f9}.badge-bear{background:#2a0a0a;color:#f45}
 #chartPanel{padding:10px}
 .chart-bar{display:flex;flex-wrap:wrap;gap:8px;align-items:flex-end;padding-bottom:10px}
 .chart-bar label{display:flex;flex-direction:column;font-size:11px;color:#888;gap:2px}
-.chart-bar input,.chart-bar select{background:#0d0d0d;border:1px solid #333;color:#e0e0e0;padding:4px 7px;border-radius:4px;font-size:12px;width:90px}
+.chart-bar input,.chart-bar select{background:#0d0d0d;border:1px solid #333;color:#e0e0e0;padding:4px 7px;border-radius:4px;font-size:12px;width:90px;margin-bottom:0}
 .chart-legend{display:flex;flex-wrap:wrap;gap:10px;padding:4px 0 8px;font-size:11px;color:#888}
 .chart-legend span{display:flex;align-items:center;gap:4px}
 .chart-legend i{display:inline-block;width:14px;height:6px;border-radius:2px}
@@ -662,21 +657,21 @@ input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;
 #chartStatus{font-size:11px;color:#555;padding:4px 0}
 </style></head><body>
 <div class="topbar">
-  <h1>⚡ SMC Optimizer</h1>
+  <h1>&#9889; SMC Optimizer</h1>
   <span class="ver" id="verBadge">v__VER__</span>
-  <button class="btn btn-go" id="btnStart" onclick="startOpt()">▶ Старт</button>
-  <button class="btn btn-stop" id="btnStop" onclick="stopOpt()" style="display:none">⏹ Стоп</button>
+  <button class="btn btn-go" id="btnStart" onclick="startOpt()">&#9654; Старт</button>
+  <button class="btn btn-stop" id="btnStop" onclick="stopOpt()" style="display:none">&#9632; Стоп</button>
   <span id="statusBadge" style="color:#555;font-size:11px">готов</span>
 </div>
 <div class="tabs">
-  <button class="tab active" onclick="switchTab('opt',this)">⚡ Оптимизатор</button>
-  <button class="tab" onclick="switchTab('chart',this)">📈 График</button>
+  <button class="tab active" onclick="switchTab('opt',this)">Оптимизатор</button>
+  <button class="tab" onclick="switchTab('chart',this)">График</button>
 </div>
 <div id="optPanel" class="tab-panel active">
 <div class="body">
 <div class="sidebar">
   <div class="card">
-    <h3>⚙ Параметры запуска</h3>
+    <h3>Параметры запуска</h3>
     <label>Символ</label><input id="sym" value="BTC_USDT">
     <label>Таймфрейм</label>
     <select id="tf">
@@ -689,11 +684,12 @@ input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;
     <label>Риск на сделку %</label><input id="risk_pct" type="number" value="2.0" step="0.5">
   </div>
   <div class="card">
-    <h3>📊 Лучший конфиг</h3>
+    <h3>Лучший конфиг</h3>
+    <button class="btn btn-go" style="width:100%;margin-bottom:8px;font-size:11px" onclick="applyBestToChart()">Открыть на графике</button>
     <div id="bestCard" style="color:#555;font-size:11px">—</div>
   </div>
   <div class="card">
-    <h3>📈 Прогресс</h3>
+    <h3>Прогресс</h3>
     <div class="prog-bar"><div class="prog-fill" id="progFill" style="width:0%"></div></div>
     <div class="stat-row"><span class="stat-label">Цикл</span><span class="stat-val" id="cycleVal">—</span></div>
     <div class="stat-row"><span class="stat-label">Попыток</span><span class="stat-val" id="trialsVal">—</span></div>
@@ -702,7 +698,7 @@ input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;
 </div>
 <div class="main">
   <div class="card">
-    <h3>🏆 Топ-20 конфигураций</h3>
+    <h3>Топ-20 конфигураций</h3>
     <div id="top20Container">
       <div class="top20-row">
         <span>#</span><span>WR%</span><span>PF</span><span>DD%</span>
@@ -726,322 +722,45 @@ input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;
     <label>TP%<input id="cTp" type="number" value="1.6" step="0.1" style="width:60px"></label>
     <button class="btn btn-go" onclick="loadChart()" style="align-self:flex-end">Загрузить</button>
   </div>
-  <div id="chartStatus">Нажмите «Загрузить»</div>
+  <div id="chartStatus">Нажмите Загрузить</div>
   <div class="chart-legend">
     <span><i style="background:#089981"></i>Long</span>
     <span><i style="background:#F23645"></i>Short</span>
     <span><i style="background:rgba(49,121,245,0.3);border:1px solid #3179f5"></i>Bull OB</span>
     <span><i style="background:rgba(247,124,128,0.3);border:1px solid #f77c80"></i>Bear OB</span>
-    <span><i style="background:rgba(0,255,104,0.2);border:1px solid #0f9"></i>Bull FVG</span>
-    <span><i style="background:rgba(255,0,8,0.15);border:1px solid #f45"></i>Bear FVG</span>
+    <span><i style="background:rgba(0,255,104,0.2);border:1px solid #0f9"></i>FVG Bull</span>
+    <span><i style="background:rgba(255,0,8,0.15);border:1px solid #f45"></i>FVG Bear</span>
   </div>
   <canvas id="chartCanvas"></canvas>
   <div id="chartMetrics"></div>
 </div>
 <script>
+var _bestParams = null;
+
 function switchTab(id, btn){
-  document.querySelectorAll('.tab-panel').forEach(p=>p.classList.remove('active'));
-  document.querySelectorAll('.tab').forEach(b=>b.classList.remove('active'));
+  document.querySelectorAll('.tab-panel').forEach(function(p){p.classList.remove('active');});
+  document.querySelectorAll('.tab').forEach(function(b){b.classList.remove('active');});
   document.getElementById(id+'Panel').classList.add('active');
   btn.classList.add('active');
 }
 
-// ─── Chart ────────────────────────────────────────────────────────────────
-let _cd=[], _sig=[], _obs_bull=[], _obs_bear=[], _fvg_bull=[], _fvg_bear=[], _piv_hi=[], _piv_lo=[];
-let _camStart=0, _camEnd=0, _drag=false, _dragX=0, _dragCam=0;
-const cv=document.getElementById('chartCanvas');
-const ctx=cv.getContext('2d');
-
-function cStatus(t){document.getElementById('chartStatus').textContent=t}
-
-function loadChart(){
-  const sym=document.getElementById('cSym').value.trim()||'BTC_USDT';
-  const tf=document.getElementById('cTf').value;
-  const days=document.getElementById('cDays').value;
-  const sw=document.getElementById('cSwing').value;
-  const sl=document.getElementById('cSl').value;
-  const tp=document.getElementById('cTp').value;
-  cStatus('Загружаем данные…');
-  fetch(`/chart_data?sym=${encodeURIComponent(sym)}&tf=${tf}&days=${days}&swing=${sw}&sl=${sl}&tp=${tp}`)
-    .then(r=>r.json()).then(d=>{
-      if(d.error){cStatus('Ошибка: '+d.error);return}
-      _cd=d.candles||[];
-      _sig=d.signals||[];
-      // Rebuild OB/FVG from signals context (server returns only signals; derive OBs client-side approximation)
-      _obs_bull=[]; _obs_bear=[]; _fvg_bull=[]; _fvg_bear=[]; _piv_hi=[]; _piv_lo=[];
-      rebuildIndicators(parseInt(sw));
-      _camStart=Math.max(0,_cd.length-120);
-      _camEnd=_cd.length-1;
-      drawChart();
-      renderCMetrics(d.metrics);
-      cStatus(_cd.length+' свечей · '+_sig.length+' сигналов');
-    }).catch(e=>cStatus('Ошибка: '+e));
+function applyBestToChart(){
+  if(!_bestParams) return;
+  var p = _bestParams;
+  document.getElementById('cSym').value  = document.getElementById('sym').value;
+  document.getElementById('cTf').value   = document.getElementById('tf').value;
+  document.getElementById('cSwing').value = p.swing_len || 10;
+  document.getElementById('cSl').value   = p.sl_pct || 0.8;
+  document.getElementById('cTp').value   = p.tp_pct || 1.6;
+  switchTab('chart', document.querySelectorAll('.tab')[1]);
+  loadChart();
 }
 
-function atrArr(candles,period){
-  const r=new Array(candles.length).fill(null);
-  const trs=[];
-  for(let i=1;i<candles.length;i++){
-    const h=candles[i].h,l=candles[i].l,pc=candles[i-1].c;
-    trs.push(Math.max(h-l,Math.abs(h-pc),Math.abs(l-pc)));
-  }
-  if(trs.length<period)return r;
-  let s=trs.slice(0,period).reduce((a,b)=>a+b,0)/period;
-  r[period]=s;
-  for(let i=period+1;i<candles.length;i++){s=(s*(period-1)+trs[i-1])/period;r[i]=s;}
-  return r;
-}
+/* ── Optimizer polling ── */
+var polling=null, lastLogTotal=0, logsDropped=0;
 
-function rebuildIndicators(swLen){
-  const n=_cd.length;
-  const atr=atrArr(_cd,200);
-  // Pivot highs/lows
-  for(let i=swLen;i<n-swLen;i++){
-    const h=_cd[i].h;
-    let ok=true;
-    for(let j=i-swLen;j<i;j++)if(_cd[j].h>=h){ok=false;break}
-    if(ok)for(let j=i+1;j<=i+swLen;j++)if(_cd[j].h>=h){ok=false;break}
-    if(ok)_piv_hi.push({i,p:h});
-  }
-  for(let i=swLen;i<n-swLen;i++){
-    const l=_cd[i].l;
-    let ok=true;
-    for(let j=i-swLen;j<i;j++)if(_cd[j].l<=l){ok=false;break}
-    if(ok)for(let j=i+1;j<=i+swLen;j++)if(_cd[j].l<=l){ok=false;break}
-    if(ok)_piv_lo.push({i,p:l});
-  }
-  // Order blocks
-  _piv_hi.forEach(ph=>{
-    let j=ph.i-1;
-    while(j>Math.max(0,ph.i-swLen)){
-      const ci=_cd[j],a=atr[j]||0.001;
-      if(ci.c>ci.o&&(ci.h-ci.l)>=0.5*a){_obs_bear.push({i:j,hi:ci.h,lo:ci.l});break}
-      j--;
-    }
-  });
-  _piv_lo.forEach(pl=>{
-    let j=pl.i-1;
-    while(j>Math.max(0,pl.i-swLen)){
-      const ci=_cd[j],a=atr[j]||0.001;
-      if(ci.c<ci.o&&(ci.h-ci.l)>=0.5*a){_obs_bull.push({i:j,hi:ci.h,lo:ci.l});break}
-      j--;
-    }
-  });
-  // FVG
-  for(let i=2;i<n;i++){
-    const a=atr[i]||0.001;
-    if(_cd[i].l-_cd[i-2].h>0.1*a)_fvg_bull.push({i,lo:_cd[i-2].h,hi:_cd[i].l});
-    if(_cd[i-2].l-_cd[i].h>0.1*a)_fvg_bear.push({i,lo:_cd[i].h,hi:_cd[i-2].l});
-  }
-}
-
-function drawChart(){
-  if(!_cd.length)return;
-  const dpr=window.devicePixelRatio||1;
-  const W=cv.parentElement.clientWidth-20;
-  const H=420;
-  cv.width=W*dpr;cv.height=H*dpr;
-  cv.style.width=W+'px';cv.style.height=H+'px';
-  ctx.scale(dpr,dpr);
-
-  const s=Math.max(0,Math.floor(_camStart));
-  const e=Math.min(_cd.length-1,Math.floor(_camEnd));
-  const vis=_cd.slice(s,e+1);
-  if(!vis.length)return;
-
-  const PAD={l:62,r:8,t:12,b:28};
-  const cW=W-PAD.l-PAD.r;
-  const cH=H-PAD.t-PAD.b;
-  const barW=cW/vis.length;
-  const candleW=Math.max(1,barW*0.65);
-
-  let mn=Infinity,mx=-Infinity;
-  vis.forEach(c=>{if(c.l<mn)mn=c.l;if(c.h>mx)mx=c.h;});
-  _sig.forEach(sg=>{
-    if(sg.entry_i>=s&&sg.entry_i<=e){
-      if(sg.tp<mn)mn=sg.tp;if(sg.tp>mx)mx=sg.tp;
-      if(sg.sl<mn)mn=sg.sl;if(sg.sl>mx)mx=sg.sl;
-    }
-  });
-  const rng=mx-mn||1, pad=rng*0.06;
-  mn-=pad;mx+=pad;
-
-  const toY=p=>PAD.t+cH*(1-(p-mn)/(mx-mn));
-  const toX=i=>PAD.l+(i-s+0.5)*barW;
-
-  ctx.fillStyle='#0a0a0a';ctx.fillRect(0,0,W,H);
-
-  // grid
-  ctx.strokeStyle='rgba(255,255,255,0.05)';ctx.lineWidth=0.5;
-  for(let g=0;g<=5;g++){
-    const p=mn+(mx-mn)*g/5,y=toY(p);
-    ctx.beginPath();ctx.moveTo(PAD.l,y);ctx.lineTo(W-PAD.r,y);ctx.stroke();
-    ctx.fillStyle='rgba(160,160,160,0.45)';ctx.font='10px monospace';ctx.textAlign='right';
-    const pFmt=p>1000?p.toFixed(1):p>10?p.toFixed(2):p.toFixed(4);
-    ctx.fillText(pFmt,PAD.l-3,y+3);
-  }
-
-  // FVGs
-  _fvg_bull.filter(f=>f.i>=s&&f.i<=e).forEach(f=>{
-    ctx.fillStyle='rgba(0,255,104,0.1)';
-    ctx.strokeStyle='rgba(0,255,104,0.3)';ctx.lineWidth=0.5;
-    const y1=toY(f.hi),y2=toY(f.lo);
-    ctx.fillRect(PAD.l,y1,cW,y2-y1);
-    ctx.strokeRect(PAD.l,y1,cW,y2-y1);
-  });
-  _fvg_bear.filter(f=>f.i>=s&&f.i<=e).forEach(f=>{
-    ctx.fillStyle='rgba(255,0,8,0.08)';
-    ctx.strokeStyle='rgba(255,0,8,0.25)';ctx.lineWidth=0.5;
-    const y1=toY(f.hi),y2=toY(f.lo);
-    ctx.fillRect(PAD.l,y1,cW,y2-y1);
-    ctx.strokeRect(PAD.l,y1,cW,y2-y1);
-  });
-
-  // OBs — extend right from their bar
-  _obs_bull.filter(o=>o.i>=s&&o.i<=e).forEach(o=>{
-    const x=toX(o.i);
-    ctx.fillStyle='rgba(49,121,245,0.18)';
-    ctx.strokeStyle='rgba(49,121,245,0.5)';ctx.lineWidth=0.8;
-    const y1=toY(o.hi),y2=toY(o.lo);
-    ctx.fillRect(x,y1,W-PAD.r-x,y2-y1);
-    ctx.strokeRect(x,y1,W-PAD.r-x,y2-y1);
-    ctx.fillStyle='rgba(49,121,245,0.6)';ctx.font='9px monospace';ctx.textAlign='left';
-    ctx.fillText('Bull OB',x+2,y1+9);
-  });
-  _obs_bear.filter(o=>o.i>=s&&o.i<=e).forEach(o=>{
-    const x=toX(o.i);
-    ctx.fillStyle='rgba(247,124,128,0.18)';
-    ctx.strokeStyle='rgba(247,124,128,0.5)';ctx.lineWidth=0.8;
-    const y1=toY(o.hi),y2=toY(o.lo);
-    ctx.fillRect(x,y1,W-PAD.r-x,y2-y1);
-    ctx.strokeRect(x,y1,W-PAD.r-x,y2-y1);
-    ctx.fillStyle='rgba(247,124,128,0.6)';ctx.font='9px monospace';ctx.textAlign='left';
-    ctx.fillText('Bear OB',x+2,y1+9);
-  });
-
-  // Pivot markers
-  _piv_hi.filter(p=>p.i>=s&&p.i<=e).forEach(p=>{
-    const x=toX(p.i),y=toY(p.p);
-    ctx.fillStyle='rgba(242,54,69,0.65)';ctx.font='8px monospace';ctx.textAlign='center';
-    ctx.fillText('▼SH',x,y-4);
-  });
-  _piv_lo.filter(p=>p.i>=s&&p.i<=e).forEach(p=>{
-    const x=toX(p.i),y=toY(p.p);
-    ctx.fillStyle='rgba(8,153,129,0.65)';ctx.font='8px monospace';ctx.textAlign='center';
-    ctx.fillText('▲SL',x,y+11);
-  });
-
-  // Candles
-  vis.forEach((c,idx)=>{
-    const xi=s+idx,x=toX(xi);
-    const bull=c.c>=c.o;
-    const clr=bull?'#089981':'#F23645';
-    ctx.strokeStyle=clr;ctx.lineWidth=1;
-    ctx.beginPath();ctx.moveTo(x,toY(c.h));ctx.lineTo(x,toY(c.l));ctx.stroke();
-    ctx.fillStyle=bull?'#089981':'#F23645';
-    const y1=toY(Math.max(c.o,c.c));
-    const y2=toY(Math.min(c.o,c.c));
-    ctx.fillRect(x-candleW/2,y1,candleW,Math.max(1,y2-y1));
-  });
-
-  // Signals
-  _sig.forEach(sg=>{
-    if(sg.entry_i<s||sg.entry_i>e)return;
-    const xe=toX(sg.entry_i);
-    const xe2=sg.exit_i!==undefined&&sg.exit_i<=e?toX(sg.exit_i):W-PAD.r;
-    const ye=toY(sg.entry);
-    const yt=toY(sg.tp);
-    const ys=toY(sg.sl);
-    const isLong=sg.dir==='long';
-
-    // TP/SL zone fill
-    ctx.fillStyle=isLong?'rgba(8,153,129,0.07)':'rgba(242,54,69,0.07)';
-    ctx.fillRect(xe,Math.min(yt,ys),Math.max(0,xe2-xe),Math.abs(yt-ys));
-
-    // TP line
-    ctx.strokeStyle='rgba(8,153,129,0.55)';ctx.lineWidth=1;ctx.setLineDash([4,3]);
-    ctx.beginPath();ctx.moveTo(xe,yt);ctx.lineTo(xe2,yt);ctx.stroke();
-    // SL line
-    ctx.strokeStyle='rgba(242,54,69,0.55)';
-    ctx.beginPath();ctx.moveTo(xe,ys);ctx.lineTo(xe2,ys);ctx.stroke();
-    ctx.setLineDash([]);
-
-    // Exit dot
-    if(sg.exit_i!==undefined&&sg.exit_i>=s&&sg.exit_i<=e){
-      const xr=toX(sg.exit_i);
-      ctx.fillStyle=sg.win?'rgba(8,153,129,0.8)':'rgba(242,54,69,0.8)';
-      ctx.beginPath();ctx.arc(xr,toY(sg.win?sg.tp:sg.sl),4,0,Math.PI*2);ctx.fill();
-    }
-
-    // Entry arrow
-    const clr=isLong?'#089981':'#F23645';
-    ctx.fillStyle=clr;
-    ctx.beginPath();
-    if(isLong){ctx.moveTo(xe-5,ye+9);ctx.lineTo(xe+5,ye+9);ctx.lineTo(xe,ye+1);}
-    else{ctx.moveTo(xe-5,ye-9);ctx.lineTo(xe+5,ye-9);ctx.lineTo(xe,ye-1);}
-    ctx.fill();
-
-    // Price labels
-    ctx.fillStyle='rgba(180,180,180,0.7)';ctx.font='9px monospace';ctx.textAlign='left';
-    const fmt=v=>v>100?v.toFixed(1):v.toFixed(4);
-    ctx.fillText('TP '+fmt(sg.tp),xe+4,yt-2);
-    ctx.fillText('SL '+fmt(sg.sl),xe+4,ys+9);
-  });
-
-  // Time axis
-  ctx.fillStyle='rgba(140,140,140,0.4)';ctx.font='9px monospace';ctx.textAlign='center';
-  const every=Math.ceil(vis.length/8);
-  vis.forEach((c,idx)=>{
-    if(idx%every===0){
-      const x=toX(s+idx);
-      const d=new Date(c.t*1000);
-      ctx.fillText((d.getMonth()+1)+'/'+(d.getDate()),x,H-PAD.b+10);
-      ctx.fillText(d.getHours().toString().padStart(2,'0')+':'+d.getMinutes().toString().padStart(2,'0'),x,H-PAD.b+20);
-    }
-  });
-}
-
-function renderCMetrics(m){
-  if(!m)return;
-  const items=[
-    {l:'Сделок',v:m.trades},
-    {l:'WinRate',v:m.winrate+'%'},
-    {l:'Profit Factor',v:m.profit_factor},
-    {l:'Max DD',v:m.max_dd+'%'},
-    {l:'Return',v:m.total_return+'%'},
-    {l:'Fitness',v:m.fitness},
-  ];
-  document.getElementById('chartMetrics').innerHTML=items.map(i=>`<div class="cm"><div class="cl">${i.l}</div><div class="cv">${i.v}</div></div>`).join('');
-}
-
-// Pan & zoom
-cv.addEventListener('mousedown',e=>{_drag=true;_dragX=e.clientX;_dragCam=_camStart;cv.style.cursor='grabbing';});
-document.addEventListener('mouseup',()=>{_drag=false;cv.style.cursor='grab';});
-document.addEventListener('mousemove',e=>{
-  if(!_drag||!_cd.length)return;
-  const W=cv.parentElement.clientWidth-20;
-  const vis=_camEnd-_camStart;
-  const dx=(e.clientX-_dragX)/W*vis;
-  _camStart=Math.max(0,Math.min(_cd.length-vis-1,_dragCam-dx));
-  _camEnd=_camStart+vis;
-  drawChart();
-});
-cv.addEventListener('wheel',e=>{
-  e.preventDefault();
-  if(!_cd.length)return;
-  const z=e.deltaY>0?1.15:0.87;
-  const vis=_camEnd-_camStart;
-  const nv=Math.min(_cd.length,Math.max(20,Math.round(vis*z)));
-  const center=(_camStart+_camEnd)/2;
-  _camStart=Math.max(0,Math.round(center-nv/2));
-  _camEnd=Math.min(_cd.length-1,_camStart+nv);
-  drawChart();
-},{passive:false});
-window.addEventListener('resize',drawChart);
-</script>
-<script>
 function startOpt(){
-  const body={
+  var body={
     symbol:document.getElementById('sym').value,
     tf:document.getElementById('tf').value,
     days:parseInt(document.getElementById('days').value),
@@ -1050,7 +769,7 @@ function startOpt(){
     risk_pct:parseFloat(document.getElementById('risk_pct').value),
   };
   fetch('/scan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
-    .then(()=>{
+    .then(function(){
       document.getElementById('btnStart').style.display='none';
       document.getElementById('btnStop').style.display='';
       document.getElementById('statusBadge').textContent='работает...';
@@ -1058,7 +777,7 @@ function startOpt(){
     });
 }
 function stopOpt(){
-  fetch('/scan_stop',{method:'POST'}).then(()=>{
+  fetch('/scan_stop',{method:'POST'}).then(function(){
     document.getElementById('btnStop').style.display='none';
     document.getElementById('btnStart').style.display='';
     document.getElementById('statusBadge').textContent='останавливается...';
@@ -1066,78 +785,72 @@ function stopOpt(){
 }
 function scheduleNext(){ polling=setTimeout(poll, 1500); }
 function poll(){
-  fetch('/opt_status').then(r=>r.json()).then(d=>{
-    // Логи
+  fetch('/opt_status').then(function(r){return r.json();}).then(function(d){
     logsDropped = d.logs_dropped||0;
-    const totalNow = logsDropped + (d.logs||[]).length;
-    const newFrom = Math.max(0, lastLogTotal - logsDropped);
-    const newLogs = (d.logs||[]).slice(newFrom);
-    const lb = document.getElementById('logBox');
-    newLogs.forEach(l=>{
-      const div=document.createElement('div');
+    var totalNow = logsDropped + (d.logs||[]).length;
+    var newFrom = Math.max(0, lastLogTotal - logsDropped);
+    var newLogs = (d.logs||[]).slice(newFrom);
+    var lb = document.getElementById('logBox');
+    newLogs.forEach(function(l){
+      var div=document.createElement('div');
       div.className='log-line';
-      div.innerHTML=`<span style="color:#555">[${l.ts}]</span> ${l.msg}`;
+      div.innerHTML='<span style="color:#555">['+l.ts+']</span> '+l.msg;
       lb.appendChild(div);
     });
     if(newLogs.length) lb.scrollTop=lb.scrollHeight;
     lastLogTotal=totalNow;
 
-    // Прогресс
     document.getElementById('progFill').style.width=(d.progress||0)+'%';
     document.getElementById('cycleVal').textContent=d.cycle||'—';
     document.getElementById('trialsVal').textContent=(d.trials||0).toLocaleString();
 
-    // Статус
     if(!d.running){
       document.getElementById('btnStop').style.display='none';
       document.getElementById('btnStart').style.display='';
       document.getElementById('statusBadge').textContent='завершено';
     } else scheduleNext();
 
-    // Лучший
     if(d.best){
-      const r=d.best.result, p=d.best.params;
-      const wrC=r.winrate>=55?'green':r.winrate>=45?'yellow':'red';
-      document.getElementById('bestCard').innerHTML=`
-        <div class="stat-row"><span class="stat-label">Winrate</span><span class="stat-val ${wrC}">${r.winrate}%</span></div>
-        <div class="stat-row"><span class="stat-label">Profit Factor</span><span class="stat-val">${r.profit_factor}</span></div>
-        <div class="stat-row"><span class="stat-label">Max DD</span><span class="stat-val red">${r.max_dd}%</span></div>
-        <div class="stat-row"><span class="stat-label">Сделок</span><span class="stat-val">${r.trades}</span></div>
-        <div class="stat-row"><span class="stat-label">Доходность</span><span class="stat-val ${r.total_return>=0?'green':'red'}">${r.total_return}%</span></div>
-        <div class="stat-row"><span class="stat-label">Fitness</span><span class="stat-val yellow">${r.fitness}</span></div>
-        <hr style="border-color:#222;margin:5px 0">
-        <div class="stat-row"><span class="stat-label">SL / TP</span><span class="stat-val">${p.sl_pct}% / ${p.tp_pct}%</span></div>
-        <div class="stat-row"><span class="stat-label">Swing len</span><span class="stat-val">${p.swing_len}</span></div>
-        <div class="stat-row"><span class="stat-label">Internal len</span><span class="stat-val">${p.internal_len}</span></div>
-        <div class="stat-row"><span class="stat-label">OB filter</span><span class="stat-val">${p.ob_filter}</span></div>
-        <div class="stat-row"><span class="stat-label">OB mitigation</span><span class="stat-val">${p.ob_mitigation}</span></div>
-        <div class="stat-row"><span class="stat-label">FVG</span><span class="stat-val">${p.fvg_enabled?'вкл':'выкл'}</span></div>
-        <div class="stat-row"><span class="stat-label">CHoCH only</span><span class="stat-val">${p.choch_only?'да':'нет'}</span></div>
-      `;
+      var r=d.best.result, p=d.best.params;
+      _bestParams = p;
+      var wrC=r.winrate>=55?'green':r.winrate>=45?'yellow':'red';
+      document.getElementById('bestCard').innerHTML=
+        '<div class="stat-row"><span class="stat-label">Winrate</span><span class="stat-val '+wrC+'">'+r.winrate+'%</span></div>'+
+        '<div class="stat-row"><span class="stat-label">Profit Factor</span><span class="stat-val">'+r.profit_factor+'</span></div>'+
+        '<div class="stat-row"><span class="stat-label">Max DD</span><span class="stat-val red">'+r.max_dd+'%</span></div>'+
+        '<div class="stat-row"><span class="stat-label">Сделок</span><span class="stat-val">'+r.trades+'</span></div>'+
+        '<div class="stat-row"><span class="stat-label">Доходность</span><span class="stat-val '+(r.total_return>=0?'green':'red')+'">'+r.total_return+'%</span></div>'+
+        '<div class="stat-row"><span class="stat-label">Fitness</span><span class="stat-val yellow">'+r.fitness+'</span></div>'+
+        '<hr style="border-color:#222;margin:5px 0">'+
+        '<div class="stat-row"><span class="stat-label">SL / TP</span><span class="stat-val">'+p.sl_pct+'% / '+p.tp_pct+'%</span></div>'+
+        '<div class="stat-row"><span class="stat-label">Swing len</span><span class="stat-val">'+p.swing_len+'</span></div>'+
+        '<div class="stat-row"><span class="stat-label">Internal len</span><span class="stat-val">'+p.internal_len+'</span></div>'+
+        '<div class="stat-row"><span class="stat-label">OB filter</span><span class="stat-val">'+p.ob_filter+'</span></div>'+
+        '<div class="stat-row"><span class="stat-label">OB mitigation</span><span class="stat-val">'+p.ob_mitigation+'</span></div>'+
+        '<div class="stat-row"><span class="stat-label">FVG</span><span class="stat-val">'+(p.fvg_enabled?'вкл':'выкл')+'</span></div>'+
+        '<div class="stat-row"><span class="stat-label">CHoCH only</span><span class="stat-val">'+(p.choch_only?'да':'нет')+'</span></div>';
     }
 
-    // Топ-20
-    const top=(d.top20||[]);
+    var top=(d.top20||[]);
     if(top.length){
-      let html='<div class="top20-row"><span>#</span><span>WR%</span><span>PF</span><span>DD%</span><span>T</span><span>SL/TP/swing</span></div>';
-      top.forEach((e,i)=>{
-        const r=e.result,p=e.params;
-        const wrC=r.winrate>=55?'green':r.winrate>=45?'yellow':'red';
-        html+=`<div class="top20-row">
-          <span style="color:#555">${i+1}</span>
-          <span class="${wrC}">${r.winrate}%</span>
-          <span>${r.profit_factor}</span>
-          <span class="red">${r.max_dd}%</span>
-          <span>${r.trades}</span>
-          <span style="color:#888">${p.sl_pct}/${p.tp_pct}/${p.swing_len}</span>
-        </div>`;
+      var html='<div class="top20-row"><span>#</span><span>WR%</span><span>PF</span><span>DD%</span><span>T</span><span>SL/TP/swing</span></div>';
+      top.forEach(function(e,i){
+        var r=e.result,p=e.params;
+        var wrC=r.winrate>=55?'green':r.winrate>=45?'yellow':'red';
+        html+='<div class="top20-row">'+
+          '<span style="color:#555">'+(i+1)+'</span>'+
+          '<span class="'+wrC+'">'+r.winrate+'%</span>'+
+          '<span>'+r.profit_factor+'</span>'+
+          '<span class="red">'+r.max_dd+'%</span>'+
+          '<span>'+r.trades+'</span>'+
+          '<span style="color:#888">'+p.sl_pct+'/'+p.tp_pct+'/'+p.swing_len+'</span>'+
+        '</div>';
       });
       document.getElementById('top20Container').innerHTML=html;
     }
-  }).catch(()=>scheduleNext());
+  }).catch(function(){scheduleNext();});
 }
-// Автостарт поллинга если уже работает
-fetch('/opt_status').then(r=>r.json()).then(d=>{
+fetch('/opt_status').then(function(r){return r.json();}).then(function(d){
   if(d.running){
     document.getElementById('btnStart').style.display='none';
     document.getElementById('btnStop').style.display='';
@@ -1145,6 +858,242 @@ fetch('/opt_status').then(r=>r.json()).then(d=>{
     scheduleNext();
   }
 });
+
+/* ── Chart ── */
+var _cd=[], _sig=[], _obs_bull=[], _obs_bear=[], _fvg_bull=[], _fvg_bear=[], _piv_hi=[], _piv_lo=[];
+var _camStart=0, _camEnd=0, _drag=false, _dragX=0, _dragCam=0;
+var cv=document.getElementById('chartCanvas');
+var ctx2=cv.getContext('2d');
+
+function cStatus(t){document.getElementById('chartStatus').textContent=t;}
+
+function loadChart(){
+  var sym=document.getElementById('cSym').value.trim()||'BTC_USDT';
+  var tf=document.getElementById('cTf').value;
+  var days=document.getElementById('cDays').value;
+  var sw=document.getElementById('cSwing').value;
+  var sl=document.getElementById('cSl').value;
+  var tp=document.getElementById('cTp').value;
+  cStatus('Загружаем данные...');
+  fetch('/chart_data?sym='+encodeURIComponent(sym)+'&tf='+tf+'&days='+days+'&swing='+sw+'&sl='+sl+'&tp='+tp)
+    .then(function(r){return r.json();}).then(function(d){
+      if(d.error){cStatus('Ошибка: '+d.error);return;}
+      _cd=d.candles||[];
+      _sig=d.signals||[];
+      _obs_bull=[];_obs_bear=[];_fvg_bull=[];_fvg_bear=[];_piv_hi=[];_piv_lo=[];
+      rebuildInd(parseInt(sw));
+      _camStart=Math.max(0,_cd.length-120);
+      _camEnd=_cd.length-1;
+      drawChart();
+      renderCM(d.metrics);
+      cStatus(_cd.length+' свечей, '+_sig.length+' сигналов');
+    }).catch(function(e){cStatus('Ошибка: '+e);});
+}
+
+function atrA(candles,period){
+  var r=new Array(candles.length).fill(null),trs=[];
+  for(var i=1;i<candles.length;i++){
+    var h=candles[i].h,l=candles[i].l,pc=candles[i-1].c;
+    trs.push(Math.max(h-l,Math.abs(h-pc),Math.abs(l-pc)));
+  }
+  if(trs.length<period)return r;
+  var s=trs.slice(0,period).reduce(function(a,b){return a+b;},0)/period;
+  r[period]=s;
+  for(var i=period+1;i<candles.length;i++){s=(s*(period-1)+trs[i-1])/period;r[i]=s;}
+  return r;
+}
+
+function rebuildInd(swLen){
+  var n=_cd.length, atr=atrA(_cd,200);
+  for(var i=swLen;i<n-swLen;i++){
+    var h=_cd[i].h,ok=true;
+    for(var j=i-swLen;j<i;j++)if(_cd[j].h>=h){ok=false;break;}
+    if(ok)for(var j=i+1;j<=i+swLen;j++)if(_cd[j].h>=h){ok=false;break;}
+    if(ok)_piv_hi.push({i:i,p:h});
+  }
+  for(var i=swLen;i<n-swLen;i++){
+    var l=_cd[i].l,ok=true;
+    for(var j=i-swLen;j<i;j++)if(_cd[j].l<=l){ok=false;break;}
+    if(ok)for(var j=i+1;j<=i+swLen;j++)if(_cd[j].l<=l){ok=false;break;}
+    if(ok)_piv_lo.push({i:i,p:l});
+  }
+  _piv_hi.forEach(function(ph){
+    var j=ph.i-1;
+    while(j>Math.max(0,ph.i-swLen)){
+      var ci=_cd[j],a=atr[j]||0.001;
+      if(ci.c>ci.o&&(ci.h-ci.l)>=0.5*a){_obs_bear.push({i:j,hi:ci.h,lo:ci.l});break;}
+      j--;
+    }
+  });
+  _piv_lo.forEach(function(pl){
+    var j=pl.i-1;
+    while(j>Math.max(0,pl.i-swLen)){
+      var ci=_cd[j],a=atr[j]||0.001;
+      if(ci.c<ci.o&&(ci.h-ci.l)>=0.5*a){_obs_bull.push({i:j,hi:ci.h,lo:ci.l});break;}
+      j--;
+    }
+  });
+  for(var i=2;i<n;i++){
+    var a=atr[i]||0.001;
+    if(_cd[i].l-_cd[i-2].h>0.1*a)_fvg_bull.push({i:i,lo:_cd[i-2].h,hi:_cd[i].l});
+    if(_cd[i-2].l-_cd[i].h>0.1*a)_fvg_bear.push({i:i,lo:_cd[i].h,hi:_cd[i-2].l});
+  }
+}
+
+function drawChart(){
+  if(!_cd.length)return;
+  var dpr=window.devicePixelRatio||1;
+  var W=cv.parentElement.clientWidth-20;
+  var H=420;
+  cv.width=W*dpr;cv.height=H*dpr;
+  cv.style.width=W+'px';cv.style.height=H+'px';
+  ctx2.scale(dpr,dpr);
+  var s=Math.max(0,Math.floor(_camStart));
+  var e=Math.min(_cd.length-1,Math.floor(_camEnd));
+  var vis=_cd.slice(s,e+1);
+  if(!vis.length)return;
+  var PAD={l:65,r:8,t:12,b:28};
+  var cW=W-PAD.l-PAD.r, cH=H-PAD.t-PAD.b;
+  var barW=cW/vis.length, candleW=Math.max(1,barW*0.65);
+  var mn=Infinity,mx=-Infinity;
+  vis.forEach(function(c){if(c.l<mn)mn=c.l;if(c.h>mx)mx=c.h;});
+  _sig.forEach(function(sg){
+    if(sg.entry_i>=s&&sg.entry_i<=e){
+      if(sg.tp<mn)mn=sg.tp;if(sg.tp>mx)mx=sg.tp;
+      if(sg.sl<mn)mn=sg.sl;if(sg.sl>mx)mx=sg.sl;
+    }
+  });
+  var rng=mx-mn||1, pad2=rng*0.06;
+  mn-=pad2;mx+=pad2;
+  function toY(p){return PAD.t+cH*(1-(p-mn)/(mx-mn));}
+  function toX(i){return PAD.l+(i-s+0.5)*barW;}
+  ctx2.fillStyle='#0a0a0a';ctx2.fillRect(0,0,W,H);
+  ctx2.strokeStyle='rgba(255,255,255,0.05)';ctx2.lineWidth=0.5;
+  for(var g=0;g<=5;g++){
+    var p=mn+(mx-mn)*g/5,y=toY(p);
+    ctx2.beginPath();ctx2.moveTo(PAD.l,y);ctx2.lineTo(W-PAD.r,y);ctx2.stroke();
+    ctx2.fillStyle='rgba(160,160,160,0.45)';ctx2.font='10px monospace';ctx2.textAlign='right';
+    ctx2.fillText(p>1000?p.toFixed(1):p>10?p.toFixed(2):p.toFixed(4),PAD.l-3,y+3);
+  }
+  _fvg_bull.filter(function(f){return f.i>=s&&f.i<=e;}).forEach(function(f){
+    ctx2.fillStyle='rgba(0,255,104,0.1)';ctx2.strokeStyle='rgba(0,255,104,0.3)';ctx2.lineWidth=0.5;
+    var y1=toY(f.hi),y2=toY(f.lo);ctx2.fillRect(PAD.l,y1,cW,y2-y1);ctx2.strokeRect(PAD.l,y1,cW,y2-y1);
+  });
+  _fvg_bear.filter(function(f){return f.i>=s&&f.i<=e;}).forEach(function(f){
+    ctx2.fillStyle='rgba(255,0,8,0.08)';ctx2.strokeStyle='rgba(255,0,8,0.25)';ctx2.lineWidth=0.5;
+    var y1=toY(f.hi),y2=toY(f.lo);ctx2.fillRect(PAD.l,y1,cW,y2-y1);ctx2.strokeRect(PAD.l,y1,cW,y2-y1);
+  });
+  _obs_bull.filter(function(o){return o.i>=s&&o.i<=e;}).forEach(function(o){
+    var x=toX(o.i);ctx2.fillStyle='rgba(49,121,245,0.18)';ctx2.strokeStyle='rgba(49,121,245,0.5)';ctx2.lineWidth=0.8;
+    var y1=toY(o.hi),y2=toY(o.lo);ctx2.fillRect(x,y1,W-PAD.r-x,y2-y1);ctx2.strokeRect(x,y1,W-PAD.r-x,y2-y1);
+    ctx2.fillStyle='rgba(49,121,245,0.6)';ctx2.font='9px monospace';ctx2.textAlign='left';ctx2.fillText('Bull OB',x+2,y1+9);
+  });
+  _obs_bear.filter(function(o){return o.i>=s&&o.i<=e;}).forEach(function(o){
+    var x=toX(o.i);ctx2.fillStyle='rgba(247,124,128,0.18)';ctx2.strokeStyle='rgba(247,124,128,0.5)';ctx2.lineWidth=0.8;
+    var y1=toY(o.hi),y2=toY(o.lo);ctx2.fillRect(x,y1,W-PAD.r-x,y2-y1);ctx2.strokeRect(x,y1,W-PAD.r-x,y2-y1);
+    ctx2.fillStyle='rgba(247,124,128,0.6)';ctx2.font='9px monospace';ctx2.textAlign='left';ctx2.fillText('Bear OB',x+2,y1+9);
+  });
+  _piv_hi.filter(function(p){return p.i>=s&&p.i<=e;}).forEach(function(p){
+    ctx2.fillStyle='rgba(242,54,69,0.65)';ctx2.font='8px monospace';ctx2.textAlign='center';
+    ctx2.fillText('SH',toX(p.i),toY(p.p)-4);
+  });
+  _piv_lo.filter(function(p){return p.i>=s&&p.i<=e;}).forEach(function(p){
+    ctx2.fillStyle='rgba(8,153,129,0.65)';ctx2.font='8px monospace';ctx2.textAlign='center';
+    ctx2.fillText('SL',toX(p.i),toY(p.p)+11);
+  });
+  vis.forEach(function(c,idx){
+    var xi=s+idx,x=toX(xi),bull=c.c>=c.o,clr=bull?'#089981':'#F23645';
+    ctx2.strokeStyle=clr;ctx2.lineWidth=1;
+    ctx2.beginPath();ctx2.moveTo(x,toY(c.h));ctx2.lineTo(x,toY(c.l));ctx2.stroke();
+    ctx2.fillStyle=clr;
+    var y1=toY(Math.max(c.o,c.c)),y2=toY(Math.min(c.o,c.c));
+    ctx2.fillRect(x-candleW/2,y1,candleW,Math.max(1,y2-y1));
+  });
+  _sig.forEach(function(sg){
+    if(sg.entry_i<s||sg.entry_i>e)return;
+    var xe=toX(sg.entry_i);
+    var xe2=(sg.exit_i!==undefined&&sg.exit_i<=e)?toX(sg.exit_i):W-PAD.r;
+    var ye=toY(sg.entry),yt=toY(sg.tp),ys=toY(sg.sl);
+    var isLong=sg.dir==='long';
+    ctx2.fillStyle=isLong?'rgba(8,153,129,0.07)':'rgba(242,54,69,0.07)';
+    ctx2.fillRect(xe,Math.min(yt,ys),Math.max(0,xe2-xe),Math.abs(yt-ys));
+    ctx2.strokeStyle='rgba(8,153,129,0.55)';ctx2.lineWidth=1;ctx2.setLineDash([4,3]);
+    ctx2.beginPath();ctx2.moveTo(xe,yt);ctx2.lineTo(xe2,yt);ctx2.stroke();
+    ctx2.strokeStyle='rgba(242,54,69,0.55)';
+    ctx2.beginPath();ctx2.moveTo(xe,ys);ctx2.lineTo(xe2,ys);ctx2.stroke();
+    ctx2.setLineDash([]);
+    if(sg.exit_i!==undefined&&sg.exit_i>=s&&sg.exit_i<=e){
+      ctx2.fillStyle=sg.win?'rgba(8,153,129,0.8)':'rgba(242,54,69,0.8)';
+      ctx2.beginPath();ctx2.arc(toX(sg.exit_i),toY(sg.win?sg.tp:sg.sl),4,0,Math.PI*2);ctx2.fill();
+    }
+    ctx2.fillStyle=isLong?'#089981':'#F23645';
+    ctx2.beginPath();
+    if(isLong){ctx2.moveTo(xe-5,ye+9);ctx2.lineTo(xe+5,ye+9);ctx2.lineTo(xe,ye+1);}
+    else{ctx2.moveTo(xe-5,ye-9);ctx2.lineTo(xe+5,ye-9);ctx2.lineTo(xe,ye-1);}
+    ctx2.fill();
+    ctx2.fillStyle='rgba(180,180,180,0.7)';ctx2.font='9px monospace';ctx2.textAlign='left';
+    function fmt(v){return v>100?v.toFixed(1):v.toFixed(4);}
+    ctx2.fillText('TP '+fmt(sg.tp),xe+4,yt-2);
+    ctx2.fillText('SL '+fmt(sg.sl),xe+4,ys+9);
+  });
+  ctx2.fillStyle='rgba(140,140,140,0.4)';ctx2.font='9px monospace';ctx2.textAlign='center';
+  var every=Math.ceil(vis.length/8);
+  vis.forEach(function(c,idx){
+    if(idx%every===0){
+      var x=toX(s+idx),d=new Date(c.t*1000);
+      ctx2.fillText((d.getMonth()+1)+'/'+(d.getDate()),x,H-PAD.b+10);
+      ctx2.fillText(d.getHours().toString().padStart(2,'0')+':'+d.getMinutes().toString().padStart(2,'0'),x,H-PAD.b+20);
+    }
+  });
+}
+
+function renderCM(m){
+  if(!m)return;
+  var items=[
+    {l:'Сделок',v:m.trades},{l:'WinRate',v:m.winrate+'%'},
+    {l:'PF',v:m.profit_factor},{l:'Max DD',v:m.max_dd+'%'},
+    {l:'Return',v:m.total_return+'%'},{l:'Fitness',v:m.fitness},
+  ];
+  document.getElementById('chartMetrics').innerHTML=items.map(function(i){
+    return '<div class="cm"><div class="cl">'+i.l+'</div><div class="cv">'+i.v+'</div></div>';
+  }).join('');
+}
+
+cv.addEventListener('mousedown',function(e){_drag=true;_dragX=e.clientX;_dragCam=_camStart;cv.style.cursor='grabbing';});
+document.addEventListener('mouseup',function(){_drag=false;cv.style.cursor='grab';});
+document.addEventListener('mousemove',function(e){
+  if(!_drag||!_cd.length)return;
+  var W=cv.parentElement.clientWidth-20;
+  var vis=_camEnd-_camStart;
+  var dx=(e.clientX-_dragX)/W*vis;
+  _camStart=Math.max(0,Math.min(_cd.length-vis-1,_dragCam-dx));
+  _camEnd=_camStart+vis;
+  drawChart();
+});
+cv.addEventListener('wheel',function(e){
+  e.preventDefault();
+  if(!_cd.length)return;
+  var z=e.deltaY>0?1.15:0.87;
+  var vis=_camEnd-_camStart;
+  var nv=Math.min(_cd.length,Math.max(20,Math.round(vis*z)));
+  var center=(_camStart+_camEnd)/2;
+  _camStart=Math.max(0,Math.round(center-nv/2));
+  _camEnd=Math.min(_cd.length-1,_camStart+nv);
+  drawChart();
+},{passive:false});
+var _tc=null;
+cv.addEventListener('touchstart',function(e){_tc=e.touches[0].clientX;_dragCam=_camStart;});
+cv.addEventListener('touchmove',function(e){
+  e.preventDefault();
+  if(!_cd.length)return;
+  var W=cv.parentElement.clientWidth-20;
+  var vis=_camEnd-_camStart;
+  var dx=(e.touches[0].clientX-_tc)/W*vis;
+  _camStart=Math.max(0,Math.min(_cd.length-vis-1,_dragCam-dx));
+  _camEnd=_camStart+vis;
+  drawChart();
+},{passive:false});
+window.addEventListener('resize',drawChart);
 </script></body></html>
 """.replace("__VER__", APP_VERSION)
 
