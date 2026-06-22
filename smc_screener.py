@@ -1753,18 +1753,28 @@ function loadChart(auto){
 }
 
 var _countdownTimer = null;
+var _lastAutoLoad = 0;
 function scheduleAutoRefresh(tf){
-  if(_chartAutoTimer) clearTimeout(_chartAutoTimer);
+  if(_chartAutoTimer) clearInterval(_chartAutoTimer);
   if(_countdownTimer) clearInterval(_countdownTimer);
   var sec = TF_SEC[tf] || 900;
-  var msToNextClose = (sec - (Date.now()/1000 % sec) + 3) * 1000;
-  _chartAutoTimer = setTimeout(function(){ loadChart(true); }, msToNextClose);
-  // Обратный отсчёт в статусной строке
+  _lastAutoLoad = Date.now();
+  // Используем setInterval вместо setTimeout — Android не замораживает его так агрессивно,
+  // и цепочка не обрывается при зависшем fetch
+  _chartAutoTimer = setInterval(function(){
+    var now = Date.now()/1000;
+    var rem = sec - (now % sec);
+    // Срабатываем в течение 5с после закрытия бара
+    if(rem > sec - 5 || rem <= 2){
+      clearInterval(_chartAutoTimer);
+      _chartAutoTimer = null;
+      loadChart(true);
+    }
+  }, 1000);
+  // Обратный отсчёт
   _countdownTimer = setInterval(function(){
-    var rem = Math.round((sec - (Date.now()/1000 % sec)));
-    var base = _cd.length+' свечей, '+_sig.length+' сигналов (авто через '+rem+'с)';
-    cStatus(base);
-    if(rem <= 0) clearInterval(_countdownTimer);
+    var rem = Math.round(sec - (Date.now()/1000 % sec));
+    cStatus(_cd.length+' свечей, '+_sig.length+' сигналов (авто через '+rem+'с)');
   }, 1000);
 }
 
@@ -1921,7 +1931,17 @@ cv.addEventListener('touchmove',function(e){
 },{passive:false});
 window.addEventListener('resize',drawChart);
 document.addEventListener('visibilitychange',function(){
-  if(!document.hidden&&_cd.length) drawChart();
+  if(!document.hidden && _cd.length){
+    // Если вкладка вернулась и прошло >5с от последней загрузки — перезагружаем данные
+    var tf = document.getElementById('cTf') ? document.getElementById('cTf').value : '15m';
+    var sec = TF_SEC[tf] || 900;
+    var elapsed = (Date.now() - _lastAutoLoad) / 1000;
+    if(elapsed > sec * 0.8){
+      loadChart(true);
+    } else {
+      drawChart();
+    }
+  }
 });
 </script></body></html>
 """.replace("__VER__", APP_VERSION)
