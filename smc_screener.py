@@ -876,7 +876,7 @@ input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;p
 .log-line{padding:1px 0;border-bottom:1px solid #111}
 .prog-bar{background:#1e1e1e;border-radius:3px;height:6px;margin:6px 0}
 .prog-fill{background:#f0b800;height:6px;border-radius:3px;transition:width .3s}
-.top20-row{display:grid;grid-template-columns:24px 1fr 1fr 1fr 1fr 1fr;gap:4px;padding:3px 0;border-bottom:1px solid #1a1a1a;font-size:11px;align-items:center}
+.top20-row{display:grid;grid-template-columns:24px 1fr 1fr 1fr 1fr 1fr 1fr;gap:4px;padding:3px 0;border-bottom:1px solid #1a1a1a;font-size:11px;align-items:center}
 .badge{display:inline-block;padding:1px 5px;border-radius:3px;font-size:10px;margin-right:3px}
 .badge-bull{background:#0a2a1a;color:#0f9}.badge-bear{background:#2a0a0a;color:#f45}
 #chartPanel{padding:10px}
@@ -949,7 +949,7 @@ input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;p
     <div id="top20Container">
       <div class="top20-row">
         <span>#</span><span>WR%</span><span>PF</span><span>DD%</span>
-        <span>T</span><span>SL/TP/swing</span>
+        <span>T</span><span>Return%</span><span>SL/TP/swing</span>
       </div>
     </div>
   </div>
@@ -1172,16 +1172,18 @@ function poll(){
 
     var top=(d.top20||[]);
     if(top.length){
-      var html='<div class="top20-row"><span>#</span><span>WR%</span><span>PF</span><span>DD%</span><span>T</span><span>SL/TP/swing</span></div>';
+      var html='<div class="top20-row"><span>#</span><span>WR%</span><span>PF</span><span>DD%</span><span>T</span><span>Return%</span><span>SL/TP/swing</span></div>';
       top.forEach(function(e,i){
         var r=e.result,p=e.params;
         var wrC=r.winrate>=55?'green':r.winrate>=45?'yellow':'red';
+        var retC=r.total_return>=0?'green':'red';
         html+='<div class="top20-row">'+
           '<span style="color:#555">'+(i+1)+'</span>'+
           '<span class="'+wrC+'">'+r.winrate+'%</span>'+
           '<span>'+r.profit_factor+'</span>'+
           '<span class="red">'+r.max_dd+'%</span>'+
           '<span>'+r.trades+'</span>'+
+          '<span class="'+retC+'">'+r.total_return+'%</span>'+
           '<span style="color:#888">'+p.sl_pct+'/'+p.tp_pct+'/'+p.swing_len+'</span>'+
         '</div>';
       });
