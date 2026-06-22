@@ -35,6 +35,11 @@ SMC Optimizer v1.3
   /chart_monitor_status. На фронте — кнопка "🔔 Алерты" в баре графика и
   автообновление графика раз в ТФ (loadChart(true) по таймеру, с сохранением
   позиции/масштаба просмотра по времени свечи, а не по индексу).
+- v1.5: фикс инвертированного RR — оптимизатор находил SL>TP конфиги (RR<1)
+  потому что высокий WR с маленьким TP давал хороший PF без штрафа. Фиксы:
+  (1) _simulate() отклоняет tp_pct < sl_pct в режиме оптимизации;
+  (2) fitness *= sqrt(tp/sl) — бонус за RR>1, штраф за RR<1;
+  (3) RR добавлен в метрики графика.
 - v1.4: три фикса графика. (1) автообновление теперь срабатывает точно в момент
   закрытия бара (Date.now() % tf_sec), а не через целый ТФ после загрузки —
   раньше полчаса ждал новую свечу именно из-за этого; (2) шкала Y теперь
@@ -62,7 +67,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "1.4"
+APP_VERSION  = "1.5"
 GATE_API     = "https://fx-api.gateio.ws/api/v4"
 PORT         = 8765
 GH_REPO      = os.environ.get("GH_REPO", "mambaleylo/smc-optimizer")
@@ -227,6 +232,9 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=2.0,
     """
     if sl_pct is None: sl_pct = p["sl_pct"]
     if tp_pct is None: tp_pct = p["tp_pct"]
+
+    if tp_pct < sl_pct and not _collect:
+        return None
 
     swing_len     = int(p["swing_len"])
     internal_len  = int(p.get("internal_len", 5))
@@ -482,8 +490,11 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=2.0,
         "fitness": 0.0,
     }
     # Fitness: WR × PF × log(trades) / (1+max_dd) — штраф за просадку
-    fitness = (wr * min(pf,5.0) * math.log(len(trades)+1)) / (1 + max_dd)
+    rr_ratio = tp_pct / sl_pct if sl_pct > 0 else 1.0
+    rr_bonus = math.sqrt(max(rr_ratio, 0.5))
+    fitness = (wr * min(pf,5.0) * math.log(len(trades)+1) * rr_bonus) / (1 + max_dd)
     result["fitness"] = round(fitness, 6)
+    result["rr"] = round(tp_pct / sl_pct if sl_pct > 0 else 1.0, 2)
 
     if _collect:
         def _box_end(items, kind):
@@ -1344,7 +1355,7 @@ function renderCM(m){
   var items=[
     {l:'Сделок',v:m.trades},{l:'WinRate',v:m.winrate+'%'},
     {l:'PF',v:m.profit_factor},{l:'Max DD',v:m.max_dd+'%'},
-    {l:'Return',v:m.total_return+'%'},{l:'Fitness',v:m.fitness},
+    {l:'Return',v:m.total_return+'%'},{l:'RR',v:m.rr||'—'},{l:'Fitness',v:m.fitness},
   ];
   document.getElementById('chartMetrics').innerHTML=items.map(function(i){
     return '<div class="cm"><div class="cl">'+i.l+'</div><div class="cv">'+i.v+'</div></div>';
@@ -1448,7 +1459,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json({"candles": slim, "signals": result.get("signals",[]),
                         "bull_obs": result.get("bull_obs",[]), "bear_obs": result.get("bear_obs",[]),
                         "fvg_bull": result.get("fvg_bull",[]), "fvg_bear": result.get("fvg_bear",[]),
-                        "metrics": {k:result[k] for k in ("trades","winrate","profit_factor","max_dd","total_return","fitness")}})
+                        "metrics": {k:result[k] for k in ("trades","winrate","profit_factor","max_dd","total_return","fitness","rr")}})
         elif self.path == "/chart_monitor_status":
             with chart_mon_lock:
                 self._json({k:v for k,v in chart_mon_state.items() if k != "params"})
