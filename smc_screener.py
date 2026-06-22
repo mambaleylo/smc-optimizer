@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SMC Optimizer v1.2
+SMC Optimizer v1.3
 - v1.0: первая версия. Оптимизатор параметров Smart Money Concepts (SMC) сигналов
   по свечам Gate.io Futures. Метод: Basin Hopping + Metropolis. TP/SL как в WickFill.
   Параметры: swing_len (размер свинга), internal_len (внутренний свинг), ob_filter
@@ -35,6 +35,13 @@ SMC Optimizer v1.2
   /chart_monitor_status. На фронте — кнопка "🔔 Алерты" в баре графика и
   автообновление графика раз в ТФ (loadChart(true) по таймеру, с сохранением
   позиции/масштаба просмотра по времени свечи, а не по индексу).
+- v1.3: настройка алертов через UI (по аналогии с WickFill). Поля TG Token /
+  TG Chat ID / ntfy URL в сайдбаре, сохраняются в ~/.smc_alert_cfg.json
+  (приоритет над env при старте) и подхватываются при перезапуске — больше
+  не нужно экспортировать env-переменные руками каждый раз. Кнопка "Тест"
+  реально проверяет доставку: для Telegram разбирает поле "ok" в ответе API
+  (а не просто фиксирует факт отправки HTTP-запроса), для ntfy — код ответа.
+  Эндпоинты: GET /alert_cfg, POST /alert_cfg, POST /alert_test.
 """
 import os, sys, json, time, math, random, threading, base64, hashlib
 import http.server, urllib.request, urllib.parse
@@ -46,7 +53,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "1.2"
+APP_VERSION  = "1.3"
 GATE_API     = "https://fx-api.gateio.ws/api/v4"
 PORT         = 8765
 GH_REPO      = os.environ.get("GH_REPO", "mambaleylo/smc-optimizer")
@@ -54,6 +61,7 @@ GH_TOKEN     = os.environ.get("GH_TOKEN", "")
 TG_TOKEN     = os.environ.get("TG_TOKEN", "")
 TG_CHAT      = os.environ.get("TG_CHAT", "")
 NTFY_URL     = os.environ.get("NTFY_URL", "")
+ALERT_CFG_PATH = os.path.expanduser("~/.smc_alert_cfg.json")
 
 _C_GRN = "\033[92m"; _C_YEL = "\033[93m"; _C_RED = "\033[91m"
 _C_GREY = "\033[90m"; _C_RST = "\033[0m"
@@ -595,6 +603,55 @@ def _send_alert(msg):
             requests.post(NTFY_URL, data=msg.encode(), timeout=8)
         except: pass
 
+def _load_alert_cfg():
+    """Подхватывает сохранённые TG/ntfy настройки из файла (приоритет над env)."""
+    global TG_TOKEN, TG_CHAT, NTFY_URL
+    try:
+        with open(ALERT_CFG_PATH, "r") as f:
+            cfg = json.load(f)
+        TG_TOKEN = cfg.get("tg_token", TG_TOKEN) or TG_TOKEN
+        TG_CHAT  = cfg.get("tg_chat",  TG_CHAT)  or TG_CHAT
+        NTFY_URL = cfg.get("ntfy_url", NTFY_URL) or NTFY_URL
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        olog(f"⚠ Не удалось прочитать {ALERT_CFG_PATH}: {e}")
+
+def _save_alert_cfg():
+    try:
+        with open(ALERT_CFG_PATH, "w") as f:
+            json.dump({"tg_token": TG_TOKEN, "tg_chat": TG_CHAT, "ntfy_url": NTFY_URL}, f)
+    except Exception as e:
+        olog(f"⚠ Не удалось сохранить {ALERT_CFG_PATH}: {e}")
+
+def _test_alert():
+    """Шлёт тестовое уведомление и честно проверяет, дошло ли оно."""
+    if not ((TG_TOKEN and TG_CHAT) or NTFY_URL):
+        return False, "Не заданы TG_TOKEN+TG_CHAT или NTFY_URL"
+    msg = "✅ SMC Optimizer: тестовое уведомление. Если ты это видишь — алерты настроены верно."
+    ok_any, errs = False, []
+    if TG_TOKEN and TG_CHAT:
+        try:
+            r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                json={"chat_id":TG_CHAT,"text":msg,"parse_mode":"HTML"}, timeout=8)
+            j = r.json()
+            if j.get("ok"):
+                ok_any = True
+            else:
+                errs.append("Telegram: " + j.get("description","неизвестная ошибка"))
+        except Exception as e:
+            errs.append(f"Telegram: {e}")
+    if NTFY_URL:
+        try:
+            r = requests.post(NTFY_URL, data=msg.encode(), timeout=8)
+            if r.status_code < 300:
+                ok_any = True
+            else:
+                errs.append(f"ntfy: HTTP {r.status_code}")
+        except Exception as e:
+            errs.append(f"ntfy: {e}")
+    return ok_any, ("; ".join(errs) if errs else None)
+
 def _fmt_px(v):
     if v is None: return "—"
     if v >= 100:  return f"{v:.2f}"
@@ -830,6 +887,17 @@ input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;p
     <div id="bestCard" style="color:#555;font-size:11px">—</div>
   </div>
   <div class="card">
+    <h3>Алерты (Telegram / ntfy)</h3>
+    <label>TG Token</label><input id="tgToken" type="password" placeholder="1234567890:AA...">
+    <label>TG Chat ID</label><input id="tgChat" placeholder="123456789">
+    <label>ntfy URL (необязательно)</label><input id="ntfyUrl" placeholder="https://ntfy.sh/your-topic">
+    <div style="display:flex;gap:6px">
+      <button class="btn btn-sm" style="flex:1" onclick="saveAlertCfg()">💾 Сохранить</button>
+      <button class="btn btn-sm" style="flex:1" onclick="testAlertCfg()">📨 Тест</button>
+    </div>
+    <div id="alertCfgStatus" style="font-size:11px;color:#555;margin-top:6px">—</div>
+  </div>
+  <div class="card">
     <h3>Прогресс</h3>
     <div class="prog-bar"><div class="prog-fill" id="progFill" style="width:0%"></div></div>
     <div class="stat-row"><span class="stat-label">Цикл</span><span class="stat-val" id="cycleVal">—</span></div>
@@ -939,6 +1007,55 @@ function toggleChartMonitor(){
       }
     }).catch(function(e){cStatus('Ошибка монитора: '+e);});
 }
+
+function alertCfgStatus(t,ok){
+  var el=document.getElementById('alertCfgStatus');
+  el.textContent=t;
+  el.style.color = ok===true?'#0f9':(ok===false?'#f45':'#555');
+}
+
+function loadAlertCfg(){
+  fetch('/alert_cfg').then(function(r){return r.json();}).then(function(d){
+    document.getElementById('tgToken').value = d.tg_token||'';
+    document.getElementById('tgChat').value  = d.tg_chat||'';
+    document.getElementById('ntfyUrl').value = d.ntfy_url||'';
+    if(d.tg_token||d.tg_chat||d.ntfy_url) alertCfgStatus('Загружено из сохранённых настроек');
+  }).catch(function(){});
+}
+
+function saveAlertCfg(){
+  var body={
+    tg_token: document.getElementById('tgToken').value.trim(),
+    tg_chat:  document.getElementById('tgChat').value.trim(),
+    ntfy_url: document.getElementById('ntfyUrl').value.trim()
+  };
+  alertCfgStatus('Сохраняем...');
+  fetch('/alert_cfg',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+    .then(function(r){return r.json();})
+    .then(function(d){ alertCfgStatus(d.ok?'💾 Сохранено':'Ошибка сохранения', d.ok); })
+    .catch(function(e){ alertCfgStatus('Ошибка: '+e, false); });
+}
+
+function testAlertCfg(){
+  alertCfgStatus('Сохраняем и отправляем тест...');
+  saveAlertCfgSync().then(function(){
+    return fetch('/alert_test',{method:'POST'});
+  }).then(function(r){return r.json();})
+    .then(function(d){
+      alertCfgStatus(d.ok?'✅ Тест отправлен, проверь Telegram':('❌ '+(d.error||'не дошло')), d.ok);
+    }).catch(function(e){ alertCfgStatus('Ошибка: '+e, false); });
+}
+
+function saveAlertCfgSync(){
+  var body={
+    tg_token: document.getElementById('tgToken').value.trim(),
+    tg_chat:  document.getElementById('tgChat').value.trim(),
+    ntfy_url: document.getElementById('ntfyUrl').value.trim()
+  };
+  return fetch('/alert_cfg',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+}
+
+loadAlertCfg();
 
 /* ── Optimizer polling ── */
 var polling=null, lastLogTotal=0, logsDropped=0;
@@ -1320,6 +1437,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif self.path == "/chart_monitor_status":
             with chart_mon_lock:
                 self._json({k:v for k,v in chart_mon_state.items() if k != "params"})
+        elif self.path == "/alert_cfg":
+            self._json({"tg_token": TG_TOKEN, "tg_chat": TG_CHAT, "ntfy_url": NTFY_URL})
         else:
             self.send_response(404); self.end_headers()
 
@@ -1382,6 +1501,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 chart_mon_state["active"] = False
             self._json({"ok": True})
 
+        elif self.path == "/alert_cfg":
+            global TG_TOKEN, TG_CHAT, NTFY_URL
+            TG_TOKEN = (body.get("tg_token") or "").strip()
+            TG_CHAT  = (body.get("tg_chat")  or "").strip()
+            NTFY_URL = (body.get("ntfy_url") or "").strip()
+            _save_alert_cfg()
+            self._json({"ok": True})
+
+        elif self.path == "/alert_test":
+            ok, err = _test_alert()
+            self._json({"ok": ok, "error": err})
+
         else:
             self.send_response(404); self.end_headers()
 
@@ -1392,6 +1523,8 @@ def main():
     TG_TOKEN  = os.environ.get("TG_TOKEN", TG_TOKEN)
     TG_CHAT   = os.environ.get("TG_CHAT",  TG_CHAT)
     NTFY_URL  = os.environ.get("NTFY_URL", NTFY_URL)
+    # Сохранённые через UI настройки имеют приоритет над env (если есть файл)
+    _load_alert_cfg()
 
     server = http.server.HTTPServer(("0.0.0.0", PORT), Handler)
     print(f"{_C_GRN}SMC Optimizer v{APP_VERSION} — http://0.0.0.0:{PORT}{_C_RST}", flush=True)
