@@ -35,6 +35,15 @@ SMC Optimizer v1.3
   /chart_monitor_status. На фронте — кнопка "🔔 Алерты" в баре графика и
   автообновление графика раз в ТФ (loadChart(true) по таймеру, с сохранением
   позиции/масштаба просмотра по времени свечи, а не по индексу).
+- v1.4: три фикса графика. (1) автообновление теперь срабатывает точно в момент
+  закрытия бара (Date.now() % tf_sec), а не через целый ТФ после загрузки —
+  раньше полчаса ждал новую свечу именно из-за этого; (2) шкала Y теперь
+  учитывает TP/SL всех сигналов, у которых хоть часть зоны попадает в
+  видимый диапазон (entry_i <= e && exit_i >= s), а не только тех, чей
+  entry_i в зоне — поэтому TP/SL больше не вылазят за границу canvas;
+  (3) при переключении вкладок браузера drawChart() пропускает ренеринг
+  если ширина canvas равна 0, а по событию visibilitychange перерисовывает
+  при возврате — убирает «мешанину» из накладывающихся рендеров.
 - v1.3: настройка алертов через UI (по аналогии с WickFill). Поля TG Token /
   TG Chat ID / ntfy URL в сайдбаре, сохраняются в ~/.smc_alert_cfg.json
   (приоритет над env при старте) и подхватываются при перезапуске — больше
@@ -53,7 +62,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "1.3"
+APP_VERSION  = "1.4"
 GATE_API     = "https://fx-api.gateio.ws/api/v4"
 PORT         = 8765
 GH_REPO      = os.environ.get("GH_REPO", "mambaleylo/smc-optimizer")
@@ -1221,13 +1230,15 @@ function loadChart(auto){
 function scheduleAutoRefresh(tf){
   if(_chartAutoTimer) clearTimeout(_chartAutoTimer);
   var sec = TF_SEC[tf] || 900;
-  _chartAutoTimer = setTimeout(function(){ loadChart(true); }, sec*1000);
+  var msToNextClose = (sec - (Date.now()/1000 % sec) + 3) * 1000;
+  _chartAutoTimer = setTimeout(function(){ loadChart(true); }, msToNextClose);
 }
 
 function drawChart(){
   if(!_cd.length)return;
   var dpr=window.devicePixelRatio||1;
   var W=cv.parentElement.clientWidth-20;
+  if(W<=0)return;
   var H=420;
   cv.width=W*dpr;cv.height=H*dpr;
   cv.style.width=W+'px';cv.style.height=H+'px';
@@ -1242,7 +1253,8 @@ function drawChart(){
   var mn=Infinity,mx=-Infinity;
   vis.forEach(function(c){if(c.l<mn)mn=c.l;if(c.h>mx)mx=c.h;});
   _sig.forEach(function(sg){
-    if(sg.entry_i>=s&&sg.entry_i<=e){
+    var exitI=sg.exit_i!==undefined?sg.exit_i:(_cd.length-1);
+    if(sg.entry_i<=e&&exitI>=s){
       if(sg.tp<mn)mn=sg.tp;if(sg.tp>mx)mx=sg.tp;
       if(sg.sl<mn)mn=sg.sl;if(sg.sl>mx)mx=sg.sl;
     }
@@ -1374,6 +1386,9 @@ cv.addEventListener('touchmove',function(e){
   drawChart();
 },{passive:false});
 window.addEventListener('resize',drawChart);
+document.addEventListener('visibilitychange',function(){
+  if(!document.hidden&&_cd.length) drawChart();
+});
 </script></body></html>
 """.replace("__VER__", APP_VERSION)
 
