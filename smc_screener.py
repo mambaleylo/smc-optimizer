@@ -1309,8 +1309,8 @@ input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;p
   <div class="chart-bar">
     <label>Символ<input id="cSym" value="BTC_USDT"></label>
     <label>ТФ<select id="cTf">
-      <option>1m</option><option>5m</option><option value="15m" selected>15m</option>
-      <option>30m</option><option>1h</option><option>4h</option><option>1d</option>
+      <option value="1m">1m</option><option value="5m">5m</option><option value="15m" selected>15m</option>
+      <option value="30m">30m</option><option value="1h">1h</option><option value="4h">4h</option><option value="1d">1d</option>
     </select></label>
     <label>Дней<input id="cDays" type="number" value="7" min="1" max="60" style="width:60px"></label>
     <label>Swing<input id="cSwing" type="number" value="10" min="3" max="50" style="width:60px"></label>
@@ -1374,18 +1374,30 @@ function switchTab(id, btn){
 }
 
 function applyBestToChart(){
-  if(!_bestParams) return;
+  if(!_bestParams){ alert('Нет лучшего конфига — запустите оптимизатор'); return; }
   var p = _bestParams;
-  document.getElementById('cSym').value  = document.getElementById('sym').value;
-  document.getElementById('cTf').value   = document.getElementById('tf').value;
-  document.getElementById('cSwing').value = p.swing_len || 10;
-  document.getElementById('cSl').value   = p.sl_pct || 0.8;
-  document.getElementById('cTp').value   = p.tp_pct || 1.6;
+  // Сначала выставляем все значения, потом переключаем вкладку и грузим
+  document.getElementById('cSym').value   = document.getElementById('sym').value;
+  // TF: принудительно перебираем опции чтобы гарантированно выбрать нужную
+  var tfSel = document.getElementById('cTf');
+  var tfVal = document.getElementById('tf').value;
+  for(var i=0; i<tfSel.options.length; i++){
+    if(tfSel.options[i].value === tfVal){ tfSel.selectedIndex = i; break; }
+  }
+  document.getElementById('cDays').value  = document.getElementById('days').value;
+  document.getElementById('cSwing').value = p.swing_len  != null ? p.swing_len  : 10;
+  document.getElementById('cSl').value    = p.sl_pct     != null ? p.sl_pct     : 0.8;
+  document.getElementById('cTp').value    = p.tp_pct     != null ? p.tp_pct     : 1.6;
   _chartExtra = {
-    internal_len: p.internal_len, ob_filter: p.ob_filter, ob_mitigation: p.ob_mitigation,
-    fvg_enabled: p.fvg_enabled, fvg_threshold: p.fvg_threshold, choch_only: p.choch_only,
-    use_internal: p.use_internal, min_ob_size: p.min_ob_size,
-    require_fvg_confirm: p.require_fvg_confirm
+    internal_len:       p.internal_len       != null ? p.internal_len       : 5,
+    ob_filter:          p.ob_filter          != null ? p.ob_filter          : 'atr',
+    ob_mitigation:      p.ob_mitigation      != null ? p.ob_mitigation      : 'highlow',
+    fvg_enabled:        p.fvg_enabled        != null ? p.fvg_enabled        : true,
+    fvg_threshold:      p.fvg_threshold      != null ? p.fvg_threshold      : 0.1,
+    choch_only:         p.choch_only         != null ? p.choch_only         : false,
+    use_internal:       p.use_internal       != null ? p.use_internal       : true,
+    min_ob_size:        p.min_ob_size        != null ? p.min_ob_size        : 1.0,
+    require_fvg_confirm:p.require_fvg_confirm!= null ? p.require_fvg_confirm: false,
   };
   switchTab('chart', document.querySelectorAll('.tab')[1]);
   loadChart();
