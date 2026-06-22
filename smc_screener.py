@@ -35,6 +35,11 @@ SMC Optimizer v1.3
   /chart_monitor_status. На фронте — кнопка "🔔 Алерты" в баре графика и
   автообновление графика раз в ТФ (loadChart(true) по таймеру, с сохранением
   позиции/масштаба просмотра по времени свечи, а не по индексу).
+- v1.9: надёжность автообновления графика. (1) при ошибке fetch таймер
+  теперь перезапускается в .catch — раньше цепочка обрывалась и свеча
+  могла не появиться никогда без ручного Загрузить; (2) добавлен
+  обратный отсчёт в статусной строке "авто через Xs" — видно что
+  обновление ожидается и когда именно.
 - v1.8: (1) удалено поле "Риск на сделку" из UI (осталось в HTML с прошлой
   версии); (2) фикс приоритета малого числа сделок — добавлен trade_factor =
   log(trades+1) * min(trades/20, 1.0): при <20 сделок fitness режется
@@ -80,7 +85,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "1.8"
+APP_VERSION  = "1.9"
 GATE_API     = "https://fx-api.gateio.ws/api/v4"
 PORT         = 8765
 GH_REPO      = os.environ.get("GH_REPO", "mambaleylo/smc-optimizer")
@@ -1248,14 +1253,28 @@ function loadChart(auto){
       renderCM(d.metrics);
       cStatus(_cd.length+' свечей, '+_sig.length+' сигналов'+(auto?' (автообновление)':''));
       scheduleAutoRefresh(tf);
-    }).catch(function(e){cStatus('Ошибка: '+e);});
+    }).catch(function(e){
+      cStatus('Ошибка загрузки: '+e);
+      // Даже при ошибке перезапускаем таймер — иначе цепочка обрывается
+      var tf=document.getElementById('cTf').value;
+      scheduleAutoRefresh(tf);
+    });
 }
 
+var _countdownTimer = null;
 function scheduleAutoRefresh(tf){
   if(_chartAutoTimer) clearTimeout(_chartAutoTimer);
+  if(_countdownTimer) clearInterval(_countdownTimer);
   var sec = TF_SEC[tf] || 900;
   var msToNextClose = (sec - (Date.now()/1000 % sec) + 3) * 1000;
   _chartAutoTimer = setTimeout(function(){ loadChart(true); }, msToNextClose);
+  // Обратный отсчёт в статусной строке
+  _countdownTimer = setInterval(function(){
+    var rem = Math.round((sec - (Date.now()/1000 % sec)));
+    var base = _cd.length+' свечей, '+_sig.length+' сигналов (авто через '+rem+'с)';
+    cStatus(base);
+    if(rem <= 0) clearInterval(_countdownTimer);
+  }, 1000);
 }
 
 function drawChart(){
