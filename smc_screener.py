@@ -644,6 +644,22 @@ input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;
 .badge{display:inline-block;padding:1px 5px;border-radius:3px;font-size:10px;margin-right:3px}
 .badge-bull{background:#0a2a1a;color:#0f9}
 .badge-bear{background:#2a0a0a;color:#f45}
+.tabs{display:flex;gap:4px;padding:0 12px;background:#111;border-bottom:1px solid #222}
+.tab{padding:7px 16px;font-size:12px;cursor:pointer;color:#666;border-bottom:2px solid transparent;background:none;border-top:none;border-left:none;border-right:none}
+.tab.active{color:#f0b800;border-bottom-color:#f0b800}
+.tab-panel{display:none}.tab-panel.active{display:block}
+#chartPanel{padding:10px}
+.chart-bar{display:flex;flex-wrap:wrap;gap:8px;align-items:flex-end;padding-bottom:10px}
+.chart-bar label{display:flex;flex-direction:column;font-size:11px;color:#888;gap:2px}
+.chart-bar input,.chart-bar select{background:#0d0d0d;border:1px solid #333;color:#e0e0e0;padding:4px 7px;border-radius:4px;font-size:12px;width:90px}
+.chart-legend{display:flex;flex-wrap:wrap;gap:10px;padding:4px 0 8px;font-size:11px;color:#888}
+.chart-legend span{display:flex;align-items:center;gap:4px}
+.chart-legend i{display:inline-block;width:14px;height:6px;border-radius:2px}
+#chartMetrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(90px,1fr));gap:6px;margin-top:8px}
+.cm{background:#161616;border:1px solid #222;border-radius:5px;padding:8px 10px}
+.cm .cl{font-size:10px;color:#555}.cm .cv{font-size:16px;font-weight:700;color:#e0e0e0}
+#chartCanvas{display:block;width:100%;cursor:grab;border:1px solid #222;border-radius:5px;background:#0a0a0a}
+#chartStatus{font-size:11px;color:#555;padding:4px 0}
 </style></head><body>
 <div class="topbar">
   <h1>⚡ SMC Optimizer</h1>
@@ -652,6 +668,11 @@ input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;
   <button class="btn btn-stop" id="btnStop" onclick="stopOpt()" style="display:none">⏹ Стоп</button>
   <span id="statusBadge" style="color:#555;font-size:11px">готов</span>
 </div>
+<div class="tabs">
+  <button class="tab active" onclick="switchTab('opt',this)">⚡ Оптимизатор</button>
+  <button class="tab" onclick="switchTab('chart',this)">📈 График</button>
+</div>
+<div id="optPanel" class="tab-panel active">
 <div class="body">
 <div class="sidebar">
   <div class="card">
@@ -691,8 +712,333 @@ input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;
   </div>
 </div>
 </div>
+</div>
+<div id="chartPanel" class="tab-panel">
+  <div class="chart-bar">
+    <label>Символ<input id="cSym" value="BTC_USDT"></label>
+    <label>ТФ<select id="cTf">
+      <option>1m</option><option>5m</option><option value="15m" selected>15m</option>
+      <option>30m</option><option>1h</option><option>4h</option><option>1d</option>
+    </select></label>
+    <label>Дней<input id="cDays" type="number" value="7" min="1" max="60" style="width:60px"></label>
+    <label>Swing<input id="cSwing" type="number" value="10" min="3" max="50" style="width:60px"></label>
+    <label>SL%<input id="cSl" type="number" value="0.8" step="0.1" style="width:60px"></label>
+    <label>TP%<input id="cTp" type="number" value="1.6" step="0.1" style="width:60px"></label>
+    <button class="btn btn-go" onclick="loadChart()" style="align-self:flex-end">Загрузить</button>
+  </div>
+  <div id="chartStatus">Нажмите «Загрузить»</div>
+  <div class="chart-legend">
+    <span><i style="background:#089981"></i>Long</span>
+    <span><i style="background:#F23645"></i>Short</span>
+    <span><i style="background:rgba(49,121,245,0.3);border:1px solid #3179f5"></i>Bull OB</span>
+    <span><i style="background:rgba(247,124,128,0.3);border:1px solid #f77c80"></i>Bear OB</span>
+    <span><i style="background:rgba(0,255,104,0.2);border:1px solid #0f9"></i>Bull FVG</span>
+    <span><i style="background:rgba(255,0,8,0.15);border:1px solid #f45"></i>Bear FVG</span>
+  </div>
+  <canvas id="chartCanvas"></canvas>
+  <div id="chartMetrics"></div>
+</div>
 <script>
-let polling=null, lastLogTotal=0, logsDropped=0;
+function switchTab(id, btn){
+  document.querySelectorAll('.tab-panel').forEach(p=>p.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(b=>b.classList.remove('active'));
+  document.getElementById(id+'Panel').classList.add('active');
+  btn.classList.add('active');
+}
+
+// ─── Chart ────────────────────────────────────────────────────────────────
+let _cd=[], _sig=[], _obs_bull=[], _obs_bear=[], _fvg_bull=[], _fvg_bear=[], _piv_hi=[], _piv_lo=[];
+let _camStart=0, _camEnd=0, _drag=false, _dragX=0, _dragCam=0;
+const cv=document.getElementById('chartCanvas');
+const ctx=cv.getContext('2d');
+
+function cStatus(t){document.getElementById('chartStatus').textContent=t}
+
+function loadChart(){
+  const sym=document.getElementById('cSym').value.trim()||'BTC_USDT';
+  const tf=document.getElementById('cTf').value;
+  const days=document.getElementById('cDays').value;
+  const sw=document.getElementById('cSwing').value;
+  const sl=document.getElementById('cSl').value;
+  const tp=document.getElementById('cTp').value;
+  cStatus('Загружаем данные…');
+  fetch(`/chart_data?sym=${encodeURIComponent(sym)}&tf=${tf}&days=${days}&swing=${sw}&sl=${sl}&tp=${tp}`)
+    .then(r=>r.json()).then(d=>{
+      if(d.error){cStatus('Ошибка: '+d.error);return}
+      _cd=d.candles||[];
+      _sig=d.signals||[];
+      // Rebuild OB/FVG from signals context (server returns only signals; derive OBs client-side approximation)
+      _obs_bull=[]; _obs_bear=[]; _fvg_bull=[]; _fvg_bear=[]; _piv_hi=[]; _piv_lo=[];
+      rebuildIndicators(parseInt(sw));
+      _camStart=Math.max(0,_cd.length-120);
+      _camEnd=_cd.length-1;
+      drawChart();
+      renderCMetrics(d.metrics);
+      cStatus(_cd.length+' свечей · '+_sig.length+' сигналов');
+    }).catch(e=>cStatus('Ошибка: '+e));
+}
+
+function atrArr(candles,period){
+  const r=new Array(candles.length).fill(null);
+  const trs=[];
+  for(let i=1;i<candles.length;i++){
+    const h=candles[i].h,l=candles[i].l,pc=candles[i-1].c;
+    trs.push(Math.max(h-l,Math.abs(h-pc),Math.abs(l-pc)));
+  }
+  if(trs.length<period)return r;
+  let s=trs.slice(0,period).reduce((a,b)=>a+b,0)/period;
+  r[period]=s;
+  for(let i=period+1;i<candles.length;i++){s=(s*(period-1)+trs[i-1])/period;r[i]=s;}
+  return r;
+}
+
+function rebuildIndicators(swLen){
+  const n=_cd.length;
+  const atr=atrArr(_cd,200);
+  // Pivot highs/lows
+  for(let i=swLen;i<n-swLen;i++){
+    const h=_cd[i].h;
+    let ok=true;
+    for(let j=i-swLen;j<i;j++)if(_cd[j].h>=h){ok=false;break}
+    if(ok)for(let j=i+1;j<=i+swLen;j++)if(_cd[j].h>=h){ok=false;break}
+    if(ok)_piv_hi.push({i,p:h});
+  }
+  for(let i=swLen;i<n-swLen;i++){
+    const l=_cd[i].l;
+    let ok=true;
+    for(let j=i-swLen;j<i;j++)if(_cd[j].l<=l){ok=false;break}
+    if(ok)for(let j=i+1;j<=i+swLen;j++)if(_cd[j].l<=l){ok=false;break}
+    if(ok)_piv_lo.push({i,p:l});
+  }
+  // Order blocks
+  _piv_hi.forEach(ph=>{
+    let j=ph.i-1;
+    while(j>Math.max(0,ph.i-swLen)){
+      const ci=_cd[j],a=atr[j]||0.001;
+      if(ci.c>ci.o&&(ci.h-ci.l)>=0.5*a){_obs_bear.push({i:j,hi:ci.h,lo:ci.l});break}
+      j--;
+    }
+  });
+  _piv_lo.forEach(pl=>{
+    let j=pl.i-1;
+    while(j>Math.max(0,pl.i-swLen)){
+      const ci=_cd[j],a=atr[j]||0.001;
+      if(ci.c<ci.o&&(ci.h-ci.l)>=0.5*a){_obs_bull.push({i:j,hi:ci.h,lo:ci.l});break}
+      j--;
+    }
+  });
+  // FVG
+  for(let i=2;i<n;i++){
+    const a=atr[i]||0.001;
+    if(_cd[i].l-_cd[i-2].h>0.1*a)_fvg_bull.push({i,lo:_cd[i-2].h,hi:_cd[i].l});
+    if(_cd[i-2].l-_cd[i].h>0.1*a)_fvg_bear.push({i,lo:_cd[i].h,hi:_cd[i-2].l});
+  }
+}
+
+function drawChart(){
+  if(!_cd.length)return;
+  const dpr=window.devicePixelRatio||1;
+  const W=cv.parentElement.clientWidth-20;
+  const H=420;
+  cv.width=W*dpr;cv.height=H*dpr;
+  cv.style.width=W+'px';cv.style.height=H+'px';
+  ctx.scale(dpr,dpr);
+
+  const s=Math.max(0,Math.floor(_camStart));
+  const e=Math.min(_cd.length-1,Math.floor(_camEnd));
+  const vis=_cd.slice(s,e+1);
+  if(!vis.length)return;
+
+  const PAD={l:62,r:8,t:12,b:28};
+  const cW=W-PAD.l-PAD.r;
+  const cH=H-PAD.t-PAD.b;
+  const barW=cW/vis.length;
+  const candleW=Math.max(1,barW*0.65);
+
+  let mn=Infinity,mx=-Infinity;
+  vis.forEach(c=>{if(c.l<mn)mn=c.l;if(c.h>mx)mx=c.h;});
+  _sig.forEach(sg=>{
+    if(sg.entry_i>=s&&sg.entry_i<=e){
+      if(sg.tp<mn)mn=sg.tp;if(sg.tp>mx)mx=sg.tp;
+      if(sg.sl<mn)mn=sg.sl;if(sg.sl>mx)mx=sg.sl;
+    }
+  });
+  const rng=mx-mn||1, pad=rng*0.06;
+  mn-=pad;mx+=pad;
+
+  const toY=p=>PAD.t+cH*(1-(p-mn)/(mx-mn));
+  const toX=i=>PAD.l+(i-s+0.5)*barW;
+
+  ctx.fillStyle='#0a0a0a';ctx.fillRect(0,0,W,H);
+
+  // grid
+  ctx.strokeStyle='rgba(255,255,255,0.05)';ctx.lineWidth=0.5;
+  for(let g=0;g<=5;g++){
+    const p=mn+(mx-mn)*g/5,y=toY(p);
+    ctx.beginPath();ctx.moveTo(PAD.l,y);ctx.lineTo(W-PAD.r,y);ctx.stroke();
+    ctx.fillStyle='rgba(160,160,160,0.45)';ctx.font='10px monospace';ctx.textAlign='right';
+    const pFmt=p>1000?p.toFixed(1):p>10?p.toFixed(2):p.toFixed(4);
+    ctx.fillText(pFmt,PAD.l-3,y+3);
+  }
+
+  // FVGs
+  _fvg_bull.filter(f=>f.i>=s&&f.i<=e).forEach(f=>{
+    ctx.fillStyle='rgba(0,255,104,0.1)';
+    ctx.strokeStyle='rgba(0,255,104,0.3)';ctx.lineWidth=0.5;
+    const y1=toY(f.hi),y2=toY(f.lo);
+    ctx.fillRect(PAD.l,y1,cW,y2-y1);
+    ctx.strokeRect(PAD.l,y1,cW,y2-y1);
+  });
+  _fvg_bear.filter(f=>f.i>=s&&f.i<=e).forEach(f=>{
+    ctx.fillStyle='rgba(255,0,8,0.08)';
+    ctx.strokeStyle='rgba(255,0,8,0.25)';ctx.lineWidth=0.5;
+    const y1=toY(f.hi),y2=toY(f.lo);
+    ctx.fillRect(PAD.l,y1,cW,y2-y1);
+    ctx.strokeRect(PAD.l,y1,cW,y2-y1);
+  });
+
+  // OBs — extend right from their bar
+  _obs_bull.filter(o=>o.i>=s&&o.i<=e).forEach(o=>{
+    const x=toX(o.i);
+    ctx.fillStyle='rgba(49,121,245,0.18)';
+    ctx.strokeStyle='rgba(49,121,245,0.5)';ctx.lineWidth=0.8;
+    const y1=toY(o.hi),y2=toY(o.lo);
+    ctx.fillRect(x,y1,W-PAD.r-x,y2-y1);
+    ctx.strokeRect(x,y1,W-PAD.r-x,y2-y1);
+    ctx.fillStyle='rgba(49,121,245,0.6)';ctx.font='9px monospace';ctx.textAlign='left';
+    ctx.fillText('Bull OB',x+2,y1+9);
+  });
+  _obs_bear.filter(o=>o.i>=s&&o.i<=e).forEach(o=>{
+    const x=toX(o.i);
+    ctx.fillStyle='rgba(247,124,128,0.18)';
+    ctx.strokeStyle='rgba(247,124,128,0.5)';ctx.lineWidth=0.8;
+    const y1=toY(o.hi),y2=toY(o.lo);
+    ctx.fillRect(x,y1,W-PAD.r-x,y2-y1);
+    ctx.strokeRect(x,y1,W-PAD.r-x,y2-y1);
+    ctx.fillStyle='rgba(247,124,128,0.6)';ctx.font='9px monospace';ctx.textAlign='left';
+    ctx.fillText('Bear OB',x+2,y1+9);
+  });
+
+  // Pivot markers
+  _piv_hi.filter(p=>p.i>=s&&p.i<=e).forEach(p=>{
+    const x=toX(p.i),y=toY(p.p);
+    ctx.fillStyle='rgba(242,54,69,0.65)';ctx.font='8px monospace';ctx.textAlign='center';
+    ctx.fillText('▼SH',x,y-4);
+  });
+  _piv_lo.filter(p=>p.i>=s&&p.i<=e).forEach(p=>{
+    const x=toX(p.i),y=toY(p.p);
+    ctx.fillStyle='rgba(8,153,129,0.65)';ctx.font='8px monospace';ctx.textAlign='center';
+    ctx.fillText('▲SL',x,y+11);
+  });
+
+  // Candles
+  vis.forEach((c,idx)=>{
+    const xi=s+idx,x=toX(xi);
+    const bull=c.c>=c.o;
+    const clr=bull?'#089981':'#F23645';
+    ctx.strokeStyle=clr;ctx.lineWidth=1;
+    ctx.beginPath();ctx.moveTo(x,toY(c.h));ctx.lineTo(x,toY(c.l));ctx.stroke();
+    ctx.fillStyle=bull?'#089981':'#F23645';
+    const y1=toY(Math.max(c.o,c.c));
+    const y2=toY(Math.min(c.o,c.c));
+    ctx.fillRect(x-candleW/2,y1,candleW,Math.max(1,y2-y1));
+  });
+
+  // Signals
+  _sig.forEach(sg=>{
+    if(sg.entry_i<s||sg.entry_i>e)return;
+    const xe=toX(sg.entry_i);
+    const xe2=sg.exit_i!==undefined&&sg.exit_i<=e?toX(sg.exit_i):W-PAD.r;
+    const ye=toY(sg.entry);
+    const yt=toY(sg.tp);
+    const ys=toY(sg.sl);
+    const isLong=sg.dir==='long';
+
+    // TP/SL zone fill
+    ctx.fillStyle=isLong?'rgba(8,153,129,0.07)':'rgba(242,54,69,0.07)';
+    ctx.fillRect(xe,Math.min(yt,ys),Math.max(0,xe2-xe),Math.abs(yt-ys));
+
+    // TP line
+    ctx.strokeStyle='rgba(8,153,129,0.55)';ctx.lineWidth=1;ctx.setLineDash([4,3]);
+    ctx.beginPath();ctx.moveTo(xe,yt);ctx.lineTo(xe2,yt);ctx.stroke();
+    // SL line
+    ctx.strokeStyle='rgba(242,54,69,0.55)';
+    ctx.beginPath();ctx.moveTo(xe,ys);ctx.lineTo(xe2,ys);ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Exit dot
+    if(sg.exit_i!==undefined&&sg.exit_i>=s&&sg.exit_i<=e){
+      const xr=toX(sg.exit_i);
+      ctx.fillStyle=sg.win?'rgba(8,153,129,0.8)':'rgba(242,54,69,0.8)';
+      ctx.beginPath();ctx.arc(xr,toY(sg.win?sg.tp:sg.sl),4,0,Math.PI*2);ctx.fill();
+    }
+
+    // Entry arrow
+    const clr=isLong?'#089981':'#F23645';
+    ctx.fillStyle=clr;
+    ctx.beginPath();
+    if(isLong){ctx.moveTo(xe-5,ye+9);ctx.lineTo(xe+5,ye+9);ctx.lineTo(xe,ye+1);}
+    else{ctx.moveTo(xe-5,ye-9);ctx.lineTo(xe+5,ye-9);ctx.lineTo(xe,ye-1);}
+    ctx.fill();
+
+    // Price labels
+    ctx.fillStyle='rgba(180,180,180,0.7)';ctx.font='9px monospace';ctx.textAlign='left';
+    const fmt=v=>v>100?v.toFixed(1):v.toFixed(4);
+    ctx.fillText('TP '+fmt(sg.tp),xe+4,yt-2);
+    ctx.fillText('SL '+fmt(sg.sl),xe+4,ys+9);
+  });
+
+  // Time axis
+  ctx.fillStyle='rgba(140,140,140,0.4)';ctx.font='9px monospace';ctx.textAlign='center';
+  const every=Math.ceil(vis.length/8);
+  vis.forEach((c,idx)=>{
+    if(idx%every===0){
+      const x=toX(s+idx);
+      const d=new Date(c.t*1000);
+      ctx.fillText((d.getMonth()+1)+'/'+(d.getDate()),x,H-PAD.b+10);
+      ctx.fillText(d.getHours().toString().padStart(2,'0')+':'+d.getMinutes().toString().padStart(2,'0'),x,H-PAD.b+20);
+    }
+  });
+}
+
+function renderCMetrics(m){
+  if(!m)return;
+  const items=[
+    {l:'Сделок',v:m.trades},
+    {l:'WinRate',v:m.winrate+'%'},
+    {l:'Profit Factor',v:m.profit_factor},
+    {l:'Max DD',v:m.max_dd+'%'},
+    {l:'Return',v:m.total_return+'%'},
+    {l:'Fitness',v:m.fitness},
+  ];
+  document.getElementById('chartMetrics').innerHTML=items.map(i=>`<div class="cm"><div class="cl">${i.l}</div><div class="cv">${i.v}</div></div>`).join('');
+}
+
+// Pan & zoom
+cv.addEventListener('mousedown',e=>{_drag=true;_dragX=e.clientX;_dragCam=_camStart;cv.style.cursor='grabbing';});
+document.addEventListener('mouseup',()=>{_drag=false;cv.style.cursor='grab';});
+document.addEventListener('mousemove',e=>{
+  if(!_drag||!_cd.length)return;
+  const W=cv.parentElement.clientWidth-20;
+  const vis=_camEnd-_camStart;
+  const dx=(e.clientX-_dragX)/W*vis;
+  _camStart=Math.max(0,Math.min(_cd.length-vis-1,_dragCam-dx));
+  _camEnd=_camStart+vis;
+  drawChart();
+});
+cv.addEventListener('wheel',e=>{
+  e.preventDefault();
+  if(!_cd.length)return;
+  const z=e.deltaY>0?1.15:0.87;
+  const vis=_camEnd-_camStart;
+  const nv=Math.min(_cd.length,Math.max(20,Math.round(vis*z)));
+  const center=(_camStart+_camEnd)/2;
+  _camStart=Math.max(0,Math.round(center-nv/2));
+  _camEnd=Math.min(_cd.length-1,_camStart+nv);
+  drawChart();
+},{passive:false});
+window.addEventListener('resize',drawChart);
+</script>
 
 function startOpt(){
   const body={
@@ -824,6 +1170,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif self.path == "/opt_status":
             with opt_lock:
                 self._json({k:v for k,v in opt_state.items() if k!="chart"})
+        elif self.path.startswith("/chart_data"):
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            sym  = qs.get("sym",  ["BTC_USDT"])[0]
+            tf   = qs.get("tf",   ["15m"])[0]
+            days = int(qs.get("days", ["7"])[0])
+            sl_p = float(qs.get("sl",  ["0.8"])[0])
+            tp_p = float(qs.get("tp",  ["1.6"])[0])
+            sw   = int(qs.get("swing", ["10"])[0])
+            candles = _fetch_candles(sym, tf, days)
+            if not candles:
+                self._json({"error": "no data"}); return
+            p = {"swing_len": sw, "internal_len": 5, "ob_filter": "atr",
+                 "ob_mitigation": "highlow", "fvg_enabled": True,
+                 "fvg_threshold": 0.1, "choch_only": False,
+                 "use_internal": True, "min_ob_size": 1.0,
+                 "require_fvg_confirm": False, "sl_pct": sl_p, "tp_pct": tp_p}
+            result = _simulate(candles, p, sl_pct=sl_p, tp_pct=tp_p, _collect=True)
+            if not result:
+                self._json({"error": "simulation failed"}); return
+            # Slim down candles for transfer
+            slim = [{"t":c["t"],"o":c["open"],"h":c["high"],"l":c["low"],"c":c["close"]} for c in candles]
+            self._json({"candles": slim, "signals": result.get("signals",[]),
+                        "metrics": {k:result[k] for k in ("trades","winrate","profit_factor","max_dd","total_return","fitness")}})
         else:
             self.send_response(404); self.end_headers()
 
