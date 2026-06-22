@@ -1039,7 +1039,7 @@ cv.addEventListener('wheel',e=>{
 },{passive:false});
 window.addEventListener('resize',drawChart);
 </script>
-
+<script>
 function startOpt(){
   const body={
     symbol:document.getElementById('sym').value,
