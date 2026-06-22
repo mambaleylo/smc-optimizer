@@ -1,1111 +1,877 @@
 #!/usr/bin/env python3
 """
 SMC Optimizer v1.0
-Smart Money Concepts parameter optimizer for Gate.io futures.
-Inspired by WickFill Optimizer architecture (mambaleylo/wickfill).
-
-Что оптимизирует:
-  - swing_len       : длина свинга (pivot detection window)
-  - internal_len    : длина внутренней структуры
-  - ob_filter_mult  : множитель ATR для фильтра OB
-  - fvg_threshold   : порог FVG (0 = выкл, 1 = авто)
-  - use_eqhl        : фильтр Equal High/Low
-  - eqhl_len        : bars confirmation для EQH/EQL
-  - eqhl_thresh     : чувствительность EQH/EQL (ATR-кратное)
-  - entry_type      : 0=BOS-only, 1=CHoCH-only, 2=all
-  - htf_bias        : 0=off, 1=on (торгуем только по тренду HTF swing)
-  - sl_pct          : стоп-лосс %
-  - tp_pct          : тейк-профит %
-  - use_atr_sl      : динамический SL по ATR
-  - atr_sl_mult     : множитель ATR для SL
-  - confirm_bar     : ждать подтверждающий бар после BOS/CHoCH
-
-Стратегия сигналов:
-  LONG  — bullish BOS или CHoCH на swing/internal структуре
-  SHORT — bearish BOS или CHoCH
-
-Выход:
-  - TP / SL по фиксированному % (или ATR-SL)
-  - Следующий противоположный сигнал (sig-close)
-
-Run:   python3 smc_screener.py
-UI:    http://localhost:8765
+- v1.0: первая версия. Оптимизатор параметров Smart Money Concepts (SMC) сигналов
+  по свечам Gate.io Futures. Метод: Basin Hopping + Metropolis. TP/SL как в WickFill.
+  Параметры: swing_len (размер свинга), internal_len (внутренний свинг), ob_filter
+  (фильтр ордер-блоков по ATR), ob_mitigation (Close/HighLow), fvg_threshold,
+  sl_pct, tp_pct. Фитнесс: winrate × profit_factor × log(trades+1) / max_drawdown.
+  HTTP-сервер на :8765, браузерный UI с живым графиком, топ-20 конфигов,
+  автосохранение лучшего на GitHub, Telegram/ntfy алерты.
 """
-
-# ── changelog (newest first) ───────────────────────────────────────────────
-# v1.0: первый релиз — Gate.io candles, SMC signal sim, Basin-Hopping optimizer,
-#       HTML/JS UI, Telegram/ntfy alerts, GitHub config sync.
-# ──────────────────────────────────────────────────────────────────────────
-
 import os, sys, json, time, math, random, threading, base64, hashlib
-import itertools, traceback, copy, bisect, urllib.request
-
-from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
-from urllib.parse import parse_qs, urlparse
-from datetime import datetime, timezone
+import http.server, urllib.request, urllib.parse
+from functools import lru_cache
 
 try:
     import requests
 except ImportError:
-    os.system("pip install requests --break-system-packages -q")
+    os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-# ── ANSI ──────────────────────────────────────────────────────────────────
-_C_RST  = "\033[0m"
-_C_GRN  = "\033[32m"
-_C_YEL  = "\033[33m"
-_C_RED  = "\033[31m"
-_C_GREY = "\033[90m"
-_C_CYN  = "\033[36m"
+APP_VERSION  = "1.0"
+GATE_API     = "https://fx-api.gateio.ws/api/v4"
+PORT         = 8765
+GH_REPO      = os.environ.get("GH_REPO", "mambaleylo/smc-optimizer")
+GH_TOKEN     = os.environ.get("GH_TOKEN", "")
+TG_TOKEN     = os.environ.get("TG_TOKEN", "")
+TG_CHAT      = os.environ.get("TG_CHAT", "")
+NTFY_URL     = os.environ.get("NTFY_URL", "")
 
-# ══════════════════════════════════════════════════════════════════════════
-# PARAM SPACE
-# ══════════════════════════════════════════════════════════════════════════
-PARAM_SPACE = {
-    "swing_len":      {"min": 20,  "max": 100, "step": 5,    "type": "int",   "label": "Swing Length"},
-    "internal_len":   {"min": 3,   "max": 10,  "step": 1,    "type": "int",   "label": "Internal Length"},
-    "ob_filter_mult": {"min": 1.0, "max": 3.0, "step": 0.25, "type": "float", "label": "OB ATR Filter ×"},
-    "fvg_threshold":  {"values": [0, 1],                      "type": "int",   "label": "FVG Auto Thresh"},
-    "use_eqhl":       {"values": [False, True],               "type": "bool",  "label": "EQH/EQL Filter"},
-    "eqhl_len":       {"min": 2,   "max": 6,   "step": 1,    "type": "int",   "label": "EQH/EQL Bars"},
-    "eqhl_thresh":    {"min": 0.0, "max": 0.5, "step": 0.1,  "type": "float", "label": "EQH/EQL Thresh"},
-    "entry_type":     {"values": [0, 1, 2],                   "type": "int",   "label": "Entry: 0=BOS 1=CHoCH 2=All"},
-    "htf_bias":       {"values": [False, True],               "type": "bool",  "label": "HTF Trend Filter"},
-    "confirm_bar":    {"values": [False, True],               "type": "bool",  "label": "Confirmation Bar"},
-    "sl_pct":         {"min": 0.35,"max": 2.0, "step": 0.05, "type": "float", "label": "Stop-Loss (%)"},
-    "tp_pct":         {"min": 0.5, "max": 3.0, "step": 0.1,  "type": "float", "label": "Take-Profit (%)"},
-    "use_atr_sl":     {"values": [False, True],               "type": "bool",  "label": "Dynamic ATR SL"},
-    "atr_sl_mult":    {"min": 0.5, "max": 3.0, "step": 0.25, "type": "float", "label": "ATR SL Mult"},
+_C_GRN = "\033[92m"; _C_YEL = "\033[93m"; _C_RED = "\033[91m"
+_C_GREY = "\033[90m"; _C_RST = "\033[0m"
+
+TF_SECONDS = {
+    "1m":60,"5m":300,"15m":900,"30m":1800,
+    "1h":3600,"4h":14400,"1d":86400
 }
 
-def _param_grid(spec):
-    if "values" in spec:
-        return list(spec["values"])
-    mn, mx, st = spec["min"], spec["max"], spec["step"]
-    vals = []
-    v = mn
-    while v <= mx + 1e-9:
-        if spec["type"] == "int":
-            vals.append(int(round(v)))
-        else:
-            vals.append(round(v, 6))
-        v += st
-    return vals
+# ─── Пространство параметров ────────────────────────────────────────────────
+PARAM_SPACE = {
+    "sl_pct":        {"min":0.3,  "max":2.0,  "step":0.05, "type":"float"},
+    "tp_pct":        {"min":0.5,  "max":4.0,  "step":0.05, "type":"float"},
+    "swing_len":     {"min":10,   "max":100,  "step":5,    "type":"int"},
+    "internal_len":  {"min":3,    "max":15,   "step":1,    "type":"int"},
+    "ob_filter":     {"values":["atr","range"],             "type":"cat"},
+    "ob_mitigation": {"values":["close","highlow"],         "type":"cat"},
+    "fvg_enabled":   {"values":[True, False],               "type":"bool"},
+    "fvg_threshold": {"min":0.0,  "max":0.5,  "step":0.05, "type":"float"},
+    "choch_only":    {"values":[False, True],               "type":"bool"},
+    "use_internal":  {"values":[True, False],               "type":"bool"},
+    "min_ob_size":   {"min":0.5,  "max":3.0,  "step":0.1,  "type":"float"},
+    "require_fvg_confirm": {"values":[False,True],          "type":"bool"},
+}
 
-_GRIDS = {k: _param_grid(v) for k, v in PARAM_SPACE.items()}
+# ─── Глобальное состояние ───────────────────────────────────────────────────
+opt_lock   = threading.Lock()
+opt_state  = {
+    "running": False, "logs": [], "best": None, "top20": [],
+    "cycle": 0, "trials": 0, "progress": 0,
+    "symbol": "BTC_USDT", "tf": "15m", "days": 30,
+    "sl_pct": 0.6, "tp_pct": 1.2, "risk_pct": 2.0,
+    "chart": None, "fetch_pct": 0, "logs_dropped": 0,
+}
+_stop_flag = threading.Event()
+_opt_thread = None
 
-def _rand_params():
-    return {k: random.choice(v) for k, v in _GRIDS.items()}
+def _ts():
+    return time.strftime("[%H:%M:%S]")
 
-def _clamp_params(p):
-    out = {}
-    for k, g in _GRIDS.items():
-        v = p.get(k, g[0])
-        if v not in g:
-            # snap to nearest
-            v = min(g, key=lambda x: abs(x - v) if isinstance(v, (int, float)) else 0)
-        out[k] = v
-    return out
+def olog(msg):
+    with opt_lock:
+        opt_state["logs"].append({"ts": time.strftime("%H:%M:%S"), "msg": msg})
+        if len(opt_state["logs"]) > 500:
+            opt_state["logs"] = opt_state["logs"][-300:]
+            opt_state["logs_dropped"] = opt_state.get("logs_dropped",0) + 200
 
-# ══════════════════════════════════════════════════════════════════════════
-# GATE.IO CANDLE FETCHING
-# ══════════════════════════════════════════════════════════════════════════
-GATE_BASE = "https://api.gateio.ws/api/v4"
-
-def _tf_to_seconds(tf: str) -> int:
-    table = {"1m":60,"3m":180,"5m":300,"15m":900,"30m":1800,
-             "1h":3600,"2h":7200,"4h":14400,"6h":21600,"12h":43200,
-             "1d":86400,"1w":604800}
-    return table.get(tf, 3600)
-
-def fetch_candles(symbol: str, tf: str, days: int = 90) -> list:
-    """Загружает свечи с Gate.io фьючерсы. Возвращает список dict {t,o,h,l,c,v}."""
-    interval = tf
-    limit_per_req = 1000
-    tf_sec = _tf_to_seconds(tf)
-    now_ts = int(time.time())
-    since_ts = now_ts - days * 86400
-
-    candles = []
-    end_ts = now_ts
-    seen = set()
-
-    for _ in range(50):
-        url = (f"{GATE_BASE}/futures/usdt/candlesticks"
-               f"?contract={symbol}&interval={interval}&limit={limit_per_req}&to={end_ts}")
+# ─── Gate.io fetch ──────────────────────────────────────────────────────────
+def _fetch_candles(symbol, tf, days):
+    interval_sec = TF_SECONDS.get(tf, 3600)
+    now   = int(time.time())
+    since = now - days * 86400
+    LIMIT = 999
+    all_candles = []
+    current_from = since
+    while current_from < now:
         try:
-            r = requests.get(url, timeout=15)
-            r.raise_for_status()
-            batch = r.json()
+            r = requests.get(f"{GATE_API}/futures/usdt/candlesticks",
+                params={"contract":symbol,"interval":tf,"from":current_from,"limit":LIMIT},
+                timeout=15)
+            if r.status_code != 200:
+                time.sleep(5); continue
+            raw = r.json()
+            if not raw: break
+            batch = []
+            for c in raw:
+                t = int(c.get("t",0))
+                batch.append({
+                    "t": t, "open": float(c.get("o",0)),
+                    "high": float(c.get("h",0)), "low": float(c.get("l",0)),
+                    "close": float(c.get("c",0)), "vol": float(c.get("v",0))
+                })
+            if not batch: break
+            all_candles.extend(batch)
+            last_t = batch[-1]["t"]
+            if last_t >= now - interval_sec: break
+            current_from = last_t + interval_sec
+            time.sleep(0.12)
         except Exception as e:
-            print(f"{_C_RED}[candles] fetch error: {e}{_C_RST}", flush=True)
-            break
+            olog(f"fetch error: {e}")
+            time.sleep(5)
+    seen = set()
+    result = []
+    for c in sorted(all_candles, key=lambda x: x["t"]):
+        if c["t"] not in seen:
+            seen.add(c["t"]); result.append(c)
+    return result
 
-        if not batch:
-            break
+# ─── Индикаторы ─────────────────────────────────────────────────────────────
+def _ema(arr, period):
+    result = [None]*len(arr)
+    if len(arr) < period: return result
+    k = 2.0/(period+1)
+    s = sum(arr[:period])/period
+    result[period-1] = s
+    for i in range(period, len(arr)):
+        s = arr[i]*k + s*(1-k)
+        result[i] = s
+    return result
 
-        new = 0
-        for c in batch:
-            t = int(c.get("t") or c.get("time") or 0)
-            if t in seen or t < since_ts:
-                continue
-            seen.add(t)
-            candles.append({
-                "t": t,
-                "o": float(c.get("o") or c.get("open") or 0),
-                "h": float(c.get("h") or c.get("high") or 0),
-                "l": float(c.get("l") or c.get("low") or 0),
-                "c": float(c.get("c") or c.get("close") or 0),
-                "v": float(c.get("v") or c.get("volume") or 0),
-            })
-            new += 1
-
-        if not new:
-            break
-
-        oldest = min(int(c.get("t") or c.get("time") or end_ts) for c in batch)
-        if oldest <= since_ts:
-            break
-        end_ts = oldest - 1
-        time.sleep(0.05)
-
-    candles.sort(key=lambda x: x["t"])
-    return candles
-
-# ══════════════════════════════════════════════════════════════════════════
-# SMC SIGNAL SIMULATOR
-# ══════════════════════════════════════════════════════════════════════════
-def _atr(candles, period=14, i=None):
-    """ATR до индекса i (включительно)."""
-    if i is None:
-        i = len(candles) - 1
-    start = max(0, i - period + 1)
+def _atr(candles, period=14):
     trs = []
-    for j in range(start, i + 1):
-        h, l, c = candles[j]["h"], candles[j]["l"], candles[j]["c"]
-        pc = candles[j-1]["c"] if j > 0 else c
-        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
-    return sum(trs) / len(trs) if trs else 0.0
+    for i in range(1, len(candles)):
+        h = candles[i]["high"]; l = candles[i]["low"]; pc = candles[i-1]["close"]
+        trs.append(max(h-l, abs(h-pc), abs(l-pc)))
+    result = [None]*len(candles)
+    if len(trs) < period: return result
+    s = sum(trs[:period])/period
+    result[period] = s
+    for i in range(period+1, len(candles)):
+        s = (s*(period-1) + trs[i-1])/period
+        result[i] = s
+    return result
 
-def _detect_pivots(candles, size):
-    """
-    Возвращает список (index, price, direction) — 'H' или 'L'.
-    Pivot high: high[size] > all highs in [0..size-1] and [size+1..2*size]
-    """
+def _pivot_high(candles, length):
+    """Возвращает массив pivot high цен (None если не пивот)"""
     n = len(candles)
-    pivots = []
-    for i in range(size, n - size):
-        hi = candles[i]["h"]
-        lo = candles[i]["l"]
-        is_ph = all(candles[i-k]["h"] < hi for k in range(1, size+1)) and \
-                all(candles[i+k]["h"] < hi for k in range(1, size+1))
-        is_pl = all(candles[i-k]["l"] > lo for k in range(1, size+1)) and \
-                all(candles[i+k]["l"] > lo for k in range(1, size+1))
-        if is_ph:
-            pivots.append((i, hi, "H"))
-        if is_pl:
-            pivots.append((i, lo, "L"))
-    pivots.sort(key=lambda x: x[0])
-    return pivots
+    result = [None]*n
+    for i in range(length, n-length):
+        h = candles[i]["high"]
+        if all(candles[j]["high"] < h for j in range(i-length, i)) and \
+           all(candles[j]["high"] < h for j in range(i+1, i+length+1)):
+            result[i] = h
+    return result
 
-def _get_htf_direction(candles, swing_len):
-    """
-    Упрощённый HTF тренд: последовательность HH/HL → 1 (bull), LH/LL → -1 (bear).
-    Смотрим на последние 3 свинг-точки.
-    """
-    pivots = _detect_pivots(candles, swing_len)
-    highs = [(i, p) for i, p, d in pivots if d == "H"]
-    lows  = [(i, p) for i, p, d in pivots if d == "L"]
-    if len(highs) >= 2 and len(lows) >= 2:
-        hh = highs[-1][1] > highs[-2][1]
-        hl = lows[-1][1]  > lows[-2][1]
-        if hh and hl:
-            return 1
-        if not hh and not hl:
-            return -1
-    return 0
+def _pivot_low(candles, length):
+    """Возвращает массив pivot low цен (None если не пивот)"""
+    n = len(candles)
+    result = [None]*n
+    for i in range(length, n-length):
+        l = candles[i]["low"]
+        if all(candles[j]["low"] > l for j in range(i-length, i)) and \
+           all(candles[j]["low"] > l for j in range(i+1, i+length+1)):
+            result[i] = l
+    return result
 
-def simulate(candles, p, days_limit=0, init_deposit=100.0, risk_pct=20.0):
+# ─── SMC симуляция ──────────────────────────────────────────────────────────
+def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=2.0,
+              init_deposit=1000.0, _collect=False):
     """
-    Симулирует торговлю SMC-сигналами по параметрам p.
-    Возвращает dict с метриками или None.
+    Симуляция SMC стратегии по параметрам p.
+    Возвращает dict с метриками или None если мало данных.
     """
-    sw  = p["swing_len"]
-    iln = p["internal_len"]
-    ob_mult = p["ob_filter_mult"]
-    entry_t = p["entry_type"]     # 0=BOS, 1=CHoCH, 2=all
-    htf_on  = p["htf_bias"]
-    conf_b  = p["confirm_bar"]
-    sl_p    = p["sl_pct"] / 100
-    tp_p    = p["tp_pct"] / 100
-    use_atr_sl = p["use_atr_sl"]
-    atr_sl_m   = p["atr_sl_mult"]
+    if sl_pct is None: sl_pct = p["sl_pct"]
+    if tp_pct is None: tp_pct = p["tp_pct"]
 
-    if days_limit > 0:
-        cutoff = time.time() - days_limit * 86400
-        candles = [c for c in candles if c["t"] >= cutoff]
+    swing_len     = int(p["swing_len"])
+    internal_len  = int(p.get("internal_len", 5))
+    ob_filter     = p.get("ob_filter","atr")
+    ob_mit        = p.get("ob_mitigation","highlow")
+    fvg_enabled   = p.get("fvg_enabled", True)
+    fvg_thr       = p.get("fvg_threshold", 0.1)
+    choch_only    = p.get("choch_only", False)
+    use_internal  = p.get("use_internal", True)
+    min_ob_size   = p.get("min_ob_size", 1.0)
+    req_fvg       = p.get("require_fvg_confirm", False)
 
     n = len(candles)
-    min_bars = max(sw * 2, iln * 2, 30)
-    if n < min_bars:
-        return None
+    min_bars = swing_len*2 + 20
+    if n < min_bars: return None
 
-    # HTF direction (whole dataset as proxy)
-    htf_dir = _get_htf_direction(candles, max(sw, 5)) if htf_on else 0
+    # ATR
+    atr_arr = _atr(candles, 200)
+    cum_tr = 0.0; cum_atr_range = []
+    for i in range(1, n):
+        h=candles[i]["high"]; l=candles[i]["low"]; pc=candles[i-1]["close"]
+        cum_tr += max(h-l, abs(h-pc), abs(l-pc))
+        cum_atr_range.append(cum_tr / i)
 
-    # ── detect swing structure ────────────────────────────────────────────
-    # We scan bar-by-bar, maintaining last pivot high/low and trend bias.
-    # When close crosses last pivot → BOS or CHoCH.
+    # Пивоты
+    ph = _pivot_high(candles, swing_len)
+    pl = _pivot_low(candles, swing_len)
+    if use_internal:
+        iph = _pivot_high(candles, internal_len)
+        ipl = _pivot_low(candles, internal_len)
+    else:
+        iph = [None]*n; ipl = [None]*n
 
-    # Pre-detect all pivots (swing and internal)
-    swing_pivots   = _detect_pivots(candles, sw)
-    internal_pivots= _detect_pivots(candles, iln)
+    # Order blocks: ищем последний бычий/медвежий OB
+    # Бычий OB = последняя медвежья свеча перед пробитием вверх swing high
+    # Медвежий OB = последняя бычья свеча перед пробитием вниз swing low
 
-    # Build per-bar last-known pivot (for real-time simulation)
-    # sw_high_at[i] = (pivot_bar, pivot_price) last swing high known at bar i
-    def _build_pivot_maps(pivots, n):
-        last_h = [None] * n
-        last_l = [None] * n
-        ph, pl = None, None
-        pi = 0
-        plist = pivots
-        for i in range(n):
-            # pivots confirmed at i - size (already in the list up to i-size)
-            while pi < len(plist) and plist[pi][0] <= i - 1:
-                idx, price, d = plist[pi]
-                if d == "H":
-                    ph = (idx, price)
-                else:
-                    pl = (idx, price)
-                pi += 1
-            last_h[i] = ph
-            last_l[i] = pl
-        return last_h, last_l
+    # Определяем swing trend и CHoCH/BOS
+    sw_highs = []  # (i, price)
+    sw_lows  = []  # (i, price)
+    for i in range(n):
+        if ph[i] is not None: sw_highs.append((i, ph[i]))
+        if pl[i] is not None: sw_lows.append((i, pl[i]))
 
-    sw_lh, sw_ll   = _build_pivot_maps(swing_pivots,   n)
-    in_lh, in_ll   = _build_pivot_maps(internal_pivots, n)
+    # FVG детекция
+    fvg_bull = []  # (i, low, high) бычий FVG: low[i] > high[i-2]
+    fvg_bear = []  # (i, high, low) медвежий FVG: high[i] < low[i-2]
+    for i in range(2, n):
+        gap_b = candles[i]["low"] - candles[i-2]["high"]
+        gap_s = candles[i-2]["low"] - candles[i]["high"]
+        atr_val = atr_arr[i] or 0.001
+        if gap_b > fvg_thr * atr_val:
+            fvg_bull.append((i, candles[i-2]["high"], candles[i]["low"]))
+        if gap_s > fvg_thr * atr_val:
+            fvg_bear.append((i, candles[i]["high"], candles[i-2]["low"]))
 
-    # ── simulation loop ───────────────────────────────────────────────────
-    deposit  = init_deposit
-    trades   = []
-    in_trade = False
-    direction= 0
-    ep = tp_price = sl_price = 0.0
-    entry_bar = 0
+    # Основной бэктест
+    equity    = init_deposit
+    trades    = []
+    signals   = []  # для _collect
+    in_trade  = False
+    trade_dir = None  # "long" / "short"
+    entry_px  = 0.0
+    sl_price  = 0.0
+    tp_price  = 0.0
+    entry_i   = 0
 
-    sw_trend   = 0   # last known swing trend
-    in_trend   = 0   # last known internal trend
-    sw_ph_crossed = True
-    sw_pl_crossed = True
-    in_ph_crossed = True
-    in_pl_crossed = True
-    last_sw_h = last_sw_l = None
-    last_in_h = last_in_l = None
+    # Swing trend state
+    last_sh = None  # последний swing high (i, price)
+    last_sl_sw = None  # последний swing low (i, price)
+    sw_trend = 0   # +1 bull, -1 bear
 
-    # for BOS/CHoCH detection track if pivot crossed
-    sw_h_cross = {}   # pivot_bar → crossed bool
-    sw_l_cross = {}
-    in_h_cross = {}
-    in_l_cross = {}
+    # OB storage: list of {"dir":+1/-1, "hi":, "lo":, "i":}
+    bull_obs = []
+    bear_obs = []
 
-    signals = []  # list of {bar, dir, ep, tp, sl, exit_bar, exit_price, win}
+    for i in range(swing_len*2, n):
+        c = candles[i]
+        high_i = c["high"]; low_i = c["low"]
+        close_i = c["close"]; open_i = c["open"]
 
-    pending_entry = None  # (bar, direction, ep, tp, sl) for confirm_bar mode
+        # Update swing highs/lows
+        if ph[i] is not None:
+            # New swing high
+            if last_sh is None or ph[i] > last_sh[1]:
+                if last_sh is not None and sw_trend == -1:
+                    # CHoCH вверх или BOS вверх
+                    pass
+                last_sh = (i, ph[i])
+            # Медвежий OB перед этим высоким: ищем последнюю бычью свечу до i
+            ob_hi_bar = i - 1
+            while ob_hi_bar > max(0, i-swing_len):
+                ci = candles[ob_hi_bar]
+                is_bullish = ci["close"] > ci["open"]
+                size_ok = (ci["high"] - ci["low"]) >= min_ob_size * (atr_arr[i] or 0.001)
+                if is_bullish and size_ok:
+                    bear_obs.append({"dir":-1,"hi":ci["high"],"lo":ci["low"],"i":ob_hi_bar})
+                    if len(bear_obs) > 10: bear_obs.pop(0)
+                    break
+                ob_hi_bar -= 1
 
-    for i in range(min_bars, n):
-        c  = candles[i]
-        hi = c["h"]; lo = c["l"]; cl = c["c"]; op = c["o"]
+        if pl[i] is not None:
+            if last_sl_sw is None or pl[i] < last_sl_sw[1]:
+                last_sl_sw = (i, pl[i])
+            # Бычий OB перед этим низким: последняя медвежья свеча до i
+            ob_lo_bar = i - 1
+            while ob_lo_bar > max(0, i-swing_len):
+                ci = candles[ob_lo_bar]
+                is_bearish = ci["close"] < ci["open"]
+                size_ok = (ci["high"] - ci["low"]) >= min_ob_size * (atr_arr[i] or 0.001)
+                if is_bearish and size_ok:
+                    bull_obs.append({"dir":+1,"hi":ci["high"],"lo":ci["low"],"i":ob_lo_bar})
+                    if len(bull_obs) > 10: bull_obs.pop(0)
+                    break
+                ob_lo_bar -= 1
 
-        # ── close open trade ─────────────────────────────────────────────
-        if in_trade:
-            hit_tp = (direction == 1 and hi >= tp_price) or (direction == -1 and lo <= tp_price)
-            hit_sl = (direction == 1 and lo <= sl_price) or (direction == -1 and hi >= sl_price)
-            if hit_tp or hit_sl:
-                win = hit_tp and not hit_sl
-                if hit_tp and hit_sl:
-                    # simultaneous — conservative: SL wins
-                    win = False
-                exit_p = tp_price if win else sl_price
-                pnl_pct = (exit_p - ep) / ep * direction
-                pos_size = deposit * risk_pct / 100 / sl_p
-                pnl_usdt = pos_size * pnl_pct
-                deposit += pnl_usdt
-                signals[-1]["exit_bar"]  = i
-                signals[-1]["exit_price"]= exit_p
-                signals[-1]["win"]       = win
-                signals[-1]["pnl_pct"]   = pnl_pct * 100
-                in_trade = False
-
-        # ── pivot updates ─────────────────────────────────────────────────
-        # Swing
-        cur_sw_h = sw_lh[i]
-        cur_sw_l = sw_ll[i]
-        if cur_sw_h and cur_sw_h != last_sw_h:
-            last_sw_h = cur_sw_h
-            sw_h_cross[cur_sw_h[0]] = False
-        if cur_sw_l and cur_sw_l != last_sw_l:
-            last_sw_l = cur_sw_l
-            sw_l_cross[cur_sw_l[0]] = False
-
-        # Internal
-        cur_in_h = in_lh[i]
-        cur_in_l = in_ll[i]
-        if cur_in_h and cur_in_h != last_in_h:
-            last_in_h = cur_in_h
-            in_h_cross[cur_in_h[0]] = False
-        if cur_in_l and cur_in_l != last_in_l:
-            last_in_l = cur_in_l
-            in_l_cross[cur_in_l[0]] = False
-
-        # ── structure breaks ──────────────────────────────────────────────
-        sig_dir = 0
-        sig_type = ""  # "BOS" or "CHoCH"
-
-        def _check_cross_up(pivot_map, cross_map, trend_ref):
-            """Returns (broke, sig_type) if close crosses above last pivot high."""
-            nonlocal sw_trend, in_trend
-            if not pivot_map:
-                return 0, ""
-            pb, pp = pivot_map
-            if pb in cross_map and not cross_map[pb] and cl > pp:
-                cross_map[pb] = True
-                t = "CHoCH" if trend_ref < 0 else "BOS"
-                return 1, t
-            return 0, ""
-
-        def _check_cross_dn(pivot_map, cross_map, trend_ref):
-            if not pivot_map:
-                return 0, ""
-            pb, pp = pivot_map
-            if pb in cross_map and not cross_map[pb] and cl < pp:
-                cross_map[pb] = True
-                t = "CHoCH" if trend_ref > 0 else "BOS"
-                return -1, t
-            return 0, ""
-
-        # Swing crosses
-        bull_sw, bst_sw = _check_cross_up(last_sw_h, sw_h_cross, sw_trend)
-        bear_sw, bst_sw2= _check_cross_dn(last_sw_l, sw_l_cross, sw_trend)
-        if bull_sw:
-            sw_trend = 1
-        if bear_sw:
+        # Swing trend update: BOS/CHoCH
+        if last_sh is not None and close_i > last_sh[1]:
+            sw_trend = +1
+        if last_sl_sw is not None and close_i < last_sl_sw[1]:
             sw_trend = -1
 
-        # Internal crosses
-        bull_in, bst_in = _check_cross_up(last_in_h, in_h_cross, in_trend)
-        bear_in, bst_in2= _check_cross_dn(last_in_l, in_l_cross, in_trend)
-        if bull_in:
-            in_trend = 1
-        if bear_in:
-            in_trend = -1
+        # Управление открытой позицией
+        if in_trade:
+            if trade_dir == "long":
+                sl_src = low_i if ob_mit == "highlow" else close_i
+                tp_src = high_i
+                if sl_src <= sl_price:
+                    pnl_pct = -sl_pct
+                    pnl = equity * (risk_pct/100.0) * (-1.0)
+                    equity += pnl
+                    trades.append({"dir":"long","entry":entry_px,"exit":sl_price,
+                                   "pnl_pct":pnl_pct,"pnl":pnl,"win":False,"i":i})
+                    if _collect:
+                        signals.append({"dir":"long","entry_i":entry_i,"exit_i":i,
+                                        "entry":entry_px,"tp":tp_price,"sl":sl_price,"win":False})
+                    in_trade = False
+                elif tp_src >= tp_price:
+                    rr = tp_pct / sl_pct
+                    pnl = equity * (risk_pct/100.0) * rr
+                    equity += pnl
+                    trades.append({"dir":"long","entry":entry_px,"exit":tp_price,
+                                   "pnl_pct":tp_pct,"pnl":pnl,"win":True,"i":i})
+                    if _collect:
+                        signals.append({"dir":"long","entry_i":entry_i,"exit_i":i,
+                                        "entry":entry_px,"tp":tp_price,"sl":sl_price,"win":True})
+                    in_trade = False
+            else:  # short
+                sl_src = high_i if ob_mit == "highlow" else close_i
+                tp_src = low_i
+                if sl_src >= sl_price:
+                    pnl = equity * (risk_pct/100.0) * (-1.0)
+                    equity += pnl
+                    trades.append({"dir":"short","entry":entry_px,"exit":sl_price,
+                                   "pnl_pct":-sl_pct,"pnl":pnl,"win":False,"i":i})
+                    if _collect:
+                        signals.append({"dir":"short","entry_i":entry_i,"exit_i":i,
+                                        "entry":entry_px,"tp":tp_price,"sl":sl_price,"win":False})
+                    in_trade = False
+                elif tp_src <= tp_price:
+                    rr = tp_pct / sl_pct
+                    pnl = equity * (risk_pct/100.0) * rr
+                    equity += pnl
+                    trades.append({"dir":"short","entry":entry_px,"exit":tp_price,
+                                   "pnl_pct":tp_pct,"pnl":pnl,"win":True,"i":i})
+                    if _collect:
+                        signals.append({"dir":"short","entry_i":entry_i,"exit_i":i,
+                                        "entry":entry_px,"tp":tp_price,"sl":sl_price,"win":True})
+                    in_trade = False
+            if in_trade: continue
 
-        # Choose signal
-        for d, st in [(1, bst_sw if bull_sw else ""), (-1, bst_sw2 if bear_sw else ""),
-                      (1, bst_in if bull_in else ""), (-1, bst_in2 if bear_in else "")]:
-            if d == 0 or not st:
-                continue
-            # entry_type filter
-            if entry_t == 0 and st != "BOS":
-                continue
-            if entry_t == 1 and st != "CHoCH":
-                continue
-            # HTF filter
-            if htf_on and htf_dir != 0 and d != htf_dir:
-                continue
-            sig_dir = d
-            sig_type = st
-            break
+        # Сигнал входа — ищем возврат цены в OB
+        sig_dir = None
+        entry_candidate = None
 
-        # ── confirm bar ───────────────────────────────────────────────────
-        if pending_entry:
-            pb, pd, pep, ptp, psl = pending_entry
-            pending_entry = None
-            if not in_trade:
-                # entry at open of this bar
-                actual_ep = op
-                lev = max(1, round(risk_pct / (p["sl_pct"])))
-                signals.append({"bar": i, "dir": pd, "ep": actual_ep,
-                                 "tp": ptp, "sl": psl, "type": sig_type,
-                                 "exit_bar": None, "exit_price": None,
-                                 "win": None, "pnl_pct": None})
-                in_trade  = True
-                direction = pd
-                ep        = actual_ep
-                sl_price  = actual_ep * (1 - psl * pd) if pd == 1 else actual_ep * (1 + psl)
-                tp_price  = actual_ep * (1 + ptp * pd) if pd == 1 else actual_ep * (1 - ptp)
+        # Бычий сигнал: цена возвращается в бычий OB снизу при бычьем тренде (или CHoCH)
+        for ob in reversed(bull_obs):
+            in_ob = low_i <= ob["hi"] and high_i >= ob["lo"]
+            trend_ok = (sw_trend == +1) or (not choch_only)
+            if in_ob and trend_ok:
+                # FVG подтверждение
+                fvg_ok = True
+                if req_fvg and fvg_enabled:
+                    fvg_ok = any(f[0] > ob["i"] and f[0] <= i and
+                                  f[1] <= ob["hi"] and f[2] >= ob["lo"]
+                                  for f in fvg_bull)
+                if fvg_ok:
+                    sig_dir = "long"
+                    entry_candidate = ob
+                    break
 
-        if sig_dir != 0 and not in_trade:
-            actual_sl = sl_p
-            if use_atr_sl:
-                bar_atr = _atr(candles, 14, i)
-                if ep_tmp := cl:
-                    dyn = bar_atr * atr_sl_m / cl
-                    actual_sl = max(sl_p, min(sl_p * 3, dyn))
+        if sig_dir is None:
+            for ob in reversed(bear_obs):
+                in_ob = high_i >= ob["lo"] and low_i <= ob["hi"]
+                trend_ok = (sw_trend == -1) or (not choch_only)
+                if in_ob and trend_ok:
+                    fvg_ok = True
+                    if req_fvg and fvg_enabled:
+                        fvg_ok = any(f[0] > ob["i"] and f[0] <= i and
+                                      f[1] <= ob["hi"] and f[2] >= ob["lo"]
+                                      for f in fvg_bear)
+                    if fvg_ok:
+                        sig_dir = "short"
+                        entry_candidate = ob
+                        break
 
-            ep_now  = cl
-            if sig_dir == 1:
-                sl_now = ep_now * (1 - actual_sl)
-                tp_now = ep_now * (1 + tp_p)
+        if sig_dir is not None and entry_candidate is not None:
+            entry_px  = close_i
+            if sig_dir == "long":
+                sl_price = entry_px * (1 - sl_pct/100)
+                tp_price = entry_px * (1 + tp_pct/100)
             else:
-                sl_now = ep_now * (1 + actual_sl)
-                tp_now = ep_now * (1 - tp_p)
+                sl_price = entry_px * (1 + sl_pct/100)
+                tp_price = entry_px * (1 - tp_pct/100)
+            in_trade  = True
+            trade_dir = sig_dir
+            entry_i   = i
 
-            if conf_b:
-                pending_entry = (i, sig_dir, ep_now, tp_p, actual_sl)
-            else:
-                signals.append({"bar": i, "dir": sig_dir, "ep": ep_now,
-                                 "tp": tp_now, "sl": sl_now, "type": sig_type,
-                                 "exit_bar": None, "exit_price": None,
-                                 "win": None, "pnl_pct": None})
-                in_trade  = True
-                direction = sig_dir
-                ep        = ep_now
-                sl_price  = sl_now
-                tp_price  = tp_now
-                entry_bar = i
+    # Метрики
+    if len(trades) < 5: return None
+    wins   = [t for t in trades if t["win"]]
+    losses = [t for t in trades if not t["win"]]
+    wr     = len(wins)/len(trades)
+    gross_profit = sum(t["pnl"] for t in wins)
+    gross_loss   = abs(sum(t["pnl"] for t in losses)) or 1e-9
+    pf   = gross_profit / gross_loss
+    # Max drawdown
+    eq = init_deposit
+    peak = eq; max_dd = 0.0
+    for t in trades:
+        eq += t["pnl"]
+        if eq > peak: peak = eq
+        dd = (peak - eq)/peak if peak > 0 else 0
+        if dd > max_dd: max_dd = dd
+    max_dd = max(max_dd, 0.001)
+    total_return = (equity - init_deposit)/init_deposit*100
 
-    # ── compute metrics ───────────────────────────────────────────────────
-    closed = [s for s in signals if s["exit_bar"] is not None]
-    if len(closed) < 3:
-        return None
-
-    wins    = sum(1 for s in closed if s["win"])
-    losses  = len(closed) - wins
-    wr      = wins / len(closed)
-    avg_win = sum(s["pnl_pct"] for s in closed if s["win"]) / max(wins, 1)
-    avg_los = abs(sum(s["pnl_pct"] for s in closed if not s["win"])) / max(losses, 1)
-    pf      = (wins * avg_win) / max(losses * avg_los, 1e-9)
-
-    # max drawdown
-    eq_curve = [init_deposit]
-    dep = init_deposit
-    for s in closed:
-        pos = dep * risk_pct / 100 / sl_p
-        dep += pos * (s["pnl_pct"] / 100)
-        eq_curve.append(dep)
-    peak = eq_curve[0]
-    max_dd = 0.0
-    for eq in eq_curve:
-        peak = max(peak, eq)
-        dd = (peak - eq) / peak * 100 if peak > 0 else 0
-        max_dd = max(max_dd, dd)
-
-    final_dep = eq_curve[-1]
-    fitness = (wr * 0.4 + min(pf, 5) / 5 * 0.3 + min(len(closed), 30) / 30 * 0.2
-               - max_dd / 100 * 0.1) * (final_dep / init_deposit)
-
-    return {
-        "fitness":   round(fitness, 6),
-        "wr":        round(wr * 100, 2),
-        "trades":    len(closed),
-        "pf":        round(pf, 3),
-        "max_dd":    round(max_dd, 2),
-        "equity":    round(final_dep, 2),
-        "signals":   signals,
-        "closed":    closed,
+    result = {
+        "trades": len(trades), "winrate": round(wr*100,1),
+        "profit_factor": round(pf,3), "max_dd": round(max_dd*100,2),
+        "total_return": round(total_return,2), "equity": round(equity,2),
+        "fitness": 0.0,
     }
+    # Fitness: WR × PF × log(trades) / (1+max_dd) — штраф за просадку
+    fitness = (wr * min(pf,5.0) * math.log(len(trades)+1)) / (1 + max_dd)
+    result["fitness"] = round(fitness, 6)
 
-# ══════════════════════════════════════════════════════════════════════════
-# OPTIMIZER STATE
-# ══════════════════════════════════════════════════════════════════════════
-opt_state = {
-    "running":    False,
-    "symbol":     "BTC_USDT",
-    "tf":         "1h",
-    "days":       60,
-    "risk_pct":   20.0,
-    "deposit":    100.0,
-    "best":       None,
-    "best_params":None,
-    "cycle":      0,
-    "iters":      0,
-    "logs":       [],
-    "candles":    [],
-    "candles_ts": 0,
-    "alert_cfg":  {},
-    "top20":      [],
-}
+    if _collect:
+        result["signals"] = signals
+        result["candles"] = candles
 
-_opt_thread  = None
-_candles_lock= threading.Lock()
-_state_lock  = threading.Lock()
+    return result
 
-ALERT_CFG_FILE = os.path.expanduser("~/.smc_alert_cfg.json")
-BEST_FILE      = os.path.expanduser("~/.smc_best.json")
+# ─── Параметры: random / shake ───────────────────────────────────────────────
+def _random_params():
+    p = {}
+    for k, sp in PARAM_SPACE.items():
+        if sp["type"] == "float":
+            steps = round((sp["max"]-sp["min"])/sp["step"])
+            p[k] = round(sp["min"] + random.randint(0,steps)*sp["step"], 4)
+        elif sp["type"] == "int":
+            steps = (sp["max"]-sp["min"])//sp["step"]
+            p[k] = int(sp["min"] + random.randint(0,steps)*sp["step"])
+        elif sp["type"] == "cat":
+            p[k] = random.choice(sp["values"])
+        elif sp["type"] == "bool":
+            p[k] = random.choice(sp["values"])
+    return p
 
-def _load_persistent():
-    global opt_state
-    if os.path.exists(ALERT_CFG_FILE):
-        try:
-            opt_state["alert_cfg"] = json.load(open(ALERT_CFG_FILE))
-        except Exception:
-            pass
-    if os.path.exists(BEST_FILE):
-        try:
-            d = json.load(open(BEST_FILE))
-            if d.get("params"):
-                opt_state["best_params"] = d["params"]
-                opt_state["best"] = d.get("metrics")
-                _log(f"[start] загружен локальный best: fit={d.get('metrics',{}).get('fitness','?')}")
-        except Exception:
-            pass
+def _shake(p, strength=0.3):
+    q = dict(p)
+    keys = list(PARAM_SPACE.keys())
+    n_shake = max(1, int(len(keys)*strength))
+    for k in random.sample(keys, n_shake):
+        sp = PARAM_SPACE[k]
+        if sp["type"] == "float":
+            steps = round((sp["max"]-sp["min"])/sp["step"])
+            q[k] = round(sp["min"] + random.randint(0,steps)*sp["step"], 4)
+        elif sp["type"] == "int":
+            steps = (sp["max"]-sp["min"])//sp["step"]
+            q[k] = int(sp["min"] + random.randint(0,steps)*sp["step"])
+        elif sp["type"] in ("cat","bool"):
+            q[k] = random.choice(sp["values"])
+    return q
 
-def _save_best_local(params, metrics):
+def _neighbour(p, temp=0.1):
+    """Малое отклонение одного-двух параметров"""
+    q = dict(p)
+    keys = [k for k,sp in PARAM_SPACE.items() if sp["type"] in ("float","int")]
+    for k in random.sample(keys, min(2, len(keys))):
+        sp = PARAM_SPACE[k]
+        if sp["type"] == "float":
+            delta = random.choice([-2,-1,1,2]) * sp["step"]
+            q[k] = round(max(sp["min"], min(sp["max"], p[k]+delta)), 4)
+        elif sp["type"] == "int":
+            delta = random.choice([-2,-1,1,2]) * sp["step"]
+            q[k] = int(max(sp["min"], min(sp["max"], p[k]+delta)))
+    return q
+
+# ─── GitHub ─────────────────────────────────────────────────────────────────
+def _gh_request(method, path, body=None):
+    if not GH_TOKEN: return None
+    url = f"https://api.github.com/repos/{GH_REPO}/{path}"
+    headers = {"Authorization":f"token {GH_TOKEN}",
+               "Content-Type":"application/json","Accept":"application/vnd.github.v3+json"}
     try:
-        json.dump({"params": params, "metrics": metrics}, open(BEST_FILE, "w"), ensure_ascii=False)
-    except Exception:
-        pass
-
-def _log(msg):
-    ts = datetime.now().strftime("%H:%M:%S")
-    line = f"[{ts}] {msg}"
-    print(line, flush=True)
-    with _state_lock:
-        opt_state["logs"].append(line)
-        if len(opt_state["logs"]) > 300:
-            opt_state["logs"] = opt_state["logs"][-200:]
-
-# ── Telegram/ntfy ─────────────────────────────────────────────────────────
-def _send_alert(text: str):
-    cfg = opt_state.get("alert_cfg", {})
-    tg_token = cfg.get("tg_token", "")
-    tg_chat  = cfg.get("tg_chat", "")
-    ntfy_url = cfg.get("ntfy_url", "")
-
-    if tg_token and tg_chat:
-        try:
-            requests.post(
-                f"https://api.telegram.org/bot{tg_token}/sendMessage",
-                json={"chat_id": tg_chat, "text": text, "parse_mode": "HTML"},
-                timeout=10
-            )
-        except Exception as e:
-            _log(f"[tg] ошибка: {e}")
-
-    if ntfy_url:
-        try:
-            requests.post(ntfy_url, data=text.encode(), timeout=10)
-        except Exception as e:
-            _log(f"[ntfy] ошибка: {e}")
-
-# ── GitHub config sync ────────────────────────────────────────────────────
-def _gh_push_best(params, metrics, symbol, tf):
-    cfg = opt_state.get("alert_cfg", {})
-    token = cfg.get("gh_token", "")
-    repo  = cfg.get("gh_repo", "")
-    if not token or not repo:
-        return
-
-    path  = f"configs/{symbol}_{tf}_best.json"
-    data  = json.dumps({"params": params, "metrics": metrics,
-                        "symbol": symbol, "tf": tf,
-                        "ts": int(time.time())}, ensure_ascii=False, indent=2)
-    b64   = base64.b64encode(data.encode()).decode()
-
-    # get current SHA
-    sha = None
-    try:
-        r = requests.get(f"https://api.github.com/repos/{repo}/contents/{path}",
-                         headers={"Authorization": f"token {token}"}, timeout=10)
-        if r.status_code == 200:
-            sha = r.json().get("sha")
-    except Exception:
-        pass
-
-    payload = {"message": f"smc best {symbol} {tf}", "content": b64}
-    if sha:
-        payload["sha"] = sha
-
-    try:
-        r = requests.put(f"https://api.github.com/repos/{repo}/contents/{path}",
-                         headers={"Authorization": f"token {token}",
-                                  "Content-Type": "application/json"},
-                         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-                         timeout=15)
-        if r.status_code in (200, 201):
-            _log(f"[gh] pushed best → {path}")
-        else:
-            _log(f"[gh] push failed {r.status_code}: {r.text[:120]}")
+        data = json.dumps(body, ensure_ascii=False).encode("utf-8") if body else None
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.loads(r.read().decode())
     except Exception as e:
-        _log(f"[gh] push error: {e}")
-
-def _gh_pull_best(symbol, tf):
-    cfg = opt_state.get("alert_cfg", {})
-    token = cfg.get("gh_token", "")
-    repo  = cfg.get("gh_repo", "")
-    if not token or not repo:
+        olog(f"gh error {method} {path}: {e}")
         return None
-    path = f"configs/{symbol}_{tf}_best.json"
-    try:
-        r = requests.get(f"https://api.github.com/repos/{repo}/contents/{path}",
-                         headers={"Authorization": f"token {token}"}, timeout=10)
-        if r.status_code == 200:
-            content = base64.b64decode(r.json()["content"]).decode()
-            return json.loads(content)
-    except Exception:
-        pass
-    return None
 
-# ══════════════════════════════════════════════════════════════════════════
-# BASIN-HOPPING OPTIMIZER
-# ══════════════════════════════════════════════════════════════════════════
-def _shake(params, keys=None, n=2):
-    """Встряска: рескрамблить n случайных параметров."""
-    p = dict(params)
-    ks = keys or list(_GRIDS.keys())
-    for k in random.sample(ks, min(n, len(ks))):
-        p[k] = random.choice(_GRIDS[k])
-    return p
+def _gh_save_best(best):
+    if not GH_TOKEN: return
+    sym = opt_state["symbol"].replace("/","_"); tf = opt_state["tf"]
+    fname = f"configs/best_{sym}_{tf}.json"
+    existing = _gh_request("GET", f"contents/{fname}")
+    sha = existing.get("sha","") if existing else ""
+    content_b64 = base64.b64encode(json.dumps(best, ensure_ascii=False, indent=2).encode()).decode()
+    body = {"message":f"best config {sym} {tf}","content":content_b64}
+    if sha: body["sha"] = sha
+    _gh_request("PUT", f"contents/{fname}", body)
 
-def _neighbor(params, temp=1.0):
-    """Сосед: сдвигаем 1-2 параметра на один шаг."""
-    p = dict(params)
-    n_keys = random.randint(1, 3)
-    for k in random.sample(list(_GRIDS.keys()), n_keys):
-        g = _GRIDS[k]
-        idx = g.index(p[k]) if p[k] in g else 0
-        delta = random.choice([-1, 0, 1])
-        idx = max(0, min(len(g)-1, idx + delta))
-        p[k] = g[idx]
-    return p
+# ─── Telegram / ntfy ────────────────────────────────────────────────────────
+def _send_alert(msg):
+    if TG_TOKEN and TG_CHAT:
+        try:
+            requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                json={"chat_id":TG_CHAT,"text":msg,"parse_mode":"HTML"}, timeout=8)
+        except: pass
+    if NTFY_URL:
+        try:
+            requests.post(NTFY_URL, data=msg.encode(), timeout=8)
+        except: pass
 
-def _run_optimizer():
-    global opt_state, _opt_thread
+# ─── Основной оптимизатор ───────────────────────────────────────────────────
+def run_optimizer():
+    global _opt_thread
+    sym   = opt_state["symbol"]
+    tf    = opt_state["tf"]
+    days  = int(opt_state["days"])
+    sl_p  = float(opt_state["sl_pct"])
+    tp_p  = float(opt_state["tp_pct"])
+    risk  = float(opt_state["risk_pct"])
 
-    symbol   = opt_state["symbol"]
-    tf       = opt_state["tf"]
-    days     = opt_state["days"]
-    risk_pct = opt_state["risk_pct"]
-    deposit  = opt_state["deposit"]
+    olog(f"▶ Старт | {sym} {tf} {days}д | SL={sl_p}% TP={tp_p}%")
+    candles = _fetch_candles(sym, tf, days)
+    if not candles or len(candles) < 100:
+        olog("❌ Мало свечей, остановка"); return
+    olog(f"✔ Загружено {len(candles)} свечей")
 
-    _log(f"[opt] старт {symbol} {tf} {days}д риск={risk_pct}%")
+    best_params  = _random_params()
+    best_params["sl_pct"] = sl_p; best_params["tp_pct"] = tp_p
+    best_result  = _simulate(candles, best_params, sl_pct=sl_p, tp_pct=tp_p, risk_pct=risk)
+    best_fit     = best_result["fitness"] if best_result else 0.0
+    top20        = []
+    cycle        = 0
+    TEMP_START   = 1.0
 
-    # ── fetch candles ──────────────────────────────────────────────────────
-    _log(f"[opt] загружаю свечи {symbol} {tf}...")
-    candles = fetch_candles(symbol, tf, days)
-    if len(candles) < 50:
-        _log(f"[opt] недостаточно свечей ({len(candles)}), стоп")
-        opt_state["running"] = False
-        return
-    with _state_lock:
-        opt_state["candles"] = candles
-        opt_state["candles_ts"] = int(time.time())
-    _log(f"[opt] загружено {len(candles)} свечей")
+    with opt_lock:
+        opt_state["top20"] = top20
+        opt_state["best"]  = None
 
-    # ── init ───────────────────────────────────────────────────────────────
-    best_params = opt_state.get("best_params") or _rand_params()
-    best_result = opt_state.get("best")
-    if best_result is None:
-        best_result = simulate(candles, best_params, 0, deposit, risk_pct)
-        if best_result is None:
-            best_params = _rand_params()
-            best_result = {"fitness": -999}
-
-    gh_data = _gh_pull_best(symbol, tf)
-    if gh_data and gh_data.get("params"):
-        gh_res = simulate(candles, gh_data["params"], 0, deposit, risk_pct)
-        if gh_res and (best_result is None or gh_res["fitness"] > best_result.get("fitness", -999)):
-            best_params = gh_data["params"]
-            best_result = gh_res
-            _log(f"[gh] взял GH-лучший: fit={gh_res['fitness']:.4f}")
-
-    current_params = dict(best_params)
-    current_fit    = best_result.get("fitness", -999) if best_result else -999
-
-    T = 1.0
-    T_min = 0.01
-    alpha = 0.98
-    stagnation = 0
-    stagnation_max = 50
-    cycle = 0
-    top20 = []
-
-    def _update_top20(params, metrics):
-        nonlocal top20
-        entry = {"params": params, "metrics": metrics}
-        fit = metrics["fitness"]
-        top20.append(entry)
-        top20.sort(key=lambda x: -x["metrics"]["fitness"])
-        # dedup by fitness
-        seen_f = set()
-        deduped = []
-        for e in top20:
-            f = round(e["metrics"]["fitness"], 4)
-            if f not in seen_f:
-                seen_f.add(f)
-                deduped.append(e)
-        top20 = deduped[:20]
-        with _state_lock:
-            opt_state["top20"] = top20
-
-    if best_result and best_result.get("fitness", -999) > -999:
-        _update_top20(best_params, best_result)
-
-    _log(f"[opt] base fitness={current_fit:.4f}")
-
-    # ── main loop ──────────────────────────────────────────────────────────
-    while opt_state["running"]:
+    while not _stop_flag.is_set():
         cycle += 1
-        with _state_lock:
-            opt_state["cycle"] = cycle
+        temp = TEMP_START * math.exp(-0.05 * cycle)
+        with opt_lock: opt_state["cycle"] = cycle
 
-        # re-fetch candles every 30 min
-        if int(time.time()) - opt_state["candles_ts"] > 1800:
-            new_c = fetch_candles(symbol, tf, days)
-            if len(new_c) >= 50:
-                candles = new_c
-                with _state_lock:
-                    opt_state["candles"] = candles
-                    opt_state["candles_ts"] = int(time.time())
-                _log(f"[opt] свечи обновлены ({len(candles)})")
+        # Несколько стартовых точек за цикл
+        starts = [_shake(best_params, 0.4) if best_params else _random_params(),
+                  _random_params()]
+        if len(top20) > 2:
+            starts.append(_shake(random.choice(top20)["params"], 0.3))
 
-        # Basin-Hopping: explore neighbourhood
-        stagnation += 1
-        if stagnation >= stagnation_max:
-            stagnation = 0
-            current_params = _shake(best_params, n=3)
-            _log(f"[opt] встряска (stagnation={stagnation_max})")
-        else:
-            current_params = _neighbor(current_params, T)
+        for start_p in starts:
+            if _stop_flag.is_set(): break
+            current_p = start_p
+            current_r = _simulate(candles, current_p, risk_pct=risk)
+            current_fit = current_r["fitness"] if current_r else 0.0
 
-        res = simulate(candles, current_params, 0, deposit, risk_pct)
-        with _state_lock:
-            opt_state["iters"] += 1
+            # Локальный поиск
+            for step in range(60):
+                if _stop_flag.is_set(): break
+                with opt_lock:
+                    opt_state["trials"] = opt_state.get("trials",0)+1
+                    opt_state["progress"] = int(step/60*100)
 
-        if res is None:
-            continue
+                neighbour_p = _neighbour(current_p)
+                neighbour_r = _simulate(candles, neighbour_p, risk_pct=risk)
+                if not neighbour_r: continue
+                nfit = neighbour_r["fitness"]
+                delta = nfit - current_fit
+                if delta > 0 or random.random() < math.exp(delta / max(temp, 0.001)):
+                    current_p   = neighbour_p
+                    current_fit = nfit
+                    current_r   = neighbour_r
 
-        fit = res["fitness"]
-        delta = fit - current_fit
+                    # Обновляем топ-20
+                    with opt_lock:
+                        top20 = opt_state["top20"]
+                        entry = {"params": current_p, "result": current_r}
+                        top20 = [e for e in top20 if abs(e["result"]["fitness"]-nfit)>0.001]
+                        top20.append(entry)
+                        top20.sort(key=lambda x: x["result"]["fitness"], reverse=True)
+                        opt_state["top20"] = top20[:20]
 
-        # Metropolis acceptance
-        if delta > 0 or (T > T_min and random.random() < math.exp(delta / T)):
-            current_fit    = fit
-            current_params = dict(current_params)
+                    if nfit > best_fit:
+                        best_fit    = nfit
+                        best_params = current_p
+                        best_result = current_r
+                        with opt_lock:
+                            opt_state["best"] = {"params":current_p,"result":current_r}
+                        olog(f"🏆 Цикл {cycle} шаг {step} | "
+                             f"WR={current_r['winrate']}% PF={current_r['profit_factor']} "
+                             f"DD={current_r['max_dd']}% T={current_r['trades']} "
+                             f"fit={nfit:.4f} | "
+                             f"SL={current_p['sl_pct']}% TP={current_p['tp_pct']}% "
+                             f"swing={current_p['swing_len']}")
+                        threading.Thread(target=_gh_save_best,
+                            args=({"params":current_p,"result":current_r},), daemon=True).start()
+                        _send_alert(
+                            f"🏆 SMC {sym} {tf} — новый лучший\n"
+                            f"WR={current_r['winrate']}% PF={current_r['profit_factor']} "
+                            f"DD={current_r['max_dd']}% Trades={current_r['trades']}\n"
+                            f"SL={current_p['sl_pct']}% TP={current_p['tp_pct']}% "
+                            f"swing={current_p['swing_len']}"
+                        )
 
-        if fit > best_result.get("fitness", -999):
-            best_result = res
-            best_params = dict(current_params)
-            stagnation  = 0
-            with _state_lock:
-                opt_state["best"]        = {k: v for k, v in res.items() if k != "signals" and k != "closed"}
-                opt_state["best_params"] = best_params
+        olog(f"Цикл {cycle} завершён | best fit={best_fit:.4f}")
 
-            _log(f"{_C_GRN}[opt] НОВЫЙ РЕКОРД: fit={fit:.4f} WR={res['wr']}% "
-                 f"сделок={res['trades']} PF={res['pf']} DD={res['max_dd']}%{_C_RST}")
-            _update_top20(best_params, opt_state["best"])
-            _save_best_local(best_params, opt_state["best"])
-            _gh_push_best(best_params, opt_state["best"], symbol, tf)
+    olog("⏹ Остановлено")
+    with opt_lock: opt_state["running"] = False
 
-            msg = (f"🏆 SMC NEW BEST [{symbol} {tf}]\n"
-                   f"fit={fit:.4f} | WR={res['wr']}% | сделок={res['trades']}\n"
-                   f"PF={res['pf']} | DD={res['max_dd']}% | eq={res['equity']:.2f}\n"
-                   f"SL={current_params['sl_pct']}% TP={current_params['tp_pct']}%")
-            threading.Thread(target=_send_alert, args=(msg,), daemon=True).start()
-
-        T = max(T_min, T * alpha)
-
-        if cycle % 100 == 0:
-            _log(f"[opt] цикл {cycle} | iter={opt_state['iters']} | "
-                 f"best_fit={best_result.get('fitness',-999):.4f} T={T:.4f}")
-
-    opt_state["running"] = False
-    _log("[opt] остановлен")
-
-# ══════════════════════════════════════════════════════════════════════════
-# HTTP SERVER + UI
-# ══════════════════════════════════════════════════════════════════════════
-HTML = r"""<!DOCTYPE html>
-<html lang="ru">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+# ─── HTTP сервер ─────────────────────────────────────────────────────────────
+HTML = r"""<!DOCTYPE html><html lang="ru"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>SMC Optimizer</title>
 <style>
-  :root{--bg:#0d1117;--card:#161b22;--border:#30363d;--text:#e6edf3;--sub:#8b949e;
-        --grn:#3fb950;--red:#f85149;--yel:#d29922;--blue:#58a6ff;--acc:#1f6feb}
-  *{box-sizing:border-box;margin:0;padding:0}
-  body{background:var(--bg);color:var(--text);font:14px/1.5 'Segoe UI',system-ui,sans-serif;padding:12px}
-  h1{font-size:18px;color:var(--blue);margin-bottom:12px}
-  .row{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:10px}
-  label{font-size:12px;color:var(--sub)}
-  input,select{background:#010409;border:1px solid var(--border);color:var(--text);
-    border-radius:6px;padding:5px 8px;font-size:13px;width:100%}
-  .card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:12px;flex:1;min-width:180px}
-  .card h3{font-size:13px;color:var(--sub);margin-bottom:8px}
-  .metric{display:flex;justify-content:space-between;margin-bottom:4px;font-size:13px}
-  .metric span:last-child{font-weight:600}
-  .grn{color:var(--grn)} .red{color:var(--red)} .yel{color:var(--yel)} .blue{color:var(--blue)}
-  button{background:var(--acc);border:none;color:#fff;border-radius:6px;padding:7px 16px;
-    cursor:pointer;font-size:13px;transition:opacity .2s}
-  button:hover{opacity:.8} button.stop{background:#b62324}
-  #logs{background:#010409;border:1px solid var(--border);border-radius:6px;padding:8px;
-    height:200px;overflow-y:auto;font:12px/1.6 monospace;color:var(--sub);margin-top:10px}
-  table{width:100%;border-collapse:collapse;font-size:12px;margin-top:8px}
-  th,td{padding:5px 8px;text-align:left;border-bottom:1px solid var(--border)}
-  th{color:var(--sub);font-weight:500} tr:hover{background:#1c2128}
-  .badge{display:inline-block;padding:1px 6px;border-radius:4px;font-size:11px}
-  .badge-grn{background:#1a3828;color:var(--grn)} .badge-red{background:#3c1212;color:var(--red)}
-  #status{font-size:12px;color:var(--sub);margin-top:6px}
-</style>
-</head>
-<body>
-<h1>📊 SMC Optimizer</h1>
-
-<div class="row">
-  <div class="card" style="flex:2;min-width:300px">
-    <h3>Настройки</h3>
-    <div class="row">
-      <div style="flex:1"><label>Символ</label><input id="symbol" value="BTC_USDT"></div>
-      <div style="flex:1"><label>Таймфрейм</label>
-        <select id="tf">
-          <option>1m</option><option>5m</option><option>15m</option><option>30m</option>
-          <option value="1h" selected>1h</option><option>4h</option><option>1d</option>
-        </select>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0d0d0d;color:#e0e0e0;font-family:'JetBrains Mono',monospace,sans-serif;font-size:13px}
+.topbar{background:#111;border-bottom:1px solid #222;padding:8px 12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.topbar h1{color:#f0b800;font-size:15px;font-weight:700}
+.ver{color:#555;font-size:11px}
+.btn{padding:6px 14px;border:none;border-radius:5px;cursor:pointer;font-size:12px;font-weight:600}
+.btn-go{background:#1a8f4a;color:#fff}.btn-go:hover{background:#22b85e}
+.btn-stop{background:#8f1a1a;color:#fff}.btn-stop:hover{background:#b82222}
+.btn-sm{background:#222;color:#aaa;padding:4px 10px;font-size:11px}
+.body{display:grid;grid-template-columns:320px 1fr;gap:0;height:calc(100vh - 45px)}
+@media(max-width:700px){.body{grid-template-columns:1fr;height:auto}}
+.sidebar{background:#111;border-right:1px solid #1e1e1e;padding:10px;overflow-y:auto;height:100%}
+.main{padding:10px;overflow-y:auto;height:100%}
+.card{background:#161616;border:1px solid #222;border-radius:6px;padding:10px;margin-bottom:8px}
+.card h3{color:#f0b800;font-size:12px;margin-bottom:6px}
+label{display:block;color:#888;font-size:11px;margin-bottom:2px}
+input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;
+  padding:5px 7px;border-radius:4px;font-size:12px;margin-bottom:6px}
+.stat-row{display:flex;justify-content:space-between;padding:2px 0;font-size:12px}
+.stat-label{color:#666}.stat-val{color:#e0e0e0;font-weight:600}
+.green{color:#0f9} .red{color:#f45} .yellow{color:#f0b800}
+.log-box{background:#0a0a0a;border:1px solid #1e1e1e;border-radius:4px;
+  height:200px;overflow-y:auto;padding:6px;font-size:11px;font-family:monospace}
+.log-line{padding:1px 0;border-bottom:1px solid #111}
+.prog-bar{background:#1e1e1e;border-radius:3px;height:6px;margin:6px 0}
+.prog-fill{background:#f0b800;height:6px;border-radius:3px;transition:width .3s}
+.top20-row{display:grid;grid-template-columns:24px 1fr 1fr 1fr 1fr 1fr;gap:4px;
+  padding:3px 0;border-bottom:1px solid #1a1a1a;font-size:11px;align-items:center}
+.top20-row:first-child{color:#555;font-size:10px}
+.badge{display:inline-block;padding:1px 5px;border-radius:3px;font-size:10px;margin-right:3px}
+.badge-bull{background:#0a2a1a;color:#0f9}
+.badge-bear{background:#2a0a0a;color:#f45}
+</style></head><body>
+<div class="topbar">
+  <h1>⚡ SMC Optimizer</h1>
+  <span class="ver" id="verBadge">v__VER__</span>
+  <button class="btn btn-go" id="btnStart" onclick="startOpt()">▶ Старт</button>
+  <button class="btn btn-stop" id="btnStop" onclick="stopOpt()" style="display:none">⏹ Стоп</button>
+  <span id="statusBadge" style="color:#555;font-size:11px">готов</span>
+</div>
+<div class="body">
+<div class="sidebar">
+  <div class="card">
+    <h3>⚙ Параметры запуска</h3>
+    <label>Символ</label><input id="sym" value="BTC_USDT">
+    <label>Таймфрейм</label>
+    <select id="tf">
+      <option>1m</option><option>5m</option><option selected>15m</option>
+      <option>30m</option><option>1h</option><option>4h</option><option>1d</option>
+    </select>
+    <label>Дней истории</label><input id="days" type="number" value="30" min="7" max="365">
+    <label>SL %</label><input id="sl_pct" type="number" value="0.6" step="0.05">
+    <label>TP %</label><input id="tp_pct" type="number" value="1.2" step="0.05">
+    <label>Риск на сделку %</label><input id="risk_pct" type="number" value="2.0" step="0.5">
+  </div>
+  <div class="card">
+    <h3>📊 Лучший конфиг</h3>
+    <div id="bestCard" style="color:#555;font-size:11px">—</div>
+  </div>
+  <div class="card">
+    <h3>📈 Прогресс</h3>
+    <div class="prog-bar"><div class="prog-fill" id="progFill" style="width:0%"></div></div>
+    <div class="stat-row"><span class="stat-label">Цикл</span><span class="stat-val" id="cycleVal">—</span></div>
+    <div class="stat-row"><span class="stat-label">Попыток</span><span class="stat-val" id="trialsVal">—</span></div>
+  </div>
+  <div class="card log-box" id="logBox"></div>
+</div>
+<div class="main">
+  <div class="card">
+    <h3>🏆 Топ-20 конфигураций</h3>
+    <div id="top20Container">
+      <div class="top20-row">
+        <span>#</span><span>WR%</span><span>PF</span><span>DD%</span>
+        <span>T</span><span>SL/TP/swing</span>
       </div>
-      <div style="flex:1"><label>Дней истории</label><input id="days" type="number" value="60" min="7" max="365"></div>
     </div>
-    <div class="row">
-      <div style="flex:1"><label>Депозит (USDT)</label><input id="deposit" type="number" value="100"></div>
-      <div style="flex:1"><label>Риск на сделку (%)</label><input id="risk_pct" type="number" value="20" step="1"></div>
-    </div>
-    <div class="row" style="margin-top:4px">
-      <button id="btnStart" onclick="startOpt()">▶ Старт</button>
-      <button class="stop" onclick="stopOpt()">⏹ Стоп</button>
-    </div>
-    <div id="status">Статус: остановлен</div>
-  </div>
-
-  <div class="card" id="bestCard">
-    <h3>🏆 Лучший результат</h3>
-    <div id="bestBody"><span style="color:var(--sub);font-size:12px">нет данных</span></div>
   </div>
 </div>
-
-<div class="row">
-  <div class="card" style="flex:1;min-width:260px">
-    <h3>⚙️ Telegram / ntfy</h3>
-    <div style="margin-bottom:6px"><label>TG Bot Token</label><input id="tgToken" type="password"></div>
-    <div style="margin-bottom:6px"><label>TG Chat ID</label><input id="tgChat"></div>
-    <div style="margin-bottom:6px"><label>ntfy URL</label><input id="ntfyUrl"></div>
-    <button onclick="saveAlerts()">💾 Сохранить</button>
-  </div>
-  <div class="card" style="flex:1;min-width:260px">
-    <h3>🐙 GitHub sync</h3>
-    <div style="margin-bottom:6px"><label>GitHub Token</label><input id="ghToken" type="password"></div>
-    <div style="margin-bottom:6px"><label>Репо (owner/repo)</label><input id="ghRepo" placeholder="user/smc-optimizer"></div>
-    <button onclick="saveAlerts()">💾 Сохранить</button>
-  </div>
 </div>
-
-<div class="card" style="margin-bottom:10px">
-  <h3>🏅 Топ-20 конфигов</h3>
-  <table>
-    <thead><tr><th>#</th><th>Fitness</th><th>WR%</th><th>Сделок</th><th>PF</th><th>DD%</th>
-      <th>SL%</th><th>TP%</th><th>Swing</th><th>Entry</th><th>HTF</th></tr></thead>
-    <tbody id="top20Body"><tr><td colspan="11" style="color:var(--sub)">нет данных</td></tr></tbody>
-  </table>
-</div>
-
-<div id="logs"></div>
-
 <script>
-let pollTimer=null;
-let running=false;
-
-function fmt(v,d=2){return typeof v==='number'?v.toFixed(d):v??'—'}
+let polling=null, lastLogTotal=0, logsDropped=0;
 
 function startOpt(){
   const body={
-    symbol:document.getElementById('symbol').value.trim().toUpperCase(),
+    symbol:document.getElementById('sym').value,
     tf:document.getElementById('tf').value,
-    days:+document.getElementById('days').value,
-    deposit:+document.getElementById('deposit').value,
-    risk_pct:+document.getElementById('risk_pct').value,
+    days:parseInt(document.getElementById('days').value),
+    sl_pct:parseFloat(document.getElementById('sl_pct').value),
+    tp_pct:parseFloat(document.getElementById('tp_pct').value),
+    risk_pct:parseFloat(document.getElementById('risk_pct').value),
   };
-  fetch('/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
-    .then(r=>r.json()).then(d=>{
-      if(d.ok){running=true;schedulePoll();}
-      else alert('Ошибка: '+d.error);
+  fetch('/scan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+    .then(()=>{
+      document.getElementById('btnStart').style.display='none';
+      document.getElementById('btnStop').style.display='';
+      document.getElementById('statusBadge').textContent='работает...';
+      scheduleNext();
     });
 }
-
 function stopOpt(){
-  fetch('/stop',{method:'POST'}).then(()=>{running=false;clearTimeout(pollTimer);
-    document.getElementById('status').textContent='Статус: остановлен';});
+  fetch('/scan_stop',{method:'POST'}).then(()=>{
+    document.getElementById('btnStop').style.display='none';
+    document.getElementById('btnStart').style.display='';
+    document.getElementById('statusBadge').textContent='останавливается...';
+  });
 }
-
-function saveAlerts(){
-  const cfg={
-    tg_token:document.getElementById('tgToken').value,
-    tg_chat:document.getElementById('tgChat').value,
-    ntfy_url:document.getElementById('ntfyUrl').value,
-    gh_token:document.getElementById('ghToken').value,
-    gh_repo:document.getElementById('ghRepo').value,
-  };
-  fetch('/update_alert_cfg',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)})
-    .then(r=>r.json()).then(d=>alert(d.ok?'Сохранено':'Ошибка'));
-}
-
-function schedulePoll(){pollTimer=setTimeout(poll,2000);}
-
+function scheduleNext(){ polling=setTimeout(poll, 1500); }
 function poll(){
-  fetch('/status').then(r=>r.json()).then(d=>{
-    document.getElementById('status').textContent=
-      `Статус: ${d.running?'🟢 работает':'⚪ остановлен'} | цикл ${d.cycle} | iter ${d.iters}`;
+  fetch('/opt_status').then(r=>r.json()).then(d=>{
+    // Логи
+    logsDropped = d.logs_dropped||0;
+    const totalNow = logsDropped + (d.logs||[]).length;
+    const newFrom = Math.max(0, lastLogTotal - logsDropped);
+    const newLogs = (d.logs||[]).slice(newFrom);
+    const lb = document.getElementById('logBox');
+    newLogs.forEach(l=>{
+      const div=document.createElement('div');
+      div.className='log-line';
+      div.innerHTML=`<span style="color:#555">[${l.ts}]</span> ${l.msg}`;
+      lb.appendChild(div);
+    });
+    if(newLogs.length) lb.scrollTop=lb.scrollHeight;
+    lastLogTotal=totalNow;
 
+    // Прогресс
+    document.getElementById('progFill').style.width=(d.progress||0)+'%';
+    document.getElementById('cycleVal').textContent=d.cycle||'—';
+    document.getElementById('trialsVal').textContent=(d.trials||0).toLocaleString();
+
+    // Статус
+    if(!d.running){
+      document.getElementById('btnStop').style.display='none';
+      document.getElementById('btnStart').style.display='';
+      document.getElementById('statusBadge').textContent='завершено';
+    } else scheduleNext();
+
+    // Лучший
     if(d.best){
-      const b=d.best;
-      document.getElementById('bestBody').innerHTML=`
-        <div class="metric"><span>Fitness</span><span class="blue">${fmt(b.fitness,4)}</span></div>
-        <div class="metric"><span>WR</span><span class="grn">${fmt(b.wr)}%</span></div>
-        <div class="metric"><span>Сделок</span><span>${b.trades}</span></div>
-        <div class="metric"><span>PF</span><span class="yel">${fmt(b.pf)}</span></div>
-        <div class="metric"><span>Max DD</span><span class="red">${fmt(b.max_dd)}%</span></div>
-        <div class="metric"><span>Equity</span><span>${fmt(b.equity)}</span></div>
+      const r=d.best.result, p=d.best.params;
+      const wrC=r.winrate>=55?'green':r.winrate>=45?'yellow':'red';
+      document.getElementById('bestCard').innerHTML=`
+        <div class="stat-row"><span class="stat-label">Winrate</span><span class="stat-val ${wrC}">${r.winrate}%</span></div>
+        <div class="stat-row"><span class="stat-label">Profit Factor</span><span class="stat-val">${r.profit_factor}</span></div>
+        <div class="stat-row"><span class="stat-label">Max DD</span><span class="stat-val red">${r.max_dd}%</span></div>
+        <div class="stat-row"><span class="stat-label">Сделок</span><span class="stat-val">${r.trades}</span></div>
+        <div class="stat-row"><span class="stat-label">Доходность</span><span class="stat-val ${r.total_return>=0?'green':'red'}">${r.total_return}%</span></div>
+        <div class="stat-row"><span class="stat-label">Fitness</span><span class="stat-val yellow">${r.fitness}</span></div>
+        <hr style="border-color:#222;margin:5px 0">
+        <div class="stat-row"><span class="stat-label">SL / TP</span><span class="stat-val">${p.sl_pct}% / ${p.tp_pct}%</span></div>
+        <div class="stat-row"><span class="stat-label">Swing len</span><span class="stat-val">${p.swing_len}</span></div>
+        <div class="stat-row"><span class="stat-label">Internal len</span><span class="stat-val">${p.internal_len}</span></div>
+        <div class="stat-row"><span class="stat-label">OB filter</span><span class="stat-val">${p.ob_filter}</span></div>
+        <div class="stat-row"><span class="stat-label">OB mitigation</span><span class="stat-val">${p.ob_mitigation}</span></div>
+        <div class="stat-row"><span class="stat-label">FVG</span><span class="stat-val">${p.fvg_enabled?'вкл':'выкл'}</span></div>
+        <div class="stat-row"><span class="stat-label">CHoCH only</span><span class="stat-val">${p.choch_only?'да':'нет'}</span></div>
       `;
     }
 
-    if(d.top20&&d.top20.length){
-      const rows=d.top20.map((e,i)=>{
-        const m=e.metrics,p=e.params;
-        const et=['BOS','CHoCH','All'][p.entry_type??2];
-        return `<tr>
-          <td>${i+1}</td>
-          <td class="blue">${fmt(m.fitness,4)}</td>
-          <td class="grn">${fmt(m.wr)}%</td>
-          <td>${m.trades}</td>
-          <td class="yel">${fmt(m.pf)}</td>
-          <td class="red">${fmt(m.max_dd)}%</td>
-          <td>${fmt(p.sl_pct)}</td><td>${fmt(p.tp_pct)}</td>
-          <td>${p.swing_len}</td><td>${et}</td>
-          <td>${p.htf_bias?'✓':''}</td>
-        </tr>`;
-      }).join('');
-      document.getElementById('top20Body').innerHTML=rows;
+    // Топ-20
+    const top=(d.top20||[]);
+    if(top.length){
+      let html='<div class="top20-row"><span>#</span><span>WR%</span><span>PF</span><span>DD%</span><span>T</span><span>SL/TP/swing</span></div>';
+      top.forEach((e,i)=>{
+        const r=e.result,p=e.params;
+        const wrC=r.winrate>=55?'green':r.winrate>=45?'yellow':'red';
+        html+=`<div class="top20-row">
+          <span style="color:#555">${i+1}</span>
+          <span class="${wrC}">${r.winrate}%</span>
+          <span>${r.profit_factor}</span>
+          <span class="red">${r.max_dd}%</span>
+          <span>${r.trades}</span>
+          <span style="color:#888">${p.sl_pct}/${p.tp_pct}/${p.swing_len}</span>
+        </div>`;
+      });
+      document.getElementById('top20Container').innerHTML=html;
     }
-
-    if(d.logs&&d.logs.length){
-      const el=document.getElementById('logs');
-      el.innerHTML=d.logs.slice(-80).map(l=>`<div>${l}</div>`).join('');
-      el.scrollTop=el.scrollHeight;
-    }
-
-    running=d.running;
-    if(running) schedulePoll();
-  }).catch(()=>{if(running) schedulePoll();});
+  }).catch(()=>scheduleNext());
 }
+// Автостарт поллинга если уже работает
+fetch('/opt_status').then(r=>r.json()).then(d=>{
+  if(d.running){
+    document.getElementById('btnStart').style.display='none';
+    document.getElementById('btnStop').style.display='';
+    document.getElementById('statusBadge').textContent='работает...';
+    scheduleNext();
+  }
+});
+</script></body></html>
+""".replace("__VER__", APP_VERSION)
 
-// init poll
-poll();
-</script>
-</body>
-</html>
-"""
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
 
-class Handler(BaseHTTPRequestHandler):
-    def log_message(self, fmt, *args):
-        pass  # тишина
-
-    def _send_json(self, data, code=200):
-        body = json.dumps(data, ensure_ascii=False).encode()
+    def _json(self, obj, code=200):
+        body = json.dumps(obj, ensure_ascii=False).encode()
         self.send_response(code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Content-Type","application/json")
+        self.send_header("Content-Length",len(body))
         self.end_headers()
         self.wfile.write(body)
 
     def do_GET(self):
-        path = urlparse(self.path).path
-
-        if path == "/" or path == "/index.html":
+        if self.path == "/" or self.path == "/index.html":
             body = HTML.encode()
             self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Content-Type","text/html; charset=utf-8")
+            self.send_header("Content-Length",len(body))
             self.end_headers()
             self.wfile.write(body)
-            return
-
-        if path == "/status":
-            with _state_lock:
-                self._send_json({
-                    "running": opt_state["running"],
-                    "cycle":   opt_state["cycle"],
-                    "iters":   opt_state["iters"],
-                    "best":    opt_state["best"],
-                    "top20":   opt_state["top20"],
-                    "logs":    opt_state["logs"][-80:],
-                })
-            return
-
-        self._send_json({"error": "not found"}, 404)
+        elif self.path == "/opt_status":
+            with opt_lock:
+                self._json({k:v for k,v in opt_state.items() if k!="chart"})
+        else:
+            self.send_response(404); self.end_headers()
 
     def do_POST(self):
-        path = urlparse(self.path).path
-        length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(length)
-        try:
-            data = json.loads(body) if body else {}
-        except Exception:
-            data = {}
+        global _opt_thread
+        length = int(self.headers.get("Content-Length",0))
+        body   = json.loads(self.rfile.read(length)) if length else {}
 
-        if path == "/start":
-            global _opt_thread
-            if opt_state["running"]:
-                self._send_json({"ok": False, "error": "уже запущен"})
-                return
-            with _state_lock:
-                opt_state["running"]    = True
-                opt_state["symbol"]     = data.get("symbol", opt_state["symbol"])
-                opt_state["tf"]         = data.get("tf",     opt_state["tf"])
-                opt_state["days"]       = int(data.get("days", opt_state["days"]))
-                opt_state["risk_pct"]   = float(data.get("risk_pct", opt_state["risk_pct"]))
-                opt_state["deposit"]    = float(data.get("deposit",  opt_state["deposit"]))
-                opt_state["cycle"]      = 0
-                opt_state["iters"]      = 0
-                opt_state["logs"]       = []
-            _opt_thread = threading.Thread(target=_run_optimizer, daemon=True)
+        if self.path == "/scan":
+            if _opt_thread and _opt_thread.is_alive():
+                self._json({"ok":False,"msg":"уже работает"}); return
+            _stop_flag.clear()
+            with opt_lock:
+                opt_state.update({
+                    "running":True,"logs":[],"logs_dropped":0,
+                    "best":None,"top20":[],"cycle":0,"trials":0,"progress":0,
+                    "symbol": body.get("symbol","BTC_USDT"),
+                    "tf":     body.get("tf","15m"),
+                    "days":   body.get("days",30),
+                    "sl_pct": body.get("sl_pct",0.6),
+                    "tp_pct": body.get("tp_pct",1.2),
+                    "risk_pct": body.get("risk_pct",2.0),
+                })
+            _opt_thread = threading.Thread(target=run_optimizer, daemon=True)
             _opt_thread.start()
-            self._send_json({"ok": True})
-            return
+            self._json({"ok":True})
 
-        if path == "/stop":
-            opt_state["running"] = False
-            self._send_json({"ok": True})
-            return
+        elif self.path == "/scan_stop":
+            _stop_flag.set()
+            self._json({"ok":True})
 
-        if path == "/update_alert_cfg":
-            with _state_lock:
-                opt_state["alert_cfg"].update(data)
-            try:
-                json.dump(opt_state["alert_cfg"], open(ALERT_CFG_FILE, "w"), ensure_ascii=False)
-            except Exception:
-                pass
-            self._send_json({"ok": True})
-            return
+        else:
+            self.send_response(404); self.end_headers()
 
-        self._send_json({"error": "not found"}, 404)
+def main():
+    global GH_TOKEN, TG_TOKEN, TG_CHAT, NTFY_URL
+    # Подхватываем env
+    GH_TOKEN  = os.environ.get("GH_TOKEN", GH_TOKEN)
+    TG_TOKEN  = os.environ.get("TG_TOKEN", TG_TOKEN)
+    TG_CHAT   = os.environ.get("TG_CHAT",  TG_CHAT)
+    NTFY_URL  = os.environ.get("NTFY_URL", NTFY_URL)
 
-    def do_OPTIONS(self):
-        self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.end_headers()
-
-# ══════════════════════════════════════════════════════════════════════════
-# MAIN
-# ══════════════════════════════════════════════════════════════════════════
-PORT = 8765
-
-if __name__ == "__main__":
-    _load_persistent()
-    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
-    server.daemon_threads = True
-    print(f"{_C_GRN}[SMC Optimizer] http://localhost:{PORT}{_C_RST}", flush=True)
+    server = http.server.HTTPServer(("0.0.0.0", PORT), Handler)
+    print(f"{_C_GRN}SMC Optimizer v{APP_VERSION} — http://0.0.0.0:{PORT}{_C_RST}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\n[exit]", flush=True)
+        print("\nЗавершено"); server.shutdown()
+
+if __name__ == "__main__":
+    main()
