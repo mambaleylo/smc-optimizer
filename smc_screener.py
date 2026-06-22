@@ -85,7 +85,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "2.0"
+APP_VERSION  = "2.1"
 GATE_API     = "https://fx-api.gateio.ws/api/v4"
 PORT         = 8765
 GH_REPO      = os.environ.get("GH_REPO", "mambaleylo/smc-optimizer")
@@ -262,91 +262,129 @@ def _gate_close_position(symbol):
     except Exception as e:
         olog(f"⚠ gate_close_position {symbol}: {e}")
 
+def _gate_round_price(price, contract):
+    """Округляет цену до нужной точности (как в WickFill)."""
+    if price > 1000:  return f"{price:.1f}"
+    if price > 10:    return f"{price:.2f}"
+    if price > 1:     return f"{price:.4f}"
+    return f"{price:.6f}"
+
 def _gate_open_position(symbol, direction, entry_px, sl_px, tp_px, risk_pct):
     """
-    Открыть позицию с SL и TP лимит-ордерами.
-    Расчёт size: как в WickFill — по риску на сделку.
+    Полный цикл открытия позиции — точно как в WickFill:
+      leverage = round(risk_pct / sl_pct)
+      margin   = balance * risk_pct%
+      size     = (margin * leverage) / (entry_px * qm)
+      TP/SL    — price_orders с price="0" (маркет при триггере)
     """
     try:
-        balance  = _gate_get_balance()
-        quanto   = _gate_get_quanto(symbol)
-        if balance <= 0 or quanto <= 0 or entry_px <= 0:
-            raise RuntimeError(f"Нет данных: balance={balance} quanto={quanto} entry={entry_px}")
+        sl_pct_val = abs(entry_px - sl_px) / entry_px * 100.0
 
-        sl_dist_pct = abs(entry_px - sl_px) / entry_px  # доля риска на контракт
-        risk_usdt   = balance * (risk_pct / 100.0)
-        # размер позиции в контрактах
-        size_raw    = risk_usdt / (sl_dist_pct * entry_px * quanto)
-        size        = max(1, int(size_raw))
+        # 1. Баланс
+        balance = _gate_get_balance()
+        if not balance or balance <= 0:
+            raise RuntimeError(f"Нет баланса: {balance}")
 
-        if direction == "short": size = -size
+        # 2. Плечо = risk_pct / sl_pct  (как в WickFill)
+        leverage = max(1, round(risk_pct / sl_pct_val))
 
-        olog(f"🔓 Открываем {direction.upper()} {symbol}: size={abs(size)} "
-             f"entry≈{_fmt_px(entry_px)} SL={_fmt_px(sl_px)} TP={_fmt_px(tp_px)} "
-             f"risk={risk_pct}% bal={round(balance,2)}U")
+        # 3. Устанавливаем плечо на Gate (2 попытки)
+        applied_leverage = leverage
+        contract = symbol.replace("/", "_").upper()
+        try:
+            r = _gate_req("POST", f"/futures/usdt/positions/{contract}/leverage",
+                          params={"leverage": str(leverage)})
+            applied_leverage = int(r.get("leverage", leverage)) if isinstance(r, dict) else leverage
+            olog(f"✓ Плечо: {applied_leverage}×")
+        except Exception as e:
+            olog(f"⚠ Плечо попытка 1: {e} — повтор через 1с")
+            time.sleep(1.0)
+            try:
+                r = _gate_req("POST", f"/futures/usdt/positions/{contract}/leverage",
+                              params={"leverage": str(leverage)})
+                applied_leverage = int(r.get("leverage", leverage)) if isinstance(r, dict) else leverage
+                olog(f"✓ Плечо (попытка 2): {applied_leverage}×")
+            except Exception as e2:
+                olog(f"⚠ Плечо не применено: {e2} — используем leverage=1")
+                applied_leverage = 1
 
-        # Отменяем старые ордера на случай висяков
+        # 4. Размер позиции
+        qm = _gate_get_quanto(symbol)
+        margin   = balance * (risk_pct / 100.0)
+        size_raw = (margin * applied_leverage) / (entry_px * qm)
+        size     = round(size_raw)
+        if size < 1:
+            raise RuntimeError(
+                f"Недостаточно средств: balance={balance:.2f} margin={margin:.2f} "
+                f"lev={applied_leverage}× ep={entry_px} qm={qm} → size={size_raw:.3f} < 1"
+            )
+        notional = size * entry_px * qm
+        olog(f"🔓 Открываем {direction.upper()} {symbol}: "
+             f"balance={balance:.2f} × {risk_pct}% = margin={margin:.2f}U × {applied_leverage}× → позиция~{notional:.2f}U | "
+             f"size={size} контр | entry≈{_fmt_px(entry_px)} SL={_fmt_px(sl_px)} TP={_fmt_px(tp_px)}")
+
+        # 5. Отменяем старые ордера
         _gate_cancel_orders(symbol)
 
-        # Рыночный ордер на вход (price=0, tif=ioc)
+        # 6. Маркет-ордер на вход
+        is_long = (direction == "long")
         _gate_req("POST", "/futures/usdt/orders", body={
-            "contract": symbol,
-            "size":     size,
+            "contract": contract,
+            "size":     size if is_long else -size,
             "price":    "0",
             "tif":      "ioc",
             "text":     "t-smc-open",
         })
-
-        # Даём бирже 1 сек оформить позицию
         time.sleep(1.0)
 
-        # SL — stop-market (close=True, price=SL, tif=poc)
-        sl_side = "ask" if direction == "long" else "bid"
-        tp_side = sl_side
-        _gate_req("POST", "/futures/usdt/price_orders", body={
-            "initial": {
-                "contract":    symbol,
-                "size":        -abs(size),
-                "price":       str(round(sl_px, 6)),
-                "tif":         "ioc",
-                "reduce_only": True,
-                "text":        "t-smc-sl",
-            },
-            "trigger": {
-                "strategy_type": 0,          # по цене
-                "price_type":    0,           # last price
-                "price":         str(round(sl_px, 6)),
-                "rule":          2 if direction == "long" else 1,  # <=SL для long
-            },
-            "order_type": "close-long-order" if direction == "long" else "close-short-order",
-        })
+        close_size = -size if is_long else size
 
-        # TP — лимитный ордер
+        # 7. TP триггерный маркет (как в WickFill: price="0", ioc)
         _gate_req("POST", "/futures/usdt/price_orders", body={
             "initial": {
-                "contract":    symbol,
-                "size":        -abs(size),
-                "price":       str(round(tp_px, 6)),
-                "tif":         "gtc",
+                "contract":    contract,
+                "size":        close_size,
+                "price":       "0",
+                "tif":         "ioc",
                 "reduce_only": True,
                 "text":        "t-smc-tp",
             },
             "trigger": {
                 "strategy_type": 0,
                 "price_type":    0,
-                "price":         str(round(tp_px, 6)),
-                "rule":          1 if direction == "long" else 2,  # >=TP для long
+                "price":         _gate_round_price(tp_px, contract),
+                "rule":          1 if is_long else 2,
+                "expiration":    86400,
             },
-            "order_type": "close-long-order" if direction == "long" else "close-short-order",
         })
 
-        olog(f"✅ Позиция открыта + SL/TP выставлены: {symbol}")
+        # 8. SL триггерный маркет
+        _gate_req("POST", "/futures/usdt/price_orders", body={
+            "initial": {
+                "contract":    contract,
+                "size":        close_size,
+                "price":       "0",
+                "tif":         "ioc",
+                "reduce_only": True,
+                "text":        "t-smc-sl",
+            },
+            "trigger": {
+                "strategy_type": 0,
+                "price_type":    0,
+                "price":         _gate_round_price(sl_px, contract),
+                "rule":          2 if is_long else 1,
+                "expiration":    86400,
+            },
+        })
+
+        olog(f"✅ {symbol} открыт + TP/SL выставлены")
         _send_alert(
-            f"{'🟢' if direction == 'long' else '🔴'} <b>{symbol} SMC AUTO</b> — открыт {direction.upper()}\n"
+            f"{'🟢' if is_long else '🔴'} <b>{symbol} SMC AUTO</b> — {direction.upper()}\n"
             f"Entry ≈ {_fmt_px(entry_px)} | TP {_fmt_px(tp_px)} | SL {_fmt_px(sl_px)}\n"
-            f"Size {abs(size)} контр | Риск {risk_pct}%"
+            f"Size {size} контр | ~{notional:.1f}U | {applied_leverage}×плечо"
         )
-        return {"dir": direction, "entry": entry_px, "sl": sl_px, "tp": tp_px, "size": abs(size)}
+        return {"dir": direction, "entry": entry_px, "sl": sl_px, "tp": tp_px,
+                "size": size, "leverage": applied_leverage, "notional": round(notional, 2)}
     except Exception as e:
         olog(f"⚠ gate_open_position {symbol}: {e}")
         return None
@@ -1296,7 +1334,7 @@ input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;p
         <input id="atSecret" type="password" placeholder="Gate.io Secret" style="width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;padding:4px 6px;border-radius:4px;font-size:11px">
       </label>
     </div>
-    <label style="color:#888;font-size:11px">Риск на сделку %
+    <label style="color:#888;font-size:11px">Риск на сделку % (плечо = риск ÷ SL%)
       <input id="atRisk" type="number" value="2" min="0.5" max="20" step="0.5" style="width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;padding:4px 6px;border-radius:4px;font-size:11px;margin-bottom:6px">
     </label>
     <div style="display:flex;gap:6px;margin-bottom:6px">
