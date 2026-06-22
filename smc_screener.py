@@ -85,7 +85,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "1.9"
+APP_VERSION  = "2.0"
 GATE_API     = "https://fx-api.gateio.ws/api/v4"
 PORT         = 8765
 GH_REPO      = os.environ.get("GH_REPO", "mambaleylo/smc-optimizer")
@@ -93,7 +93,10 @@ GH_TOKEN     = os.environ.get("GH_TOKEN", "")
 TG_TOKEN     = os.environ.get("TG_TOKEN", "")
 TG_CHAT      = os.environ.get("TG_CHAT", "")
 NTFY_URL     = os.environ.get("NTFY_URL", "")
-ALERT_CFG_PATH = os.path.expanduser("~/.smc_alert_cfg.json")
+ALERT_CFG_PATH   = os.path.expanduser("~/.smc_alert_cfg.json")
+GATE_CFG_PATH    = os.path.expanduser("~/.smc_gate_cfg.json")
+GATE_KEY         = os.environ.get("GATE_KEY", "")
+GATE_SECRET      = os.environ.get("GATE_SECRET", "")
 
 _C_GRN = "\033[92m"; _C_YEL = "\033[93m"; _C_RED = "\033[91m"
 _C_GREY = "\033[90m"; _C_RST = "\033[0m"
@@ -141,6 +144,314 @@ chart_mon_state = {
 }
 _chart_mon_stop   = threading.Event()
 _chart_mon_thread = None
+
+# ─── Авто-торговля Gate.io ──────────────────────────────────────────────────
+import hmac, hashlib, urllib.parse as _uparse
+
+auto_trade_lock  = threading.Lock()
+auto_trade_state = {
+    "enabled": False, "symbol": None, "tf": None, "days": 30, "params": None,
+    "risk_pct": 2.0,          # риск на сделку %
+    "position": None,         # текущая открытая позиция: {dir, entry, sl, tp, size, order_ids}
+    "last_entry_ts": None,    # таймстемп свечи последнего сигнала
+    "last_check": 0, "last_error": "",
+}
+_auto_trade_stop   = threading.Event()
+_auto_trade_thread = None
+
+def _gate_sign(key, secret, method, url, query_str="", body_str=""):
+    """HMAC-SHA512 подпись Gate.io API v4."""
+    import hashlib as _hl
+    body_hash = _hl.sha512(body_str.encode()).hexdigest()
+    ts = str(int(time.time()))
+    msg = "\n".join([method, url, query_str, body_hash, ts])
+    sig = hmac.new(secret.encode(), msg.encode(), _hl.sha512).hexdigest()
+    return {"KEY": key, "Timestamp": ts, "SIGN": sig}
+
+def _gate_req(method, path, params=None, body=None):
+    """Подписанный запрос к Gate.io Futures USDT API."""
+    if not GATE_KEY or not GATE_SECRET:
+        raise RuntimeError("Gate.io ключи не настроены")
+    import hashlib as _hl
+    query_str = _uparse.urlencode(params) if params else ""
+    body_str  = json.dumps(body) if body else ""
+    url_path  = f"/api/v4{path}"
+    body_hash = _hl.sha512(body_str.encode()).hexdigest()
+    ts = str(int(time.time()))
+    msg = "\n".join([method, url_path, query_str, body_hash, ts])
+    sig = hmac.new(GATE_SECRET.encode(), msg.encode(), _hl.sha512).hexdigest()
+    headers = {
+        "Content-Type": "application/json",
+        "KEY":       GATE_KEY,
+        "Timestamp": ts,
+        "SIGN":      sig,
+    }
+    url = f"https://fx-api.gateio.ws{url_path}"
+    if query_str: url += "?" + query_str
+    r = requests.request(method, url, headers=headers,
+                         data=body_str if body_str else None, timeout=10)
+    if not r.ok:
+        raise RuntimeError(f"Gate {method} {path} → {r.status_code}: {r.text[:200]}")
+    return r.json()
+
+def _gate_get_position(symbol):
+    """Текущая позиция по символу (None если нет)."""
+    try:
+        data = _gate_req("GET", f"/futures/usdt/positions/{symbol}")
+        size = float(data.get("size", 0))
+        if size == 0: return None
+        return {
+            "dir":    "long" if size > 0 else "short",
+            "size":   abs(size),
+            "entry":  float(data.get("entry_price", 0)),
+        }
+    except Exception as e:
+        olog(f"⚠ gate_get_position: {e}")
+        return None
+
+def _gate_get_price(symbol):
+    """Текущая цена фьючерса (mark price)."""
+    try:
+        data = requests.get(f"{GATE_API}/futures/usdt/contracts/{symbol}", timeout=5).json()
+        return float(data.get("mark_price") or data.get("last_price", 0))
+    except:
+        return 0.0
+
+def _gate_get_quanto(symbol):
+    """Размер одного контракта в USDT (quanto_multiplier)."""
+    try:
+        data = requests.get(f"{GATE_API}/futures/usdt/contracts/{symbol}", timeout=5).json()
+        return float(data.get("quanto_multiplier", 0.0001))
+    except:
+        return 0.0001
+
+def _gate_get_balance():
+    """Свободный баланс USDT."""
+    try:
+        data = _gate_req("GET", "/futures/usdt/accounts")
+        return float(data.get("available", 0))
+    except Exception as e:
+        olog(f"⚠ gate_get_balance: {e}")
+        return 0.0
+
+def _gate_cancel_orders(symbol):
+    """Отменить все открытые ордера по символу."""
+    try:
+        _gate_req("DELETE", "/futures/usdt/orders", params={"contract": symbol, "status": "open"})
+    except Exception as e:
+        olog(f"⚠ gate_cancel_orders {symbol}: {e}")
+
+def _gate_close_position(symbol):
+    """Закрыть позицию рыночным ордером."""
+    try:
+        pos = _gate_get_position(symbol)
+        if not pos: return
+        _gate_cancel_orders(symbol)
+        size  = pos["size"]
+        side  = "ask" if pos["dir"] == "long" else "bid"  # закрываем обратной стороной
+        close_size = -size if pos["dir"] == "long" else size
+        _gate_req("POST", "/futures/usdt/orders", body={
+            "contract":    symbol,
+            "size":        int(close_size),
+            "price":       "0",
+            "tif":         "ioc",
+            "reduce_only": True,
+            "text":        "t-smc-close",
+        })
+        olog(f"📤 Позиция закрыта: {symbol} {pos['dir']}")
+    except Exception as e:
+        olog(f"⚠ gate_close_position {symbol}: {e}")
+
+def _gate_open_position(symbol, direction, entry_px, sl_px, tp_px, risk_pct):
+    """
+    Открыть позицию с SL и TP лимит-ордерами.
+    Расчёт size: как в WickFill — по риску на сделку.
+    """
+    try:
+        balance  = _gate_get_balance()
+        quanto   = _gate_get_quanto(symbol)
+        if balance <= 0 or quanto <= 0 or entry_px <= 0:
+            raise RuntimeError(f"Нет данных: balance={balance} quanto={quanto} entry={entry_px}")
+
+        sl_dist_pct = abs(entry_px - sl_px) / entry_px  # доля риска на контракт
+        risk_usdt   = balance * (risk_pct / 100.0)
+        # размер позиции в контрактах
+        size_raw    = risk_usdt / (sl_dist_pct * entry_px * quanto)
+        size        = max(1, int(size_raw))
+
+        if direction == "short": size = -size
+
+        olog(f"🔓 Открываем {direction.upper()} {symbol}: size={abs(size)} "
+             f"entry≈{_fmt_px(entry_px)} SL={_fmt_px(sl_px)} TP={_fmt_px(tp_px)} "
+             f"risk={risk_pct}% bal={round(balance,2)}U")
+
+        # Отменяем старые ордера на случай висяков
+        _gate_cancel_orders(symbol)
+
+        # Рыночный ордер на вход (price=0, tif=ioc)
+        _gate_req("POST", "/futures/usdt/orders", body={
+            "contract": symbol,
+            "size":     size,
+            "price":    "0",
+            "tif":      "ioc",
+            "text":     "t-smc-open",
+        })
+
+        # Даём бирже 1 сек оформить позицию
+        time.sleep(1.0)
+
+        # SL — stop-market (close=True, price=SL, tif=poc)
+        sl_side = "ask" if direction == "long" else "bid"
+        tp_side = sl_side
+        _gate_req("POST", "/futures/usdt/price_orders", body={
+            "initial": {
+                "contract":    symbol,
+                "size":        -abs(size),
+                "price":       str(round(sl_px, 6)),
+                "tif":         "ioc",
+                "reduce_only": True,
+                "text":        "t-smc-sl",
+            },
+            "trigger": {
+                "strategy_type": 0,          # по цене
+                "price_type":    0,           # last price
+                "price":         str(round(sl_px, 6)),
+                "rule":          2 if direction == "long" else 1,  # <=SL для long
+            },
+            "order_type": "close-long-order" if direction == "long" else "close-short-order",
+        })
+
+        # TP — лимитный ордер
+        _gate_req("POST", "/futures/usdt/price_orders", body={
+            "initial": {
+                "contract":    symbol,
+                "size":        -abs(size),
+                "price":       str(round(tp_px, 6)),
+                "tif":         "gtc",
+                "reduce_only": True,
+                "text":        "t-smc-tp",
+            },
+            "trigger": {
+                "strategy_type": 0,
+                "price_type":    0,
+                "price":         str(round(tp_px, 6)),
+                "rule":          1 if direction == "long" else 2,  # >=TP для long
+            },
+            "order_type": "close-long-order" if direction == "long" else "close-short-order",
+        })
+
+        olog(f"✅ Позиция открыта + SL/TP выставлены: {symbol}")
+        _send_alert(
+            f"{'🟢' if direction == 'long' else '🔴'} <b>{symbol} SMC AUTO</b> — открыт {direction.upper()}\n"
+            f"Entry ≈ {_fmt_px(entry_px)} | TP {_fmt_px(tp_px)} | SL {_fmt_px(sl_px)}\n"
+            f"Size {abs(size)} контр | Риск {risk_pct}%"
+        )
+        return {"dir": direction, "entry": entry_px, "sl": sl_px, "tp": tp_px, "size": abs(size)}
+    except Exception as e:
+        olog(f"⚠ gate_open_position {symbol}: {e}")
+        return None
+
+def _load_gate_cfg():
+    global GATE_KEY, GATE_SECRET
+    try:
+        with open(GATE_CFG_PATH) as f:
+            cfg = json.load(f)
+        GATE_KEY    = cfg.get("gate_key",    GATE_KEY)    or GATE_KEY
+        GATE_SECRET = cfg.get("gate_secret", GATE_SECRET) or GATE_SECRET
+    except: pass
+
+def _save_gate_cfg():
+    try:
+        with open(GATE_CFG_PATH, "w") as f:
+            json.dump({"gate_key": GATE_KEY, "gate_secret": GATE_SECRET}, f)
+    except Exception as e:
+        olog(f"⚠ Не удалось сохранить gate cfg: {e}")
+
+# ─── Поток авто-торговли ────────────────────────────────────────────────────
+def _auto_trade_loop():
+    """
+    Раз в бар запускает _simulate() на свежих свечах.
+    Если появился новый сигнал — закрывает старую позицию (если есть)
+    и открывает новую через Gate.io API.
+    """
+    with auto_trade_lock:
+        sym      = auto_trade_state["symbol"]
+        tf       = auto_trade_state["tf"]
+        days     = auto_trade_state["days"]
+        p        = auto_trade_state["params"]
+        risk_pct = auto_trade_state["risk_pct"]
+
+    tf_sec = TF_SECONDS.get(tf, 900)
+    olog(f"🤖 Авто-трейд запущен: {sym} {tf} risk={risk_pct}%")
+
+    # Вооружаемся — запоминаем текущий сигнал без открытия
+    armed = False
+    last_entry_ts = None
+
+    while not _auto_trade_stop.is_set():
+        try:
+            candles = _fetch_candles(sym, tf, days)
+            if candles and len(candles) > 50:
+                result = _simulate(candles, p, sl_pct=p.get("sl_pct"),
+                                   tp_pct=p.get("tp_pct"), _collect=True)
+                with auto_trade_lock:
+                    auto_trade_state["last_check"] = time.time()
+
+                if result:
+                    sigs = result.get("signals") or []
+                    if sigs:
+                        sig = sigs[-1]
+                        entry_ts = candles[sig["entry_i"]]["t"]
+
+                        if not armed:
+                            armed         = True
+                            last_entry_ts = entry_ts
+                            olog(f"🤖 Авто-трейд вооружён, текущий сигнал: "
+                                 f"{sig['dir'].upper()} entry={_fmt_px(sig['entry'])}")
+                        elif entry_ts != last_entry_ts:
+                            # Новый сигнал!
+                            last_entry_ts = entry_ts
+                            direction     = sig["dir"]
+                            entry_px      = sig["entry"]
+                            sl_px         = sig["sl"]
+                            tp_px         = sig["tp"]
+
+                            olog(f"🤖 Новый сигнал: {direction.upper()} "
+                                 f"entry={_fmt_px(entry_px)} sl={_fmt_px(sl_px)} tp={_fmt_px(tp_px)}")
+
+                            # Закрываем старую позицию (если есть)
+                            existing = _gate_get_position(sym)
+                            if existing:
+                                olog(f"🔄 Закрываем старую позицию {existing['dir']} перед открытием новой")
+                                _gate_close_position(sym)
+                                time.sleep(1.0)
+
+                            # Открываем новую
+                            pos_info = _gate_open_position(
+                                sym, direction, entry_px, sl_px, tp_px, risk_pct)
+                            with auto_trade_lock:
+                                auto_trade_state["position"] = pos_info
+                                auto_trade_state["last_entry_ts"] = entry_ts
+                        else:
+                            # Тот же сигнал — просто логируем статус позиции
+                            cur_price = _gate_get_price(sym)
+                            with auto_trade_lock:
+                                auto_trade_state["last_check"] = time.time()
+                                auto_trade_state["last_error"] = ""
+
+        except Exception as e:
+            olog(f"⚠ Авто-трейд ошибка: {e}")
+            with auto_trade_lock:
+                auto_trade_state["last_error"] = str(e)
+
+        now = time.time()
+        sleep_for = tf_sec - (now % tf_sec) + 3
+        _auto_trade_stop.wait(timeout=max(5, sleep_for))
+
+    olog("🛑 Авто-трейд остановлен")
+    with auto_trade_lock:
+        auto_trade_state["enabled"] = False
+
 
 def _ts():
     return time.strftime("[%H:%M:%S]")
@@ -969,6 +1280,32 @@ input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;p
     <label>TP%<input id="cTp" type="number" value="1.6" step="0.1" style="width:60px"></label>
     <button class="btn btn-go" onclick="loadChart()" style="align-self:flex-end">Загрузить</button>
     <button class="btn" id="monBtn" onclick="toggleChartMonitor()" style="align-self:flex-end">🔔 Алерты</button>
+    <button class="btn" id="atBtn" onclick="toggleAutoTrade()" style="align-self:flex-end;background:#1a3a5c">🤖 Авто</button>
+  </div>
+  <!-- Панель авто-торговли (скрыта по умолчанию) -->
+  <div id="atPanel" style="display:none;background:#0d1a2a;border:1px solid #1a3a5c;border-radius:6px;padding:10px;margin-bottom:8px;font-size:12px">
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+      <b style="color:#3a9eff">🤖 Авто-торговля Gate.io</b>
+      <span id="atStatusBadge" style="color:#555;font-size:11px">выкл</span>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:6px">
+      <label style="color:#888;font-size:11px">API Key
+        <input id="atKey" type="password" placeholder="Gate.io API Key" style="width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;padding:4px 6px;border-radius:4px;font-size:11px">
+      </label>
+      <label style="color:#888;font-size:11px">API Secret
+        <input id="atSecret" type="password" placeholder="Gate.io Secret" style="width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;padding:4px 6px;border-radius:4px;font-size:11px">
+      </label>
+    </div>
+    <label style="color:#888;font-size:11px">Риск на сделку %
+      <input id="atRisk" type="number" value="2" min="0.5" max="20" step="0.5" style="width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;padding:4px 6px;border-radius:4px;font-size:11px;margin-bottom:6px">
+    </label>
+    <div style="display:flex;gap:6px;margin-bottom:6px">
+      <button class="btn btn-sm" style="flex:1" onclick="saveGateCfg()">💾 Сохранить ключи</button>
+      <button class="btn btn-sm" id="atStartBtn" style="flex:1;background:#1a5c2a;color:#0f9" onclick="startAutoTrade()">▶ Запустить</button>
+      <button class="btn btn-sm" id="atStopBtn" style="flex:1;background:#3a0a0a;color:#f45;display:none" onclick="stopAutoTrade()">⏹ Стоп</button>
+    </div>
+    <button class="btn btn-sm" style="width:100%;background:#3a1a0a;color:#f0b800;margin-bottom:4px" onclick="closePosition()">📤 Закрыть позицию вручную</button>
+    <div id="atInfo" style="font-size:11px;color:#555;line-height:1.6">—</div>
   </div>
   <div id="chartStatus">Нажмите Загрузить</div>
   <div class="chart-legend">
@@ -1044,6 +1381,120 @@ function toggleChartMonitor(){
         btn.classList.add('btn-go');
       }
     }).catch(function(e){cStatus('Ошибка монитора: '+e);});
+}
+
+// ─── Авто-торговля JS ──────────────────────────────────────────────────────
+var _atActive = false;
+var _atPollTimer = null;
+
+function toggleAutoTrade(){
+  var panel = document.getElementById('atPanel');
+  panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
+  if(panel.style.display === 'block') loadGateCfg();
+}
+
+function loadGateCfg(){
+  fetch('/gate_cfg').then(function(r){return r.json();}).then(function(d){
+    if(d.has_key){
+      document.getElementById('atKey').placeholder = d.gate_key + ' (сохранён)';
+      document.getElementById('atSecret').placeholder = '*** (сохранён)';
+    }
+  }).catch(function(){});
+}
+
+function saveGateCfg(){
+  var key = document.getElementById('atKey').value.trim();
+  var sec = document.getElementById('atSecret').value.trim();
+  if(!key || !sec){ atInfo('Введите ключ и секрет','#f45'); return; }
+  fetch('/gate_cfg',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({gate_key:key,gate_secret:sec})})
+    .then(function(r){return r.json();})
+    .then(function(d){ if(d.ok) atInfo('✅ Ключи сохранены','#0f9'); })
+    .catch(function(e){ atInfo('Ошибка: '+e,'#f45'); });
+}
+
+function startAutoTrade(){
+  var sym  = document.getElementById('cSym').value.trim()||'BTC_USDT';
+  var tf   = document.getElementById('cTf').value;
+  var days = parseInt(document.getElementById('cDays').value)||30;
+  var risk = parseFloat(document.getElementById('atRisk').value)||2.0;
+  var params = Object.assign({}, _chartExtra, {
+    swing_len: parseFloat(document.getElementById('cSwing').value),
+    sl_pct:    parseFloat(document.getElementById('cSl').value),
+    tp_pct:    parseFloat(document.getElementById('cTp').value)
+  });
+  fetch('/auto_trade_start',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({sym:sym,tf:tf,days:days,risk_pct:risk,params:params})})
+    .then(function(r){return r.json();})
+    .then(function(d){
+      if(d.ok){
+        _atActive=true;
+        document.getElementById('atStartBtn').style.display='none';
+        document.getElementById('atStopBtn').style.display='';
+        document.getElementById('atStatusBadge').textContent='🟢 активен · '+sym+' '+tf;
+        document.getElementById('atStatusBadge').style.color='#0f9';
+        document.getElementById('atBtn').style.background='#1a5c2a';
+        atInfo('Авто-трейд запущен. Ждём нового сигнала...','#0f9');
+        scheduleAtPoll();
+      } else {
+        atInfo('❌ '+d.msg,'#f45');
+      }
+    }).catch(function(e){ atInfo('Ошибка: '+e,'#f45'); });
+}
+
+function stopAutoTrade(){
+  fetch('/auto_trade_stop',{method:'POST'}).then(function(){
+    _atActive=false;
+    clearTimeout(_atPollTimer);
+    document.getElementById('atStartBtn').style.display='';
+    document.getElementById('atStopBtn').style.display='none';
+    document.getElementById('atStatusBadge').textContent='выкл';
+    document.getElementById('atStatusBadge').style.color='#555';
+    document.getElementById('atBtn').style.background='#1a3a5c';
+    atInfo('Авто-трейд остановлен.','#f0b800');
+  }).catch(function(e){ atInfo('Ошибка: '+e,'#f45'); });
+}
+
+function closePosition(){
+  if(!confirm('Закрыть текущую позицию рыночным ордером?')) return;
+  fetch('/auto_trade_close',{method:'POST'}).then(function(r){return r.json();})
+    .then(function(d){
+      atInfo(d.ok?'✅ Позиция закрыта':'❌ '+d.msg, d.ok?'#0f9':'#f45');
+    }).catch(function(e){ atInfo('Ошибка: '+e,'#f45'); });
+}
+
+function scheduleAtPoll(){
+  if(!_atActive) return;
+  _atPollTimer = setTimeout(pollAtStatus, 5000);
+}
+
+function pollAtStatus(){
+  fetch('/auto_trade_status').then(function(r){return r.json();}).then(function(d){
+    if(!d.enabled){ _atActive=false; return; }
+    var pos = d.position;
+    var info = '';
+    if(pos){
+      var dirEmoji = pos.dir==='long'?'🟢':'🔴';
+      info += dirEmoji+' <b>Позиция: '+pos.dir.toUpperCase()+'</b><br>';
+      info += 'Entry: '+pos.entry.toFixed(4)+' | SL: '+pos.sl.toFixed(4)+' | TP: '+pos.tp.toFixed(4)+'<br>';
+      info += 'Size: '+pos.size+' контр<br>';
+    } else {
+      info += '⏳ Позиций нет, ждём сигнала...<br>';
+    }
+    if(d.last_error) info += '<span style="color:#f45">⚠ '+d.last_error+'</span><br>';
+    if(d.last_check){
+      var ago = Math.round((Date.now()/1000 - d.last_check));
+      info += '<span style="color:#555">Проверка: '+ago+'с назад</span>';
+    }
+    document.getElementById('atInfo').innerHTML = info || '—';
+    scheduleAtPoll();
+  }).catch(function(){ scheduleAtPoll(); });
+}
+
+function atInfo(msg, color){
+  var el = document.getElementById('atInfo');
+  el.innerHTML = msg;
+  el.style.color = color||'#e0e0e0';
 }
 
 function alertCfgStatus(t,ok){
@@ -1494,6 +1945,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         "bull_obs": result.get("bull_obs",[]), "bear_obs": result.get("bear_obs",[]),
                         "fvg_bull": result.get("fvg_bull",[]), "fvg_bear": result.get("fvg_bear",[]),
                         "metrics": {k:result[k] for k in ("trades","winrate","profit_factor","max_dd","total_return","fitness","rr")}})
+        elif self.path == "/gate_cfg":
+            self._json({"gate_key": GATE_KEY[:4]+"***" if GATE_KEY else "",
+                        "gate_secret": "***" if GATE_SECRET else "",
+                        "has_key": bool(GATE_KEY and GATE_SECRET)})
+
+        elif self.path == "/auto_trade_status":
+            with auto_trade_lock:
+                st = dict(auto_trade_state)
+            self._json(st)
+
         elif self.path == "/chart_monitor_status":
             with chart_mon_lock:
                 self._json({k:v for k,v in chart_mon_state.items() if k != "params"})
@@ -1573,6 +2034,57 @@ class Handler(http.server.BaseHTTPRequestHandler):
             ok, err = _test_alert()
             self._json({"ok": ok, "error": err})
 
+        elif self.path == "/gate_cfg":
+            global GATE_KEY, GATE_SECRET
+            GATE_KEY    = (body.get("gate_key")    or "").strip()
+            GATE_SECRET = (body.get("gate_secret") or "").strip()
+            _save_gate_cfg()
+            self._json({"ok": True})
+
+        elif self.path == "/auto_trade_start":
+            global _auto_trade_thread
+            sym      = body.get("sym",      "BTC_USDT")
+            tf       = body.get("tf",       "15m")
+            days     = int(body.get("days", 30))
+            risk_pct = float(body.get("risk_pct", 2.0))
+            p        = dict(body.get("params") or {})
+            if "sl_pct"    not in p: p["sl_pct"]    = body.get("sl", 0.8)
+            if "tp_pct"    not in p: p["tp_pct"]    = body.get("tp", 1.6)
+            if "swing_len" not in p: p["swing_len"] = 10
+            if not GATE_KEY or not GATE_SECRET:
+                self._json({"ok": False, "msg": "Не настроены Gate.io ключи"}); return
+            _auto_trade_stop.set()
+            if _auto_trade_thread and _auto_trade_thread.is_alive():
+                _auto_trade_thread.join(timeout=3)
+            _auto_trade_stop.clear()
+            with auto_trade_lock:
+                auto_trade_state.update({
+                    "enabled": True, "symbol": sym, "tf": tf, "days": days,
+                    "params": p, "risk_pct": risk_pct, "position": None,
+                    "last_entry_ts": None, "last_check": 0, "last_error": "",
+                })
+            _auto_trade_thread = threading.Thread(target=_auto_trade_loop, daemon=True)
+            _auto_trade_thread.start()
+            self._json({"ok": True})
+
+        elif self.path == "/auto_trade_stop":
+            _auto_trade_stop.set()
+            with auto_trade_lock:
+                auto_trade_state["enabled"] = False
+            self._json({"ok": True})
+
+        elif self.path == "/auto_trade_close":
+            # Ручное закрытие текущей позиции
+            with auto_trade_lock:
+                sym = auto_trade_state.get("symbol", "BTC_USDT")
+            try:
+                _gate_close_position(sym)
+                with auto_trade_lock:
+                    auto_trade_state["position"] = None
+                self._json({"ok": True})
+            except Exception as e:
+                self._json({"ok": False, "msg": str(e)})
+
         else:
             self.send_response(404); self.end_headers()
 
@@ -1585,6 +2097,7 @@ def main():
     NTFY_URL  = os.environ.get("NTFY_URL", NTFY_URL)
     # Сохранённые через UI настройки имеют приоритет над env (если есть файл)
     _load_alert_cfg()
+    _load_gate_cfg()
 
     server = http.server.HTTPServer(("0.0.0.0", PORT), Handler)
     print(f"{_C_GRN}SMC Optimizer v{APP_VERSION} — http://0.0.0.0:{PORT}{_C_RST}", flush=True)
