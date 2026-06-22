@@ -912,6 +912,7 @@ input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;p
     <label>Дней истории</label><input id="days" type="number" value="30" min="7" max="365">
     <label>SL %</label><input id="sl_pct" type="number" value="0.6" step="0.05">
     <label>TP %</label><input id="tp_pct" type="number" value="1.2" step="0.05">
+    <label>Риск на сделку %</label><input id="risk_pct" type="number" value="10" step="1">
   </div>
   <div class="card">
     <h3>Лучший конфиг</h3>
@@ -1099,6 +1100,7 @@ function startOpt(){
     days:parseInt(document.getElementById('days').value),
     sl_pct:parseFloat(document.getElementById('sl_pct').value),
     tp_pct:parseFloat(document.getElementById('tp_pct').value),
+    risk_pct:parseFloat(document.getElementById('risk_pct').value),
   };
   fetch('/scan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
     .then(function(){
