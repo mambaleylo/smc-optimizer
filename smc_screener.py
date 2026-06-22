@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SMC Optimizer v1.0
+SMC Optimizer v1.1
 - v1.0: первая версия. Оптимизатор параметров Smart Money Concepts (SMC) сигналов
   по свечам Gate.io Futures. Метод: Basin Hopping + Metropolis. TP/SL как в WickFill.
   Параметры: swing_len (размер свинга), internal_len (внутренний свинг), ob_filter
@@ -8,6 +8,18 @@ SMC Optimizer v1.0
   sl_pct, tp_pct. Фитнесс: winrate × profit_factor × log(trades+1) / max_drawdown.
   HTTP-сервер на :8765, браузерный UI с живым графиком, топ-20 конфигов,
   автосохранение лучшего на GitHub, Telegram/ntfy алерты.
+- v1.1: фикс "мешанины" на графике. Причины было две: (1) /chart_data игнорировал
+  9 из 12 параметров лучшего конфига (internal_len, ob_filter, ob_mitigation,
+  fvg_enabled, fvg_threshold, choch_only, use_internal, min_ob_size,
+  require_fvg_confirm) — они были жёстко зашиты дефолтами и не приходили с
+  фронта даже после "Применить лучший"; (2) зоны OB/FVG на графике считались
+  отдельной, упрощённой JS-копией SMC-логики (rebuildInd), а не той же
+  _simulate(), что и оптимизатор, и рисовались БЕЗ инвалидации — каждая зона
+  тянулась на всю видимую ширину графика, поэтому сотни зон со свингов
+  накладывались друг на друга сплошными полосами. Теперь зоны OB/FVG
+  считает _simulate() с реальными параметрами конфига и передаёт на фронт
+  с end_i (где зона инвалидируется ценой); фронт рисует зону только на её
+  фактическом интервале i→end_i.
 """
 import os, sys, json, time, math, random, threading, base64, hashlib
 import http.server, urllib.request, urllib.parse
@@ -19,7 +31,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "1.0"
+APP_VERSION  = "1.1"
 GATE_API     = "https://fx-api.gateio.ws/api/v4"
 PORT         = 8765
 GH_REPO      = os.environ.get("GH_REPO", "mambaleylo/smc-optimizer")
@@ -247,6 +259,9 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=2.0,
     # OB storage: list of {"dir":+1/-1, "hi":, "lo":, "i":}
     bull_obs = []
     bear_obs = []
+    # Полная (некапнутая) история OB для отрисовки на графике
+    coll_bull_obs = []
+    coll_bear_obs = []
 
     for i in range(swing_len*2, n):
         c = candles[i]
@@ -270,6 +285,8 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=2.0,
                 if is_bullish and size_ok:
                     bear_obs.append({"dir":-1,"hi":ci["high"],"lo":ci["low"],"i":ob_hi_bar})
                     if len(bear_obs) > 10: bear_obs.pop(0)
+                    if _collect:
+                        coll_bear_obs.append({"hi":ci["high"],"lo":ci["low"],"i":ob_hi_bar})
                     break
                 ob_hi_bar -= 1
 
@@ -285,6 +302,8 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=2.0,
                 if is_bearish and size_ok:
                     bull_obs.append({"dir":+1,"hi":ci["high"],"lo":ci["low"],"i":ob_lo_bar})
                     if len(bull_obs) > 10: bull_obs.pop(0)
+                    if _collect:
+                        coll_bull_obs.append({"hi":ci["high"],"lo":ci["low"],"i":ob_lo_bar})
                     break
                 ob_lo_bar -= 1
 
@@ -420,8 +439,38 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=2.0,
     result["fitness"] = round(fitness, 6)
 
     if _collect:
-        result["signals"] = signals
-        result["candles"] = candles
+        def _box_end(items, kind):
+            out = []
+            for ob in items:
+                oi, hi, lo = ob["i"], ob["hi"], ob["lo"]
+                end_i = n - 1
+                for j in range(oi+1, n):
+                    cj = candles[j]["close"]
+                    if kind == "bull" and cj < lo:
+                        end_i = j; break
+                    if kind == "bear" and cj > hi:
+                        end_i = j; break
+                out.append({"i": oi, "hi": hi, "lo": lo, "end_i": end_i})
+            return out
+        def _fvg_end(items, kind):
+            out = []
+            for it in items:
+                fi, lo, hi = it[0], it[1], it[2]
+                end_i = n - 1
+                for j in range(fi+1, n):
+                    cj = candles[j]["close"]
+                    if kind == "bull" and cj < lo:
+                        end_i = j; break
+                    if kind == "bear" and cj > hi:
+                        end_i = j; break
+                out.append({"i": fi, "hi": hi, "lo": lo, "end_i": end_i})
+            return out
+        result["signals"]  = signals
+        result["candles"]  = candles
+        result["bull_obs"] = _box_end(coll_bull_obs, "bull")
+        result["bear_obs"] = _box_end(coll_bear_obs, "bear")
+        result["fvg_bull"] = _fvg_end(fvg_bull, "bull")
+        result["fvg_bear"] = _fvg_end(fvg_bear, "bear")
 
     return result
 
@@ -736,6 +785,9 @@ input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;p
 </div>
 <script>
 var _bestParams = null;
+var _chartExtra = {internal_len:5, ob_filter:'atr', ob_mitigation:'highlow',
+  fvg_enabled:true, fvg_threshold:0.1, choch_only:false, use_internal:true,
+  min_ob_size:1.0, require_fvg_confirm:false};
 
 function switchTab(id, btn){
   document.querySelectorAll('.tab-panel').forEach(function(p){p.classList.remove('active');});
@@ -752,6 +804,12 @@ function applyBestToChart(){
   document.getElementById('cSwing').value = p.swing_len || 10;
   document.getElementById('cSl').value   = p.sl_pct || 0.8;
   document.getElementById('cTp').value   = p.tp_pct || 1.6;
+  _chartExtra = {
+    internal_len: p.internal_len, ob_filter: p.ob_filter, ob_mitigation: p.ob_mitigation,
+    fvg_enabled: p.fvg_enabled, fvg_threshold: p.fvg_threshold, choch_only: p.choch_only,
+    use_internal: p.use_internal, min_ob_size: p.min_ob_size,
+    require_fvg_confirm: p.require_fvg_confirm
+  };
   switchTab('chart', document.querySelectorAll('.tab')[1]);
   loadChart();
 }
@@ -860,7 +918,7 @@ fetch('/opt_status').then(function(r){return r.json();}).then(function(d){
 });
 
 /* ── Chart ── */
-var _cd=[], _sig=[], _obs_bull=[], _obs_bear=[], _fvg_bull=[], _fvg_bear=[], _piv_hi=[], _piv_lo=[];
+var _cd=[], _sig=[], _obs_bull=[], _obs_bear=[], _fvg_bull=[], _fvg_bear=[];
 var _camStart=0, _camEnd=0, _drag=false, _dragX=0, _dragCam=0;
 var cv=document.getElementById('chartCanvas');
 var ctx2=cv.getContext('2d');
@@ -874,70 +932,30 @@ function loadChart(){
   var sw=document.getElementById('cSwing').value;
   var sl=document.getElementById('cSl').value;
   var tp=document.getElementById('cTp').value;
+  var ex=_chartExtra;
   cStatus('Загружаем данные...');
-  fetch('/chart_data?sym='+encodeURIComponent(sym)+'&tf='+tf+'&days='+days+'&swing='+sw+'&sl='+sl+'&tp='+tp)
+  var url='/chart_data?sym='+encodeURIComponent(sym)+'&tf='+tf+'&days='+days
+    +'&swing='+sw+'&sl='+sl+'&tp='+tp
+    +'&internal_len='+ex.internal_len+'&ob_filter='+ex.ob_filter+'&ob_mitigation='+ex.ob_mitigation
+    +'&fvg_enabled='+ex.fvg_enabled+'&fvg_threshold='+ex.fvg_threshold+'&choch_only='+ex.choch_only
+    +'&use_internal='+ex.use_internal+'&min_ob_size='+ex.min_ob_size
+    +'&require_fvg_confirm='+ex.require_fvg_confirm;
+  fetch(url)
     .then(function(r){return r.json();}).then(function(d){
       if(d.error){cStatus('Ошибка: '+d.error);return;}
       _cd=d.candles||[];
       _sig=d.signals||[];
-      _obs_bull=[];_obs_bear=[];_fvg_bull=[];_fvg_bear=[];_piv_hi=[];_piv_lo=[];
-      rebuildInd(parseInt(sw));
+      // Зоны OB/FVG теперь считает бэкенд той же функцией _simulate(),
+      // что и оптимизатор — это гарантирует совпадение с лучшим конфигом
+      // и ограниченную (а не "до конца графика") протяжённость зон.
+      _obs_bull=d.bull_obs||[]; _obs_bear=d.bear_obs||[];
+      _fvg_bull=d.fvg_bull||[]; _fvg_bear=d.fvg_bear||[];
       _camStart=Math.max(0,_cd.length-120);
       _camEnd=_cd.length-1;
       drawChart();
       renderCM(d.metrics);
       cStatus(_cd.length+' свечей, '+_sig.length+' сигналов');
     }).catch(function(e){cStatus('Ошибка: '+e);});
-}
-
-function atrA(candles,period){
-  var r=new Array(candles.length).fill(null),trs=[];
-  for(var i=1;i<candles.length;i++){
-    var h=candles[i].h,l=candles[i].l,pc=candles[i-1].c;
-    trs.push(Math.max(h-l,Math.abs(h-pc),Math.abs(l-pc)));
-  }
-  if(trs.length<period)return r;
-  var s=trs.slice(0,period).reduce(function(a,b){return a+b;},0)/period;
-  r[period]=s;
-  for(var i=period+1;i<candles.length;i++){s=(s*(period-1)+trs[i-1])/period;r[i]=s;}
-  return r;
-}
-
-function rebuildInd(swLen){
-  var n=_cd.length, atr=atrA(_cd,200);
-  for(var i=swLen;i<n-swLen;i++){
-    var h=_cd[i].h,ok=true;
-    for(var j=i-swLen;j<i;j++)if(_cd[j].h>=h){ok=false;break;}
-    if(ok)for(var j=i+1;j<=i+swLen;j++)if(_cd[j].h>=h){ok=false;break;}
-    if(ok)_piv_hi.push({i:i,p:h});
-  }
-  for(var i=swLen;i<n-swLen;i++){
-    var l=_cd[i].l,ok=true;
-    for(var j=i-swLen;j<i;j++)if(_cd[j].l<=l){ok=false;break;}
-    if(ok)for(var j=i+1;j<=i+swLen;j++)if(_cd[j].l<=l){ok=false;break;}
-    if(ok)_piv_lo.push({i:i,p:l});
-  }
-  _piv_hi.forEach(function(ph){
-    var j=ph.i-1;
-    while(j>Math.max(0,ph.i-swLen)){
-      var ci=_cd[j],a=atr[j]||0.001;
-      if(ci.c>ci.o&&(ci.h-ci.l)>=0.5*a){_obs_bear.push({i:j,hi:ci.h,lo:ci.l});break;}
-      j--;
-    }
-  });
-  _piv_lo.forEach(function(pl){
-    var j=pl.i-1;
-    while(j>Math.max(0,pl.i-swLen)){
-      var ci=_cd[j],a=atr[j]||0.001;
-      if(ci.c<ci.o&&(ci.h-ci.l)>=0.5*a){_obs_bull.push({i:j,hi:ci.h,lo:ci.l});break;}
-      j--;
-    }
-  });
-  for(var i=2;i<n;i++){
-    var a=atr[i]||0.001;
-    if(_cd[i].l-_cd[i-2].h>0.1*a)_fvg_bull.push({i:i,lo:_cd[i-2].h,hi:_cd[i].l});
-    if(_cd[i-2].l-_cd[i].h>0.1*a)_fvg_bear.push({i:i,lo:_cd[i].h,hi:_cd[i-2].l});
-  }
 }
 
 function drawChart(){
@@ -975,31 +993,27 @@ function drawChart(){
     ctx2.fillStyle='rgba(160,160,160,0.45)';ctx2.font='10px monospace';ctx2.textAlign='right';
     ctx2.fillText(p>1000?p.toFixed(1):p>10?p.toFixed(2):p.toFixed(4),PAD.l-3,y+3);
   }
-  _fvg_bull.filter(function(f){return f.i>=s&&f.i<=e;}).forEach(function(f){
+  _fvg_bull.filter(function(f){return f.end_i>=s&&f.i<=e;}).forEach(function(f){
     ctx2.fillStyle='rgba(0,255,104,0.1)';ctx2.strokeStyle='rgba(0,255,104,0.3)';ctx2.lineWidth=0.5;
-    var y1=toY(f.hi),y2=toY(f.lo);ctx2.fillRect(PAD.l,y1,cW,y2-y1);ctx2.strokeRect(PAD.l,y1,cW,y2-y1);
+    var x1=toX(Math.max(f.i,s))-barW/2, x2=toX(Math.min(f.end_i,e))+barW/2;
+    var y1=toY(f.hi),y2=toY(f.lo);ctx2.fillRect(x1,y1,x2-x1,y2-y1);ctx2.strokeRect(x1,y1,x2-x1,y2-y1);
   });
-  _fvg_bear.filter(function(f){return f.i>=s&&f.i<=e;}).forEach(function(f){
+  _fvg_bear.filter(function(f){return f.end_i>=s&&f.i<=e;}).forEach(function(f){
     ctx2.fillStyle='rgba(255,0,8,0.08)';ctx2.strokeStyle='rgba(255,0,8,0.25)';ctx2.lineWidth=0.5;
-    var y1=toY(f.hi),y2=toY(f.lo);ctx2.fillRect(PAD.l,y1,cW,y2-y1);ctx2.strokeRect(PAD.l,y1,cW,y2-y1);
+    var x1=toX(Math.max(f.i,s))-barW/2, x2=toX(Math.min(f.end_i,e))+barW/2;
+    var y1=toY(f.hi),y2=toY(f.lo);ctx2.fillRect(x1,y1,x2-x1,y2-y1);ctx2.strokeRect(x1,y1,x2-x1,y2-y1);
   });
-  _obs_bull.filter(function(o){return o.i>=s&&o.i<=e;}).forEach(function(o){
-    var x=toX(o.i);ctx2.fillStyle='rgba(49,121,245,0.18)';ctx2.strokeStyle='rgba(49,121,245,0.5)';ctx2.lineWidth=0.8;
-    var y1=toY(o.hi),y2=toY(o.lo);ctx2.fillRect(x,y1,W-PAD.r-x,y2-y1);ctx2.strokeRect(x,y1,W-PAD.r-x,y2-y1);
-    ctx2.fillStyle='rgba(49,121,245,0.6)';ctx2.font='9px monospace';ctx2.textAlign='left';ctx2.fillText('Bull OB',x+2,y1+9);
+  _obs_bull.filter(function(o){return o.end_i>=s&&o.i<=e;}).forEach(function(o){
+    var x1=toX(Math.max(o.i,s))-barW/2, x2=toX(Math.min(o.end_i,e))+barW/2;
+    ctx2.fillStyle='rgba(49,121,245,0.18)';ctx2.strokeStyle='rgba(49,121,245,0.5)';ctx2.lineWidth=0.8;
+    var y1=toY(o.hi),y2=toY(o.lo);ctx2.fillRect(x1,y1,x2-x1,y2-y1);ctx2.strokeRect(x1,y1,x2-x1,y2-y1);
+    ctx2.fillStyle='rgba(49,121,245,0.6)';ctx2.font='9px monospace';ctx2.textAlign='left';ctx2.fillText('Bull OB',x1+2,y1+9);
   });
-  _obs_bear.filter(function(o){return o.i>=s&&o.i<=e;}).forEach(function(o){
-    var x=toX(o.i);ctx2.fillStyle='rgba(247,124,128,0.18)';ctx2.strokeStyle='rgba(247,124,128,0.5)';ctx2.lineWidth=0.8;
-    var y1=toY(o.hi),y2=toY(o.lo);ctx2.fillRect(x,y1,W-PAD.r-x,y2-y1);ctx2.strokeRect(x,y1,W-PAD.r-x,y2-y1);
-    ctx2.fillStyle='rgba(247,124,128,0.6)';ctx2.font='9px monospace';ctx2.textAlign='left';ctx2.fillText('Bear OB',x+2,y1+9);
-  });
-  _piv_hi.filter(function(p){return p.i>=s&&p.i<=e;}).forEach(function(p){
-    ctx2.fillStyle='rgba(242,54,69,0.65)';ctx2.font='8px monospace';ctx2.textAlign='center';
-    ctx2.fillText('SH',toX(p.i),toY(p.p)-4);
-  });
-  _piv_lo.filter(function(p){return p.i>=s&&p.i<=e;}).forEach(function(p){
-    ctx2.fillStyle='rgba(8,153,129,0.65)';ctx2.font='8px monospace';ctx2.textAlign='center';
-    ctx2.fillText('SL',toX(p.i),toY(p.p)+11);
+  _obs_bear.filter(function(o){return o.end_i>=s&&o.i<=e;}).forEach(function(o){
+    var x1=toX(Math.max(o.i,s))-barW/2, x2=toX(Math.min(o.end_i,e))+barW/2;
+    ctx2.fillStyle='rgba(247,124,128,0.18)';ctx2.strokeStyle='rgba(247,124,128,0.5)';ctx2.lineWidth=0.8;
+    var y1=toY(o.hi),y2=toY(o.lo);ctx2.fillRect(x1,y1,x2-x1,y2-y1);ctx2.strokeRect(x1,y1,x2-x1,y2-y1);
+    ctx2.fillStyle='rgba(247,124,128,0.6)';ctx2.font='9px monospace';ctx2.textAlign='left';ctx2.fillText('Bear OB',x1+2,y1+9);
   });
   vis.forEach(function(c,idx){
     var xi=s+idx,x=toX(xi),bull=c.c>=c.o,clr=bull?'#089981':'#F23645';
@@ -1122,26 +1136,37 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif self.path.startswith("/chart_data"):
             from urllib.parse import urlparse, parse_qs
             qs = parse_qs(urlparse(self.path).query)
-            sym  = qs.get("sym",  ["BTC_USDT"])[0]
-            tf   = qs.get("tf",   ["15m"])[0]
-            days = int(qs.get("days", ["7"])[0])
-            sl_p = float(qs.get("sl",  ["0.8"])[0])
-            tp_p = float(qs.get("tp",  ["1.6"])[0])
-            sw   = int(qs.get("swing", ["10"])[0])
+            def qf(name, default):
+                return qs.get(name, [str(default)])[0]
+            def qb(name, default):
+                return qf(name, default).lower() in ("true","1","yes")
+            sym  = qf("sym",  "BTC_USDT")
+            tf   = qf("tf",   "15m")
+            days = int(float(qf("days", 7)))
+            sl_p = float(qf("sl",  0.8))
+            tp_p = float(qf("tp",  1.6))
             candles = _fetch_candles(sym, tf, days)
             if not candles:
                 self._json({"error": "no data"}); return
-            p = {"swing_len": sw, "internal_len": 5, "ob_filter": "atr",
-                 "ob_mitigation": "highlow", "fvg_enabled": True,
-                 "fvg_threshold": 0.1, "choch_only": False,
-                 "use_internal": True, "min_ob_size": 1.0,
-                 "require_fvg_confirm": False, "sl_pct": sl_p, "tp_pct": tp_p}
+            p = {"swing_len": int(float(qf("swing", 10))),
+                 "internal_len": int(float(qf("internal_len", 5))),
+                 "ob_filter": qf("ob_filter", "atr"),
+                 "ob_mitigation": qf("ob_mitigation", "highlow"),
+                 "fvg_enabled": qb("fvg_enabled", True),
+                 "fvg_threshold": float(qf("fvg_threshold", 0.1)),
+                 "choch_only": qb("choch_only", False),
+                 "use_internal": qb("use_internal", True),
+                 "min_ob_size": float(qf("min_ob_size", 1.0)),
+                 "require_fvg_confirm": qb("require_fvg_confirm", False),
+                 "sl_pct": sl_p, "tp_pct": tp_p}
             result = _simulate(candles, p, sl_pct=sl_p, tp_pct=tp_p, _collect=True)
             if not result:
                 self._json({"error": "simulation failed"}); return
             # Slim down candles for transfer
             slim = [{"t":c["t"],"o":c["open"],"h":c["high"],"l":c["low"],"c":c["close"]} for c in candles]
             self._json({"candles": slim, "signals": result.get("signals",[]),
+                        "bull_obs": result.get("bull_obs",[]), "bear_obs": result.get("bear_obs",[]),
+                        "fvg_bull": result.get("fvg_bull",[]), "fvg_bear": result.get("fvg_bear",[]),
                         "metrics": {k:result[k] for k in ("trades","winrate","profit_factor","max_dd","total_return","fitness")}})
         else:
             self.send_response(404); self.end_headers()
