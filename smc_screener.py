@@ -35,6 +35,10 @@ SMC Optimizer v1.3
   /chart_monitor_status. На фронте — кнопка "🔔 Алерты" в баре графика и
   автообновление графика раз в ТФ (loadChart(true) по таймеру, с сохранением
   позиции/масштаба просмотра по времени свечи, а не по индексу).
+- v1.6: (1) риск на сделку зафиксирован на 10% — убрано поле из UI,
+  дефолт везде 10.0; (2) Telegram-алерт о новом лучшем конфиге шлётся
+  только начиная с цикла 50 — первые 49 циклов оптимизатор "разогревается"
+  и часто обновляет лучший, алерты были бы спамом.
 - v1.5: фикс инвертированного RR — оптимизатор находил SL>TP конфиги (RR<1)
   потому что высокий WR с маленьким TP давал хороший PF без штрафа. Фиксы:
   (1) _simulate() отклоняет tp_pct < sl_pct в режиме оптимизации;
@@ -67,7 +71,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "1.5"
+APP_VERSION  = "1.6"
 GATE_API     = "https://fx-api.gateio.ws/api/v4"
 PORT         = 8765
 GH_REPO      = os.environ.get("GH_REPO", "mambaleylo/smc-optimizer")
@@ -107,7 +111,7 @@ opt_state  = {
     "running": False, "logs": [], "best": None, "top20": [],
     "cycle": 0, "trials": 0, "progress": 0,
     "symbol": "BTC_USDT", "tf": "15m", "days": 30,
-    "sl_pct": 0.6, "tp_pct": 1.2, "risk_pct": 2.0,
+    "sl_pct": 0.6, "tp_pct": 1.2, "risk_pct": 10.0,
     "chart": None, "fetch_pct": 0, "logs_dropped": 0,
 }
 _stop_flag = threading.Event()
@@ -224,7 +228,7 @@ def _pivot_low(candles, length):
     return result
 
 # ─── SMC симуляция ──────────────────────────────────────────────────────────
-def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=2.0,
+def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
               init_deposit=1000.0, _collect=False):
     """
     Симуляция SMC стратегии по параметрам p.
@@ -812,13 +816,14 @@ def run_optimizer():
                              f"swing={current_p['swing_len']}")
                         threading.Thread(target=_gh_save_best,
                             args=({"params":current_p,"result":current_r},), daemon=True).start()
-                        _send_alert(
-                            f"🏆 SMC {sym} {tf} — новый лучший\n"
-                            f"WR={current_r['winrate']}% PF={current_r['profit_factor']} "
-                            f"DD={current_r['max_dd']}% Trades={current_r['trades']}\n"
-                            f"SL={current_p['sl_pct']}% TP={current_p['tp_pct']}% "
-                            f"swing={current_p['swing_len']}"
-                        )
+                        if cycle >= 50:
+                            _send_alert(
+                                f"🏆 SMC {sym} {tf} — новый лучший\n"
+                                f"WR={current_r['winrate']}% PF={current_r['profit_factor']} "
+                                f"DD={current_r['max_dd']}% Trades={current_r['trades']}\n"
+                                f"SL={current_p['sl_pct']}% TP={current_p['tp_pct']}% "
+                                f"swing={current_p['swing_len']}"
+                            )
 
         olog(f"Цикл {cycle} завершён | best fit={best_fit:.4f}")
 
@@ -1087,7 +1092,6 @@ function startOpt(){
     days:parseInt(document.getElementById('days').value),
     sl_pct:parseFloat(document.getElementById('sl_pct').value),
     tp_pct:parseFloat(document.getElementById('tp_pct').value),
-    risk_pct:parseFloat(document.getElementById('risk_pct').value),
   };
   fetch('/scan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
     .then(function(){
@@ -1486,7 +1490,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "days":   body.get("days",30),
                     "sl_pct": body.get("sl_pct",0.6),
                     "tp_pct": body.get("tp_pct",1.2),
-                    "risk_pct": body.get("risk_pct",2.0),
+                    "risk_pct": body.get("risk_pct",10.0),
                 })
             _opt_thread = threading.Thread(target=run_optimizer, daemon=True)
             _opt_thread.start()
