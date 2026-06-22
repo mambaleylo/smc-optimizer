@@ -35,6 +35,11 @@ SMC Optimizer v1.3
   /chart_monitor_status. На фронте — кнопка "🔔 Алерты" в баре графика и
   автообновление графика раз в ТФ (loadChart(true) по таймеру, с сохранением
   позиции/масштаба просмотра по времени свечи, а не по индексу).
+- v1.7: смягчён RR-фильтр. Жёсткий запрет tp<sl убран — он перекашивал
+  оптимизатор в сторону огромных TP с малым числом сделок. Оставлен только
+  мягкий rr_bonus = sqrt(clamp(tp/sl, 0.7, 2.5)) — штрафует плохой RR
+  но не запрещает его жёстко, оптимизатор сам находит баланс между
+  WR, PF и RR.
 - v1.6: (1) риск на сделку зафиксирован на 10% — убрано поле из UI,
   дефолт везде 10.0; (2) Telegram-алерт о новом лучшем конфиге шлётся
   только начиная с цикла 50 — первые 49 циклов оптимизатор "разогревается"
@@ -71,7 +76,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "1.6"
+APP_VERSION  = "1.7"
 GATE_API     = "https://fx-api.gateio.ws/api/v4"
 PORT         = 8765
 GH_REPO      = os.environ.get("GH_REPO", "mambaleylo/smc-optimizer")
@@ -236,9 +241,6 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
     """
     if sl_pct is None: sl_pct = p["sl_pct"]
     if tp_pct is None: tp_pct = p["tp_pct"]
-
-    if tp_pct < sl_pct and not _collect:
-        return None
 
     swing_len     = int(p["swing_len"])
     internal_len  = int(p.get("internal_len", 5))
@@ -495,7 +497,7 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
     }
     # Fitness: WR × PF × log(trades) / (1+max_dd) — штраф за просадку
     rr_ratio = tp_pct / sl_pct if sl_pct > 0 else 1.0
-    rr_bonus = math.sqrt(max(rr_ratio, 0.5))
+    rr_bonus = math.sqrt(min(max(rr_ratio, 0.7), 2.5))  # мягкий бонус, без жёсткого запрета
     fitness = (wr * min(pf,5.0) * math.log(len(trades)+1) * rr_bonus) / (1 + max_dd)
     result["fitness"] = round(fitness, 6)
     result["rr"] = round(tp_pct / sl_pct if sl_pct > 0 else 1.0, 2)
