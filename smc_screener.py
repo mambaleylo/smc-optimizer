@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SMC Optimizer v1.1
+SMC Optimizer v1.2
 - v1.0: первая версия. Оптимизатор параметров Smart Money Concepts (SMC) сигналов
   по свечам Gate.io Futures. Метод: Basin Hopping + Metropolis. TP/SL как в WickFill.
   Параметры: swing_len (размер свинга), internal_len (внутренний свинг), ob_filter
@@ -20,6 +20,21 @@ SMC Optimizer v1.1
   считает _simulate() с реальными параметрами конфига и передаёт на фронт
   с end_i (где зона инвалидируется ценой); фронт рисует зону только на её
   фактическом интервале i→end_i.
+- v1.2: живой монитор сигналов + Telegram-алерты (по аналогии с WickFill).
+  _simulate() при _collect=True теперь также возвращает текущую ОТКРЫТУЮ
+  (ещё не закрытую TP/SL) позицию как сигнал без exit_i — раньше она была
+  не видна ни графику, ни монитору до своего закрытия. Убран ранний return
+  None при <5 закрытых сделках для _collect-вызовов (графику и монитору
+  нужен результат даже при малой исторической выборке). Новый фоновый поток
+  _chart_monitor_loop раз в бар (с привязкой к закрытию свечи по ТФ)
+  пересчитывает _simulate() на свежих свечах и, если последний сигнал
+  (entry-таймстемп) сменился — шлёт компактный алерт в Telegram/ntfy.
+  При первом запуске монитор "вооружается" без алерта на уже существующий
+  сигнал, чтобы не спамить историей. Эндпоинты: POST /chart_monitor_start
+  (sym, tf, days, params), POST /chart_monitor_stop, GET
+  /chart_monitor_status. На фронте — кнопка "🔔 Алерты" в баре графика и
+  автообновление графика раз в ТФ (loadChart(true) по таймеру, с сохранением
+  позиции/масштаба просмотра по времени свечи, а не по индексу).
 """
 import os, sys, json, time, math, random, threading, base64, hashlib
 import http.server, urllib.request, urllib.parse
@@ -31,7 +46,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "1.1"
+APP_VERSION  = "1.2"
 GATE_API     = "https://fx-api.gateio.ws/api/v4"
 PORT         = 8765
 GH_REPO      = os.environ.get("GH_REPO", "mambaleylo/smc-optimizer")
@@ -75,6 +90,17 @@ opt_state  = {
 }
 _stop_flag = threading.Event()
 _opt_thread = None
+
+# Монитор графика: раз в бар проверяет, не появился ли новый сигнал,
+# и шлёт алерт в Telegram (по аналогии с WickFill)
+chart_mon_lock  = threading.Lock()
+chart_mon_state = {
+    "active": False, "symbol": None, "tf": None, "days": 30,
+    "params": None, "armed": False,
+    "last_entry_ts": None, "last_dir": None, "last_check": 0,
+}
+_chart_mon_stop   = threading.Event()
+_chart_mon_thread = None
 
 def _ts():
     return time.strftime("[%H:%M:%S]")
@@ -410,22 +436,26 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=2.0,
             entry_i   = i
 
     # Метрики
-    if len(trades) < 5: return None
-    wins   = [t for t in trades if t["win"]]
-    losses = [t for t in trades if not t["win"]]
-    wr     = len(wins)/len(trades)
-    gross_profit = sum(t["pnl"] for t in wins)
-    gross_loss   = abs(sum(t["pnl"] for t in losses)) or 1e-9
-    pf   = gross_profit / gross_loss
-    # Max drawdown
-    eq = init_deposit
-    peak = eq; max_dd = 0.0
-    for t in trades:
-        eq += t["pnl"]
-        if eq > peak: peak = eq
-        dd = (peak - eq)/peak if peak > 0 else 0
-        if dd > max_dd: max_dd = dd
-    max_dd = max(max_dd, 0.001)
+    if len(trades) < 5 and not _collect:
+        return None
+    if len(trades) == 0:
+        wr = 0.0; pf = 0.0; max_dd = 0.001
+    else:
+        wins   = [t for t in trades if t["win"]]
+        losses = [t for t in trades if not t["win"]]
+        wr     = len(wins)/len(trades)
+        gross_profit = sum(t["pnl"] for t in wins)
+        gross_loss   = abs(sum(t["pnl"] for t in losses)) or 1e-9
+        pf   = gross_profit / gross_loss
+        # Max drawdown
+        eq = init_deposit
+        peak = eq; max_dd = 0.0
+        for t in trades:
+            eq += t["pnl"]
+            if eq > peak: peak = eq
+            dd = (peak - eq)/peak if peak > 0 else 0
+            if dd > max_dd: max_dd = dd
+        max_dd = max(max_dd, 0.001)
     total_return = (equity - init_deposit)/init_deposit*100
 
     result = {
@@ -466,6 +496,13 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=2.0,
                 out.append({"i": fi, "hi": hi, "lo": lo, "end_i": end_i})
             return out
         result["signals"]  = signals
+        if in_trade:
+            # Открытая (ещё не закрытая) позиция — без неё монитор и график
+            # не видят текущий активный сигнал до его TP/SL
+            result["signals"] = signals + [{
+                "dir": trade_dir, "entry_i": entry_i, "entry": entry_px,
+                "tp": tp_price, "sl": sl_price, "open": True
+            }]
         result["candles"]  = candles
         result["bull_obs"] = _box_end(coll_bull_obs, "bull")
         result["bear_obs"] = _box_end(coll_bear_obs, "bear")
@@ -557,6 +594,61 @@ def _send_alert(msg):
         try:
             requests.post(NTFY_URL, data=msg.encode(), timeout=8)
         except: pass
+
+def _fmt_px(v):
+    if v is None: return "—"
+    if v >= 100:  return f"{v:.2f}"
+    if v >= 1:    return f"{v:.4f}"
+    return f"{v:.6f}".rstrip("0").rstrip(".")
+
+# ─── Монитор графика (live-сигналы) ────────────────────────────────────────
+def _chart_monitor_loop(sym, tf, days, p):
+    tf_sec = TF_SECONDS.get(tf, 900)
+    olog(f"🔔 Монитор графика запущен: {sym} {tf}")
+    while not _chart_mon_stop.is_set():
+        try:
+            candles = _fetch_candles(sym, tf, days)
+            if candles and len(candles) > 50:
+                result = _simulate(candles, p, sl_pct=p.get("sl_pct"),
+                                    tp_pct=p.get("tp_pct"), _collect=True)
+                with chart_mon_lock:
+                    chart_mon_state["last_check"] = time.time()
+                if result:
+                    sigs = result.get("signals") or []
+                    if sigs:
+                        sig = sigs[-1]
+                        entry_ts = candles[sig["entry_i"]]["t"]
+                        new_sig = None
+                        with chart_mon_lock:
+                            if not chart_mon_state["armed"]:
+                                # Первый запуск — просто запоминаем текущий
+                                # сигнал, чтобы не спамить алертом по уже
+                                # имеющейся (старой) сделке
+                                chart_mon_state["armed"]         = True
+                                chart_mon_state["last_entry_ts"] = entry_ts
+                                chart_mon_state["last_dir"]      = sig["dir"]
+                            elif entry_ts != chart_mon_state["last_entry_ts"]:
+                                chart_mon_state["last_entry_ts"] = entry_ts
+                                chart_mon_state["last_dir"]      = sig["dir"]
+                                new_sig = sig
+                        if new_sig:
+                            emoji = "🟢" if new_sig["dir"] == "long" else "🔴"
+                            dirru = "LONG" if new_sig["dir"] == "long" else "SHORT"
+                            _send_alert(
+                                f"{emoji} <b>{sym} {tf}</b> — новый сигнал {dirru}\n"
+                                f"Entry {_fmt_px(new_sig['entry'])} | "
+                                f"TP {_fmt_px(new_sig['tp'])} | "
+                                f"SL {_fmt_px(new_sig['sl'])}"
+                            )
+                            olog(f"🔔 Новый сигнал {sym} {tf} {dirru} "
+                                 f"entry={_fmt_px(new_sig['entry'])}")
+        except Exception as e:
+            olog(f"⚠ Монитор графика: {e}")
+        # Спим до следующего закрытия бара (+небольшой запас)
+        now = time.time()
+        sleep_for = tf_sec - (now % tf_sec) + 3
+        _chart_mon_stop.wait(timeout=max(5, sleep_for))
+    olog("🔕 Монитор графика остановлен")
 
 # ─── Основной оптимизатор ───────────────────────────────────────────────────
 def run_optimizer():
@@ -770,6 +862,7 @@ input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;p
     <label>SL%<input id="cSl" type="number" value="0.8" step="0.1" style="width:60px"></label>
     <label>TP%<input id="cTp" type="number" value="1.6" step="0.1" style="width:60px"></label>
     <button class="btn btn-go" onclick="loadChart()" style="align-self:flex-end">Загрузить</button>
+    <button class="btn" id="monBtn" onclick="toggleChartMonitor()" style="align-self:flex-end">🔔 Алерты</button>
   </div>
   <div id="chartStatus">Нажмите Загрузить</div>
   <div class="chart-legend">
@@ -788,6 +881,9 @@ var _bestParams = null;
 var _chartExtra = {internal_len:5, ob_filter:'atr', ob_mitigation:'highlow',
   fvg_enabled:true, fvg_threshold:0.1, choch_only:false, use_internal:true,
   min_ob_size:1.0, require_fvg_confirm:false};
+var TF_SEC = {"1m":60,"5m":300,"15m":900,"30m":1800,"1h":3600,"4h":14400,"1d":86400};
+var _chartAutoTimer = null;
+var _monitorActive = false;
 
 function switchTab(id, btn){
   document.querySelectorAll('.tab-panel').forEach(function(p){p.classList.remove('active');});
@@ -812,6 +908,36 @@ function applyBestToChart(){
   };
   switchTab('chart', document.querySelectorAll('.tab')[1]);
   loadChart();
+}
+
+function toggleChartMonitor(){
+  var btn = document.getElementById('monBtn');
+  if(_monitorActive){
+    fetch('/chart_monitor_stop',{method:'POST'}).then(function(){
+      _monitorActive=false;
+      btn.textContent='🔔 Алерты';
+      btn.classList.remove('btn-go');
+    });
+    return;
+  }
+  var sym  = document.getElementById('cSym').value.trim()||'BTC_USDT';
+  var tf   = document.getElementById('cTf').value;
+  var days = parseInt(document.getElementById('cDays').value)||30;
+  var params = Object.assign({}, _chartExtra, {
+    swing_len: parseFloat(document.getElementById('cSwing').value),
+    sl_pct:    parseFloat(document.getElementById('cSl').value),
+    tp_pct:    parseFloat(document.getElementById('cTp').value)
+  });
+  fetch('/chart_monitor_start',{method:'POST',headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({sym:sym, tf:tf, days:days, params:params})})
+    .then(function(r){return r.json();})
+    .then(function(d){
+      if(d.ok){
+        _monitorActive=true;
+        btn.textContent='🔕 Алерты вкл ('+sym+' '+tf+')';
+        btn.classList.add('btn-go');
+      }
+    }).catch(function(e){cStatus('Ошибка монитора: '+e);});
 }
 
 /* ── Optimizer polling ── */
@@ -925,7 +1051,7 @@ var ctx2=cv.getContext('2d');
 
 function cStatus(t){document.getElementById('chartStatus').textContent=t;}
 
-function loadChart(){
+function loadChart(auto){
   var sym=document.getElementById('cSym').value.trim()||'BTC_USDT';
   var tf=document.getElementById('cTf').value;
   var days=document.getElementById('cDays').value;
@@ -933,7 +1059,13 @@ function loadChart(){
   var sl=document.getElementById('cSl').value;
   var tp=document.getElementById('cTp').value;
   var ex=_chartExtra;
-  cStatus('Загружаем данные...');
+  if(!auto) cStatus('Загружаем данные...');
+  // Запоминаем текущий вид по времени (не по индексу — индексы сдвигаются
+  // при скользящем окне свечей), чтобы автообновление раз в бар не сбрасывало
+  // масштаб/позицию, если пользователь листает историю
+  var wasFollowing = !_cd.length || _camEnd >= _cd.length-3;
+  var anchorTs = (_cd.length && _camStart < _cd.length) ? _cd[_camStart].t : null;
+  var visWidth = _camEnd - _camStart;
   var url='/chart_data?sym='+encodeURIComponent(sym)+'&tf='+tf+'&days='+days
     +'&swing='+sw+'&sl='+sl+'&tp='+tp
     +'&internal_len='+ex.internal_len+'&ob_filter='+ex.ob_filter+'&ob_mitigation='+ex.ob_mitigation
@@ -950,12 +1082,29 @@ function loadChart(){
       // и ограниченную (а не "до конца графика") протяжённость зон.
       _obs_bull=d.bull_obs||[]; _obs_bear=d.bear_obs||[];
       _fvg_bull=d.fvg_bull||[]; _fvg_bear=d.fvg_bear||[];
-      _camStart=Math.max(0,_cd.length-120);
-      _camEnd=_cd.length-1;
+      if(!auto || anchorTs===null){
+        _camStart=Math.max(0,_cd.length-120);
+        _camEnd=_cd.length-1;
+      } else if(wasFollowing){
+        _camEnd=_cd.length-1;
+        _camStart=Math.max(0,_camEnd-visWidth);
+      } else {
+        var idx=0;
+        for(var i=0;i<_cd.length;i++){ idx=i; if(_cd[i].t>=anchorTs) break; }
+        _camStart=Math.max(0,Math.min(_cd.length-1,idx));
+        _camEnd=Math.min(_cd.length-1,_camStart+visWidth);
+      }
       drawChart();
       renderCM(d.metrics);
-      cStatus(_cd.length+' свечей, '+_sig.length+' сигналов');
+      cStatus(_cd.length+' свечей, '+_sig.length+' сигналов'+(auto?' (автообновление)':''));
+      scheduleAutoRefresh(tf);
     }).catch(function(e){cStatus('Ошибка: '+e);});
+}
+
+function scheduleAutoRefresh(tf){
+  if(_chartAutoTimer) clearTimeout(_chartAutoTimer);
+  var sec = TF_SEC[tf] || 900;
+  _chartAutoTimer = setTimeout(function(){ loadChart(true); }, sec*1000);
 }
 
 function drawChart(){
@@ -1168,6 +1317,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         "bull_obs": result.get("bull_obs",[]), "bear_obs": result.get("bear_obs",[]),
                         "fvg_bull": result.get("fvg_bull",[]), "fvg_bear": result.get("fvg_bear",[]),
                         "metrics": {k:result[k] for k in ("trades","winrate","profit_factor","max_dd","total_return","fitness")}})
+        elif self.path == "/chart_monitor_status":
+            with chart_mon_lock:
+                self._json({k:v for k,v in chart_mon_state.items() if k != "params"})
         else:
             self.send_response(404); self.end_headers()
 
@@ -1198,6 +1350,37 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif self.path == "/scan_stop":
             _stop_flag.set()
             self._json({"ok":True})
+
+        elif self.path == "/chart_monitor_start":
+            global _chart_mon_thread
+            sym  = body.get("sym", "BTC_USDT")
+            tf   = body.get("tf", "15m")
+            days = int(body.get("days", 30))
+            p    = dict(body.get("params") or {})
+            if "sl_pct" not in p: p["sl_pct"] = body.get("sl", 0.8)
+            if "tp_pct" not in p: p["tp_pct"] = body.get("tp", 1.6)
+            if "swing_len" not in p: p["swing_len"] = body.get("swing", 10)
+            # Останавливаем предыдущий монитор, если был
+            _chart_mon_stop.set()
+            if _chart_mon_thread and _chart_mon_thread.is_alive():
+                _chart_mon_thread.join(timeout=3)
+            _chart_mon_stop.clear()
+            with chart_mon_lock:
+                chart_mon_state.update({
+                    "active": True, "symbol": sym, "tf": tf, "days": days,
+                    "params": p, "armed": False,
+                    "last_entry_ts": None, "last_dir": None, "last_check": 0,
+                })
+            _chart_mon_thread = threading.Thread(
+                target=_chart_monitor_loop, args=(sym, tf, days, p), daemon=True)
+            _chart_mon_thread.start()
+            self._json({"ok": True})
+
+        elif self.path == "/chart_monitor_stop":
+            _chart_mon_stop.set()
+            with chart_mon_lock:
+                chart_mon_state["active"] = False
+            self._json({"ok": True})
 
         else:
             self.send_response(404); self.end_headers()
