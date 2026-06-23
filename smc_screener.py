@@ -730,7 +730,7 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
 
         # Управление открытой позицией
         if in_trade:
-            open_i = candles[i]["o"]
+            open_i = candles[i]["open"]
             if trade_dir == "long":
                 sl_hit = (low_i  <= sl_price)
                 tp_hit = (high_i >= tp_price)
