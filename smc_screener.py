@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """
-SMC Optimizer v3.16
+SMC Optimizer v3.17
+- v3.17: фикс зависания скринера. ProcessPoolExecutor заменён на ThreadPoolExecutor
+  для скринера (IO-bound: fetch свечей + simulate) — на Android spawn 795 процессов
+  вешает систему. Потоков max(4, NUM_WORKERS*2). Фикс кривого __import__ as_completed
+  → нормальный импорт в шапке. ProcessPool оставлен только для оптимизатора.
+
 - v3.16: параллелизм как в WickFill. ProcessPoolExecutor создаётся один раз при старте
   оптимизатора (initializer=_worker_init передаёт свечи в глобали воркера). Локальный
   поиск Basin Hopping теперь отправляет пачки соседей в пул (n_workers*2 за итерацию),
@@ -92,7 +97,7 @@ import os, sys, json, time, math, random, threading, base64, hashlib
 import multiprocessing
 import http.server, urllib.request, urllib.parse
 from functools import lru_cache
-from concurrent.futures import ProcessPoolExecutor, wait as _fw
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, wait as _fw, as_completed as _as_completed
 
 try:
     import requests
@@ -100,7 +105,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.16"
+APP_VERSION  = "3.17"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -1345,15 +1350,17 @@ def run_screener():
         with screener_lock: screener_state["running"] = False
         olog("❌ Не удалось получить список монет"); return
     with screener_lock: screener_state["sym_total"] = len(syms)
-    n_workers = NUM_WORKERS
-    olog(f"✔ {len(syms)} монет, 50 циклов каждая | {n_workers} процессов")
+    # Скринер IO-bound (fetch свечей + CPU simulate) — ThreadPoolExecutor,
+    # не ProcessPool: на Android spawn 795 процессов это краш/зависание.
+    n_threads = max(4, NUM_WORKERS * 2)
+    olog(f"✔ {len(syms)} монет, 50 циклов каждая | {n_threads} потоков")
     all_results = []
     args_list = [(sym, tf, days, sl_p, tp_p, risk) for sym in syms]
 
-    with ProcessPoolExecutor(max_workers=n_workers) as pool:
+    with ThreadPoolExecutor(max_workers=n_threads) as pool:
         fut_to_sym = {pool.submit(_screener_worker, args): args[0] for args in args_list}
         done_count = 0
-        for fut in __import__("concurrent.futures", fromlist=["as_completed"]).as_completed(fut_to_sym):
+        for fut in _as_completed(fut_to_sym):
             if _screener_stop.is_set():
                 break
             sym = fut_to_sym[fut]
@@ -2608,5 +2615,6 @@ if __name__ == "__main__":
     except RuntimeError:
         pass
     main()
+
 
 
