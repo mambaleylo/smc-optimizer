@@ -90,8 +90,8 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.8"
-GATE_API     = "https://fx-api.gateio.ws/api/v4"
+APP_VERSION  = "3.9"
+GATE_API     = "https://api.gateio.ws/api/v4"
 PORT         = 8765
 GH_REPO      = os.environ.get("GH_REPO", "mambaleylo/smc-optimizer")
 GH_TOKEN     = os.environ.get("GH_TOKEN", "")
