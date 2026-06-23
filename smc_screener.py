@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """
-SMC Optimizer v1.3
+SMC Optimizer v3.4
+- v3.4: скрининг всех фьючерсных пар Gate.io. Чекбокс "Все монеты"
+  рядом с полем символа — запускает прогон каждой пары по 50 циклов.
+  Прогресс [N/Total] + текущая монета в реальном времени. Топ-20 монет
+  с WR/PF/DD/T/Return%/SL/TP/swing обновляется по ходу. Telegram-алерт
+  с топ-3 по завершении. Кнопка Стоп останавливает скрининг.
 - v1.0: первая версия. Оптимизатор параметров Smart Money Concepts (SMC) сигналов
   по свечам Gate.io Futures. Метод: Basin Hopping + Metropolis. TP/SL как в WickFill.
   Параметры: swing_len (размер свинга), internal_len (внутренний свинг), ob_filter
@@ -85,7 +90,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.3"
+APP_VERSION  = "3.4"
 GATE_API     = "https://fx-api.gateio.ws/api/v4"
 PORT         = 8765
 GH_REPO      = os.environ.get("GH_REPO", "mambaleylo/smc-optimizer")
@@ -133,6 +138,16 @@ opt_state  = {
 }
 _stop_flag = threading.Event()
 _opt_thread = None
+
+screener_lock  = threading.Lock()
+screener_state = {
+    "running": False, "done": False,
+    "current_sym": "", "sym_index": 0, "sym_total": 0,
+    "results": [], "tf":"15m", "days":30,
+    "sl_pct":0.6, "tp_pct":1.2, "risk_pct":10.0,
+}
+_screener_stop   = threading.Event()
+_screener_thread = None
 
 # Монитор графика: раз в бар проверяет, не появился ли новый сигнал,
 # и шлёт алерт в Telegram (по аналогии с WickFill)
@@ -507,6 +522,17 @@ def olog(msg):
             opt_state["logs_dropped"] = opt_state.get("logs_dropped",0) + 200
 
 # ─── Gate.io fetch ──────────────────────────────────────────────────────────
+def _fetch_all_symbols():
+    try:
+        r = requests.get(f"{GATE_API}/futures/usdt/contracts",
+                         params={"limit": 1000}, timeout=15)
+        if r.status_code != 200: return []
+        return sorted(c["name"] for c in r.json()
+                      if not c.get("in_delisting") and "_USDT" in c["name"])
+    except Exception as e:
+        olog(f"fetch_all_symbols error: {e}")
+        return []
+
 def _fetch_candles(symbol, tf, days):
     interval_sec = TF_SECONDS.get(tf, 3600)
     now   = int(time.time())
@@ -1208,6 +1234,71 @@ def run_optimizer():
     olog("⏹ Остановлено")
     with opt_lock: opt_state["running"] = False
 
+def _run_one_sym_screener(sym, tf, days, sl_p, tp_p, risk, max_cycles=50):
+    candles = _fetch_candles(sym, tf, days)
+    if not candles or len(candles) < 100: return None
+    best_params = _random_params()
+    best_params["sl_pct"] = sl_p; best_params["tp_pct"] = tp_p
+    best_result = _simulate(candles, best_params, sl_pct=sl_p, tp_pct=tp_p, risk_pct=risk)
+    best_fit    = best_result["fitness"] if best_result else 0.0
+    for cycle in range(1, max_cycles + 1):
+        if _screener_stop.is_set(): return None
+        temp = 1.0 * math.exp(-0.05 * cycle)
+        for start_p in [_shake(best_params, 0.4), _random_params()]:
+            if _screener_stop.is_set(): return None
+            cur_p = start_p
+            cur_r = _simulate(candles, cur_p, risk_pct=risk)
+            cur_f = cur_r["fitness"] if cur_r else 0.0
+            for _ in range(60):
+                if _screener_stop.is_set(): return None
+                nb_p = _neighbour(cur_p)
+                nb_r = _simulate(candles, nb_p, risk_pct=risk)
+                if not nb_r: continue
+                nfit = nb_r["fitness"]
+                delta = nfit - cur_f
+                if delta > 0 or random.random() < math.exp(delta / max(temp, 0.001)):
+                    cur_p, cur_f, cur_r = nb_p, nfit, nb_r
+                if nfit > best_fit:
+                    best_fit, best_params, best_result = nfit, nb_p, nb_r
+    return {"sym": sym, "params": best_params, "result": best_result} if best_result else None
+
+def run_screener():
+    global _screener_thread
+    tf   = screener_state["tf"]
+    days = screener_state["days"]
+    sl_p = screener_state["sl_pct"]
+    tp_p = screener_state["tp_pct"]
+    risk = screener_state["risk_pct"]
+    with screener_lock:
+        screener_state.update({"results":[],"done":False,"sym_index":0,"sym_total":0})
+    olog("🔍 Получаем список монет...")
+    syms = _fetch_all_symbols()
+    if not syms:
+        with screener_lock: screener_state["running"] = False
+        olog("❌ Не удалось получить список монет"); return
+    with screener_lock: screener_state["sym_total"] = len(syms)
+    olog(f"✔ {len(syms)} монет, 50 циклов каждая")
+    all_results = []
+    for idx, sym in enumerate(syms):
+        if _screener_stop.is_set(): break
+        with screener_lock:
+            screener_state["current_sym"] = sym
+            screener_state["sym_index"]   = idx + 1
+        olog(f"[{idx+1}/{len(syms)}] {sym}")
+        res = _run_one_sym_screener(sym, tf, days, sl_p, tp_p, risk)
+        if res:
+            all_results.append(res)
+            all_results.sort(key=lambda x: x["result"]["fitness"], reverse=True)
+            with screener_lock: screener_state["results"] = all_results[:20]
+    with screener_lock:
+        screener_state["results"] = all_results[:20]
+        screener_state["running"] = False
+        screener_state["done"]    = True
+    olog(f"✅ Скрининг завершён")
+    if all_results:
+        top3 = ", ".join(f"{r['sym']} WR={r['result']['winrate']}%" for r in all_results[:3])
+        _send_alert(f"🔍 Скрининг завершён\nТоп-3: {top3}")
+
 # ─── HTTP сервер ─────────────────────────────────────────────────────────────
 HTML = """<!DOCTYPE html><html lang="ru"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -1273,7 +1364,13 @@ input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;p
 <div class="sidebar">
   <div class="card">
     <h3>Параметры запуска</h3>
-    <label>Символ</label><input id="sym" value="DOGE_USDT">
+    <label>Символ</label>
+    <div style="display:flex;gap:6px;align-items:center">
+      <input id="sym" value="DOGE_USDT" style="flex:1">
+      <label style="display:flex;align-items:center;gap:4px;color:#aaa;font-size:11px;white-space:nowrap;cursor:pointer">
+        <input type="checkbox" id="scanAll" onchange="toggleScanAll(this)"> Все монеты
+      </label>
+    </div>
     <label>Таймфрейм</label>
     <select id="tf">
       <option>1m</option><option>5m</option><option selected>15m</option>
@@ -1317,6 +1414,12 @@ input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;p
         <span>T</span><span>Return%</span><span>SL/TP/swing</span>
       </div>
     </div>
+  </div>
+  <div class="card" id="screenerCard" style="display:none">
+    <h3>🔍 Скрининг всех монет</h3>
+    <div id="screenerStatus" style="color:#555;font-size:11px;margin-bottom:8px">—</div>
+    <div class="prog-bar"><div class="prog-fill" id="screenerProg" style="width:0%"></div></div>
+    <div id="screenerTable" style="margin-top:8px"></div>
   </div>
 </div>
 </div>
@@ -2054,6 +2157,87 @@ cv.addEventListener('touchmove',function(e){
   drawChart();
 },{passive:false});
 window.addEventListener('resize',drawChart);
+
+/* ── Screener all symbols ── */
+var _screenerPoll=null;
+function toggleScanAll(cb){
+  document.getElementById('screenerCard').style.display=cb.checked?'':'none';
+  document.getElementById('sym').disabled=cb.checked;
+  document.getElementById('btnStart').textContent=cb.checked?'\u25ba Скан всех':'\u25ba Старт';
+}
+var _origStartOpt=startOpt;
+startOpt=function(){
+  if(document.getElementById('scanAll')&&document.getElementById('scanAll').checked){
+    var body={tf:document.getElementById('tf').value,
+      days:parseInt(document.getElementById('days').value),
+      sl_pct:parseFloat(document.getElementById('sl_pct').value),
+      tp_pct:parseFloat(document.getElementById('tp_pct').value),
+      risk_pct:parseFloat(document.getElementById('risk_pct').value)};
+    fetch('/scan_all',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+      .then(function(r){return r.json();})
+      .then(function(d){
+        if(!d.ok){alert(d.msg||'ошибка');return;}
+        document.getElementById('btnStart').style.display='none';
+        document.getElementById('btnStop').style.display='';
+        document.getElementById('statusBadge').textContent='скрининг...';
+        pollScreener();
+      });
+    return;
+  }
+  _origStartOpt();
+};
+var _origStopOpt=stopOpt;
+stopOpt=function(){
+  if(document.getElementById('scanAll')&&document.getElementById('scanAll').checked){
+    fetch('/scan_all_stop',{method:'POST'}).then(function(){
+      document.getElementById('btnStop').style.display='none';
+      document.getElementById('btnStart').style.display='';
+      document.getElementById('statusBadge').textContent='остановлен';
+      if(_screenerPoll) clearTimeout(_screenerPoll);
+    });
+    return;
+  }
+  _origStopOpt();
+};
+function pollScreener(){
+  fetch('/scan_all_status').then(function(r){return r.json();}).then(function(d){
+    var pct=d.sym_total>0?Math.round(d.sym_index/d.sym_total*100):0;
+    document.getElementById('screenerProg').style.width=pct+'%';
+    document.getElementById('screenerStatus').textContent=
+      d.running?('['+d.sym_index+'/'+d.sym_total+'] '+d.current_sym+'...'):
+      d.done?('\u2705 Готово — проверено '+d.sym_total+' монет'):'—';
+    renderScreenerResults(d.results||[]);
+    if(d.running){_screenerPoll=setTimeout(pollScreener,2000);}
+    else{
+      document.getElementById('btnStop').style.display='none';
+      document.getElementById('btnStart').style.display='';
+      document.getElementById('statusBadge').textContent=d.done?'скрининг завершён':'остановлен';
+    }
+  }).catch(function(){_screenerPoll=setTimeout(pollScreener,3000);});
+}
+function renderScreenerResults(results){
+  if(!results.length){document.getElementById('screenerTable').innerHTML='';return;}
+  var cols='grid-template-columns:20px 1fr 1fr 1fr 1fr 1fr 1fr 1fr';
+  var html='<div class="top20-row" style="'+cols+'">'+
+    '<span>#</span><span>Монета</span><span>WR%</span><span>PF</span>'+
+    '<span>DD%</span><span>T</span><span>Return%</span><span>SL/TP/sw</span></div>';
+  results.forEach(function(e,i){
+    var r=e.result,p=e.params;
+    var wrC=r.winrate>=55?'green':r.winrate>=45?'yellow':'red';
+    var retC=r.total_return>=0?'green':'red';
+    html+='<div class="top20-row" style="'+cols+'">'+
+      '<span style="color:#555">'+(i+1)+'</span>'+
+      '<span style="color:#f0b800;font-size:10px">'+e.sym+'</span>'+
+      '<span class="'+wrC+'">'+r.winrate+'%</span>'+
+      '<span>'+r.profit_factor+'</span>'+
+      '<span class="red">'+r.max_dd+'%</span>'+
+      '<span>'+r.trades+'</span>'+
+      '<span class="'+retC+'">'+r.total_return+'%</span>'+
+      '<span style="color:#888">'+p.sl_pct+'/'+p.tp_pct+'/'+p.swing_len+'</span>'+
+    '</div>';
+  });
+  document.getElementById('screenerTable').innerHTML=html;
+}
 document.addEventListener('visibilitychange',function(){
   if(!document.hidden && _cd.length){
     // Если вкладка вернулась и прошло >5с от последней загрузки — перезагружаем данные
@@ -2172,6 +2356,32 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif self.path == "/scan_stop":
             _stop_flag.set()
             self._json({"ok":True})
+
+        elif self.path == "/scan_all":
+            global _screener_thread
+            if _screener_thread and _screener_thread.is_alive():
+                self._json({"ok":False,"msg":"скрининг уже идёт"}); return
+            _screener_stop.clear()
+            with screener_lock:
+                screener_state.update({
+                    "running":True,"done":False,
+                    "tf":body.get("tf","15m"),
+                    "days":int(body.get("days",30)),
+                    "sl_pct":float(body.get("sl_pct",0.6)),
+                    "tp_pct":float(body.get("tp_pct",1.2)),
+                    "risk_pct":float(body.get("risk_pct",10.0)),
+                })
+            _screener_thread = threading.Thread(target=run_screener, daemon=True)
+            _screener_thread.start()
+            self._json({"ok":True})
+
+        elif self.path == "/scan_all_stop":
+            _screener_stop.set()
+            self._json({"ok":True})
+
+        elif self.path == "/scan_all_status":
+            with screener_lock:
+                self._json(dict(screener_state))
 
         elif self.path == "/chart_monitor_start":
             global _chart_mon_thread
