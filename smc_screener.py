@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """
 SMC Optimizer v3.4
+- v3.7: фикс кнопок в шапке и чекбокса "Все монеты". (1) текст кнопки
+  Старт менялся через textContent — заменено на innerHTML чтобы сохранить
+  иконку; (2) clipboard API на Android в HTTP заблокирован — "↑ Обновить"
+  теперь открывает модалку с командой для ручного копирования; (3) "Стоп
+  Termux" пробует clipboard и при ошибке показывает подсказку по Ctrl+C.
 - v3.6: фикс скрининга всех монет — кнопка Старт не реагировала визуально
   т.к. UI обновлялся только после ответа fetch, а не сразу; display:""
   не показывал screenerCard в некоторых браузерах (исправлено на "block");
@@ -97,7 +102,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.6"
+APP_VERSION  = "3.7"
 GATE_API     = "https://fx-api.gateio.ws/api/v4"
 PORT         = 8765
 GH_REPO      = os.environ.get("GH_REPO", "mambaleylo/smc-optimizer")
@@ -2168,26 +2173,31 @@ cv.addEventListener('touchmove',function(e){
 window.addEventListener('resize',drawChart);
 var _UPDATE_CMD='curl -H \'Accept: application/vnd.github.v3.raw\' -H "Authorization: token ${GH_TOKEN}" -L \'https://api.github.com/repos/mambaleylo/smc-optimizer/contents/smc_screener.py\' -o ~/smc_screener.py && python3 ~/smc_screener.py';
 function copyUpdate(){
-  var b=document.querySelector('[onclick="copyUpdate()"]');
-  navigator.clipboard.writeText(_UPDATE_CMD).then(function(){
-    var o=b.textContent;b.textContent='\u2713 Скопировано!';
-    setTimeout(function(){b.textContent=o;},2000);
-  }).catch(function(){
-    var t=document.createElement('textarea');
-    t.value=_UPDATE_CMD;document.body.appendChild(t);
-    t.select();document.execCommand('copy');document.body.removeChild(t);
-    alert('Скопировано! Вставьте в Termux (GH_TOKEN должен быть задан в окружении).');
-  });
+  // На Android HTTP clipboard API заблокирован — показываем модалку с текстом
+  var modal=document.createElement('div');
+  modal.style.cssText='position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.85);z-index:9999;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:16px';
+  modal.innerHTML='<div style="background:#111;border:1px solid #333;border-radius:8px;padding:16px;width:100%;max-width:600px">'
+    +'<div style="color:#f0b800;font-size:13px;margin-bottom:8px">Команда для Termux (выделите и скопируйте):</div>'
+    +'<textarea id="_cmdTA" readonly style="width:100%;height:80px;background:#0a0a0a;color:#7a9fff;border:1px solid #333;border-radius:4px;padding:8px;font-size:11px;font-family:monospace;resize:none">'+_UPDATE_CMD+'</textarea>'
+    +'<div style="margin-top:12px;display:flex;gap:8px">'
+    +'<button onclick="var t=document.getElementById(\"_cmdTA\");t.select();t.setSelectionRange(0,9999);try{navigator.clipboard.writeText(t.value).catch(function(){document.execCommand(\"copy\")});}catch(e){document.execCommand(\"copy\");}this.textContent=\"\u2713 Скопировано!\";" style="flex:1;background:#1a3a1a;color:#7fff7a;border:1px solid #2a4a2a;border-radius:4px;padding:8px;font-size:12px">Копировать</button>'
+    +'<button onclick="document.body.removeChild(this.closest(\'div\').parentElement.parentElement)" style="flex:1;background:#1a1a1a;color:#888;border:1px solid #333;border-radius:4px;padding:8px;font-size:12px">Закрыть</button>'
+    +'</div></div>';
+  document.body.appendChild(modal);
+  setTimeout(function(){var t=document.getElementById('_cmdTA');if(t){t.focus();t.select();}},100);
 }
 function copyKill(){
+  // Ctrl+C как символ  — пробуем clipboard, если нет — подсказка
   var b=document.querySelector('[onclick="copyKill()"]');
-  navigator.clipboard.writeText('\x03').catch(function(){
-    var t=document.createElement('textarea');
-    t.value='\x03';document.body.appendChild(t);
-    t.select();document.execCommand('copy');document.body.removeChild(t);
-  });
-  var o=b.textContent;b.textContent='\u2713 Ctrl+C скопирован';
-  setTimeout(function(){b.textContent=o;},2000);
+  var done=function(){var o=b.innerHTML;b.innerHTML='\u2713 OK';setTimeout(function(){b.innerHTML=o;},2000);};
+  if(navigator.clipboard&&navigator.clipboard.writeText){
+    navigator.clipboard.writeText('\x03').then(done).catch(function(){
+      alert('Нажмите Ctrl+C или Volume Down + C в Termux для остановки скрипта');
+    });
+  } else {
+    alert('Нажмите Ctrl+C или Volume Down + C в Termux для остановки скрипта');
+    done();
+  }
 }
 
 /* ── Screener all symbols ── */
@@ -2195,7 +2205,7 @@ var _screenerPoll=null;
 function toggleScanAll(cb){
   document.getElementById('screenerCard').style.display=cb.checked?'block':'none';
   document.getElementById('sym').disabled=cb.checked;
-  document.getElementById('btnStart').textContent=cb.checked?'\u25ba Скан всех':'\u25ba Старт';
+  document.getElementById('btnStart').innerHTML=cb.checked?'&#9654; Скан всех':'&#9654; Старт';
 }
 var _origStartOpt=startOpt;
 startOpt=function(){
