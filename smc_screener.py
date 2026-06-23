@@ -85,7 +85,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "2.4"
+APP_VERSION  = "2.5"
 GATE_API     = "https://fx-api.gateio.ws/api/v4"
 PORT         = 8765
 GH_REPO      = os.environ.get("GH_REPO", "mambaleylo/smc-optimizer")
@@ -152,6 +152,7 @@ auto_trade_lock  = threading.Lock()
 auto_trade_state = {
     "enabled": False, "symbol": None, "tf": None, "days": 30, "params": None,
     "risk_pct": 2.0,          # риск на сделку %
+    "position_pct": 10.0,      # % депозита в маржу
     "position": None,         # текущая открытая позиция: {dir, entry, sl, tp, size, order_ids}
     "last_entry_ts": None,    # таймстемп свечи последнего сигнала
     "last_check": 0, "last_error": "",
@@ -269,7 +270,7 @@ def _gate_round_price(price, contract):
     if price > 1:     return f"{price:.4f}"
     return f"{price:.6f}"
 
-def _gate_open_position(symbol, direction, entry_px, sl_px, tp_px, risk_pct):
+def _gate_open_position(symbol, direction, entry_px, sl_px, tp_px, risk_pct, **kwargs):
     """
     Полный цикл открытия позиции — точно как в WickFill:
       leverage = round(risk_pct / sl_pct)
@@ -278,7 +279,8 @@ def _gate_open_position(symbol, direction, entry_px, sl_px, tp_px, risk_pct):
       TP/SL    — price_orders с price="0" (маркет при триггере)
     """
     try:
-        sl_pct_val = abs(entry_px - sl_px) / entry_px * 100.0
+        sl_pct_val   = abs(entry_px - sl_px) / entry_px * 100.0
+        position_pct = kwargs.get("position_pct", risk_pct)  # % депо в маржу
 
         # 1. Баланс
         balance = _gate_get_balance()
@@ -310,7 +312,7 @@ def _gate_open_position(symbol, direction, entry_px, sl_px, tp_px, risk_pct):
 
         # 4. Размер позиции
         qm = _gate_get_quanto(symbol)
-        margin   = balance * (risk_pct / 100.0)
+        margin   = balance * (position_pct / 100.0)
         size_raw = (margin * applied_leverage) / (entry_px * qm)
         size     = round(size_raw)
         if size < 1:
@@ -320,8 +322,8 @@ def _gate_open_position(symbol, direction, entry_px, sl_px, tp_px, risk_pct):
             )
         notional = size * entry_px * qm
         olog(f"🔓 Открываем {direction.upper()} {symbol}: "
-             f"balance={balance:.2f} × {risk_pct}% = margin={margin:.2f}U × {applied_leverage}× → позиция~{notional:.2f}U | "
-             f"size={size} контр | entry≈{_fmt_px(entry_px)} SL={_fmt_px(sl_px)} TP={_fmt_px(tp_px)}")
+             f"balance={balance:.2f} × {position_pct}%(маржа) × {applied_leverage}×(плечо) → позиция~{notional:.2f}U | "
+             f"риск={risk_pct}% | size={size} контр | entry≈{_fmt_px(entry_px)} SL={_fmt_px(sl_px)} TP={_fmt_px(tp_px)}")
 
         # 5. Отменяем старые ордера
         _gate_cancel_orders(symbol)
@@ -465,8 +467,11 @@ def _auto_trade_loop():
                                 time.sleep(1.0)
 
                             # Открываем новую
+                            with auto_trade_lock:
+                                pos_pct = auto_trade_state.get("position_pct", risk_pct)
                             pos_info = _gate_open_position(
-                                sym, direction, entry_px, sl_px, tp_px, risk_pct)
+                                sym, direction, entry_px, sl_px, tp_px, risk_pct,
+                                position_pct=pos_pct)
                             with auto_trade_lock:
                                 auto_trade_state["position"] = pos_info
                                 auto_trade_state["last_entry_ts"] = entry_ts
@@ -1345,9 +1350,14 @@ input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;p
         <input id="atSecret" type="password" placeholder="Gate.io Secret" style="width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;padding:4px 6px;border-radius:4px;font-size:11px">
       </label>
     </div>
-    <label style="color:#888;font-size:11px">Риск на сделку % (плечо = риск ÷ SL%)
-      <input id="atRisk" type="number" value="2" min="0.5" max="20" step="0.5" style="width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;padding:4px 6px;border-radius:4px;font-size:11px;margin-bottom:6px">
-    </label>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:6px">
+      <label style="color:#888;font-size:11px">Вход % депозита
+        <input id="atPosPct" type="number" value="10" min="1" max="100" step="1" style="width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;padding:4px 6px;border-radius:4px;font-size:11px">
+      </label>
+      <label style="color:#888;font-size:11px">Риск % (плечо=риск÷SL)
+        <input id="atRisk" type="number" value="2" min="0.5" max="20" step="0.5" style="width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;padding:4px 6px;border-radius:4px;font-size:11px">
+      </label>
+    </div>
     <div style="display:flex;gap:6px;margin-bottom:6px">
       <button class="btn btn-sm" style="flex:1" onclick="saveGateCfg()">💾 Сохранить ключи</button>
       <button class="btn btn-sm" id="atStartBtn" style="flex:1;background:#1a5c2a;color:#0f9" onclick="startAutoTrade()">▶ Запустить</button>
@@ -1485,7 +1495,7 @@ function startAutoTrade(){
     tp_pct:    parseFloat(document.getElementById('cTp').value)
   });
   fetch('/auto_trade_start',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({sym:sym,tf:tf,days:days,risk_pct:risk,params:params})})
+    body:JSON.stringify({sym:sym,tf:tf,days:days,risk_pct:risk,position_pct:parseFloat(document.getElementById('atPosPct').value)||10,params:params})})
     .then(function(r){return r.json();})
     .then(function(d){
       if(d.ok){
@@ -2127,7 +2137,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             sym      = body.get("sym",      "BTC_USDT")
             tf       = body.get("tf",       "15m")
             days     = int(body.get("days", 30))
-            risk_pct = float(body.get("risk_pct", 2.0))
+            risk_pct     = float(body.get("risk_pct",     2.0))
+            position_pct = float(body.get("position_pct", 10.0))
             p        = dict(body.get("params") or {})
             if "sl_pct"    not in p: p["sl_pct"]    = body.get("sl", 0.8)
             if "tp_pct"    not in p: p["tp_pct"]    = body.get("tp", 1.6)
@@ -2141,7 +2152,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             with auto_trade_lock:
                 auto_trade_state.update({
                     "enabled": True, "symbol": sym, "tf": tf, "days": days,
-                    "params": p, "risk_pct": risk_pct, "position": None,
+                    "params": p, "risk_pct": risk_pct, "position_pct": position_pct, "position": None,
                     "last_entry_ts": None, "last_check": 0, "last_error": "",
                 })
             _auto_trade_thread = threading.Thread(target=_auto_trade_loop, daemon=True)
