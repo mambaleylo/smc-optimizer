@@ -90,7 +90,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.9"
+APP_VERSION  = "3.10"
 GATE_API     = "https://api.gateio.ws/api/v4"
 PORT         = 8765
 GH_REPO      = os.environ.get("GH_REPO", "mambaleylo/smc-optimizer")
@@ -524,11 +524,12 @@ def olog(msg):
 # ─── Gate.io fetch ──────────────────────────────────────────────────────────
 def _fetch_all_symbols():
     try:
-        r = requests.get(f"{GATE_API}/futures/usdt/contracts",
-                         params={"limit": 1000}, timeout=15)
+        r = requests.get(f"{GATE_API}/futures/usdt/contracts", timeout=15)
         if r.status_code != 200: return []
-        return sorted(c["name"] for c in r.json()
-                      if not c.get("in_delisting") and "_USDT" in c["name"])
+        data = r.json()
+        if not isinstance(data, list): return []
+        return sorted(c["name"] for c in data
+                      if isinstance(c, dict) and not c.get("in_delisting") and "_USDT" in c.get("name",""))
     except Exception as e:
         olog(f"fetch_all_symbols error: {e}")
         return []
