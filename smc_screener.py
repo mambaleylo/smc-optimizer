@@ -1270,7 +1270,7 @@ def run_screener():
     tp_p = screener_state["tp_pct"]
     risk = screener_state["risk_pct"]
     with screener_lock:
-        screener_state.update({"results":[],"done":False,"sym_index":0,"sym_total":0})
+        screener_state.update({"results":[],"done":False,"sym_index":0,"sym_total":0,"current_sym":""})
     olog("🔍 Получаем список монет...")
     syms = _fetch_all_symbols()
     if not syms:
@@ -1285,7 +1285,7 @@ def run_screener():
             screener_state["current_sym"] = sym
             screener_state["sym_index"]   = idx + 1
         olog(f"[{idx+1}/{len(syms)}] {sym}")
-        res = _run_one_sym_screener(sym, tf, days, sl_p, tp_p, risk)
+        res = _run_one_sym_screener(sym, tf, days, sl_p, tp_p, risk, max_cycles=15)
         if res:
             all_results.append(res)
             all_results.sort(key=lambda x: x["result"]["fitness"], reverse=True)
@@ -2173,14 +2173,25 @@ startOpt=function(){
       sl_pct:parseFloat(document.getElementById('sl_pct').value),
       tp_pct:parseFloat(document.getElementById('tp_pct').value),
       risk_pct:parseFloat(document.getElementById('risk_pct').value)};
+    document.getElementById('btnStart').style.display='none';
+    document.getElementById('btnStop').style.display='';
+    document.getElementById('statusBadge').textContent='\u23f3 запуск...';
+    document.getElementById('screenerStatus').textContent='Подключаемся...';
     fetch('/scan_all',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
       .then(function(r){return r.json();})
       .then(function(d){
-        if(!d.ok){alert(d.msg||'ошибка');return;}
-        document.getElementById('btnStart').style.display='none';
-        document.getElementById('btnStop').style.display='';
+        if(!d.ok){
+          document.getElementById('btnStart').style.display='';
+          document.getElementById('btnStop').style.display='none';
+          alert(d.msg||'ошибка');return;
+        }
         document.getElementById('statusBadge').textContent='скрининг...';
         pollScreener();
+      })
+      .catch(function(e){
+        document.getElementById('btnStart').style.display='';
+        document.getElementById('btnStop').style.display='none';
+        alert('Ошибка: '+e);
       });
     return;
   }
@@ -2501,3 +2512,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
