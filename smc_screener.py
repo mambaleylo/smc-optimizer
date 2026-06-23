@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """
 SMC Optimizer v3.4
+- v3.8: критический фикс — символ \x03 (ETX/Ctrl+C) попал буквально в
+  JS-комментарий внутри HTML, из-за чего браузер обрывал парсинг скрипта
+  на этой строке. Всё что ниже (startOpt override, toggleScanAll,
+  pollScreener) не выполнялось — поэтому кнопка Старт не реагировала и
+  галочка не меняла текст. Убран литеральный байт, заменён на \u0003.
 - v3.7: фикс кнопок в шапке и чекбокса "Все монеты". (1) текст кнопки
   Старт менялся через textContent — заменено на innerHTML чтобы сохранить
   иконку; (2) clipboard API на Android в HTTP заблокирован — "↑ Обновить"
@@ -102,7 +107,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.7"
+APP_VERSION  = "3.8"
 GATE_API     = "https://fx-api.gateio.ws/api/v4"
 PORT         = 8765
 GH_REPO      = os.environ.get("GH_REPO", "mambaleylo/smc-optimizer")
@@ -2187,11 +2192,11 @@ function copyUpdate(){
   setTimeout(function(){var t=document.getElementById('_cmdTA');if(t){t.focus();t.select();}},100);
 }
 function copyKill(){
-  // Ctrl+C как символ  — пробуем clipboard, если нет — подсказка
+  // Ctrl+C как символ  — пробуем clipboard, если нет — подсказка
   var b=document.querySelector('[onclick="copyKill()"]');
   var done=function(){var o=b.innerHTML;b.innerHTML='\u2713 OK';setTimeout(function(){b.innerHTML=o;},2000);};
   if(navigator.clipboard&&navigator.clipboard.writeText){
-    navigator.clipboard.writeText('\x03').then(done).catch(function(){
+    navigator.clipboard.writeText('\u0003').then(done).catch(function(){
       alert('Нажмите Ctrl+C или Volume Down + C в Termux для остановки скрипта');
     });
   } else {
