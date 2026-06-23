@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
 SMC Optimizer v3.4
+- v3.9: фикс JS ошибки в copyUpdate — вложенные onclick в innerHTML
+  строке давали некорректное экранирование, ломавшее весь скрипт.
+  Переписано через createElement без вложенных строковых обработчиков.
 - v3.8: критический фикс — символ \x03 (ETX/Ctrl+C) попал буквально в
   JS-комментарий внутри HTML, из-за чего браузер обрывал парсинг скрипта
   на этой строке. Всё что ниже (startOpt override, toggleScanAll,
@@ -107,7 +110,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.8"
+APP_VERSION  = "3.9"
 GATE_API     = "https://fx-api.gateio.ws/api/v4"
 PORT         = 8765
 GH_REPO      = os.environ.get("GH_REPO", "mambaleylo/smc-optimizer")
@@ -2178,18 +2181,37 @@ cv.addEventListener('touchmove',function(e){
 window.addEventListener('resize',drawChart);
 var _UPDATE_CMD='curl -H \'Accept: application/vnd.github.v3.raw\' -H "Authorization: token ${GH_TOKEN}" -L \'https://api.github.com/repos/mambaleylo/smc-optimizer/contents/smc_screener.py\' -o ~/smc_screener.py && python3 ~/smc_screener.py';
 function copyUpdate(){
-  // На Android HTTP clipboard API заблокирован — показываем модалку с текстом
   var modal=document.createElement('div');
-  modal.style.cssText='position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.85);z-index:9999;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:16px';
-  modal.innerHTML='<div style="background:#111;border:1px solid #333;border-radius:8px;padding:16px;width:100%;max-width:600px">'
-    +'<div style="color:#f0b800;font-size:13px;margin-bottom:8px">Команда для Termux (выделите и скопируйте):</div>'
-    +'<textarea id="_cmdTA" readonly style="width:100%;height:80px;background:#0a0a0a;color:#7a9fff;border:1px solid #333;border-radius:4px;padding:8px;font-size:11px;font-family:monospace;resize:none">'+_UPDATE_CMD+'</textarea>'
-    +'<div style="margin-top:12px;display:flex;gap:8px">'
-    +'<button onclick="var t=document.getElementById(\"_cmdTA\");t.select();t.setSelectionRange(0,9999);try{navigator.clipboard.writeText(t.value).catch(function(){document.execCommand(\"copy\")});}catch(e){document.execCommand(\"copy\");}this.textContent=\"\u2713 Скопировано!\";" style="flex:1;background:#1a3a1a;color:#7fff7a;border:1px solid #2a4a2a;border-radius:4px;padding:8px;font-size:12px">Копировать</button>'
-    +'<button onclick="document.body.removeChild(this.closest(\'div\').parentElement.parentElement)" style="flex:1;background:#1a1a1a;color:#888;border:1px solid #333;border-radius:4px;padding:8px;font-size:12px">Закрыть</button>'
-    +'</div></div>';
+  modal.style.cssText='position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.85);z-index:9999;display:flex;align-items:center;justify-content:center;padding:16px';
+  var box=document.createElement('div');
+  box.style.cssText='background:#111;border:1px solid #333;border-radius:8px;padding:16px;width:100%;max-width:560px';
+  var lbl=document.createElement('div');
+  lbl.style.cssText='color:#f0b800;font-size:13px;margin-bottom:8px';
+  lbl.textContent='Команда для Termux (выделите и скопируйте):';
+  var ta=document.createElement('textarea');
+  ta.id='_cmdTA'; ta.readOnly=true;
+  ta.style.cssText='width:100%;height:80px;background:#0a0a0a;color:#7a9fff;border:1px solid #333;border-radius:4px;padding:8px;font-size:11px;font-family:monospace;resize:none;box-sizing:border-box';
+  ta.value=_UPDATE_CMD;
+  var row=document.createElement('div');
+  row.style.cssText='margin-top:12px;display:flex;gap:8px';
+  var btnCopy=document.createElement('button');
+  btnCopy.style.cssText='flex:1;background:#1a3a1a;color:#7fff7a;border:1px solid #2a4a2a;border-radius:4px;padding:8px;font-size:12px';
+  btnCopy.textContent='Копировать';
+  btnCopy.onclick=function(){
+    ta.select(); ta.setSelectionRange(0,9999);
+    try{ navigator.clipboard.writeText(ta.value).catch(function(){document.execCommand('copy');}); }
+    catch(e){ document.execCommand('copy'); }
+    btnCopy.textContent='✓ Скопировано!';
+  };
+  var btnClose=document.createElement('button');
+  btnClose.style.cssText='flex:1;background:#1a1a1a;color:#888;border:1px solid #333;border-radius:4px;padding:8px;font-size:12px';
+  btnClose.textContent='Закрыть';
+  btnClose.onclick=function(){ document.body.removeChild(modal); };
+  row.appendChild(btnCopy); row.appendChild(btnClose);
+  box.appendChild(lbl); box.appendChild(ta); box.appendChild(row);
+  modal.appendChild(box);
   document.body.appendChild(modal);
-  setTimeout(function(){var t=document.getElementById('_cmdTA');if(t){t.focus();t.select();}},100);
+  setTimeout(function(){ ta.focus(); ta.select(); }, 100);
 }
 function copyKill(){
   // Ctrl+C как символ  — пробуем clipboard, если нет — подсказка
