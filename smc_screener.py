@@ -90,7 +90,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.5"
+APP_VERSION  = "3.6"
 GATE_API     = "https://fx-api.gateio.ws/api/v4"
 PORT         = 8765
 GH_REPO      = os.environ.get("GH_REPO", "mambaleylo/smc-optimizer")
@@ -2266,6 +2266,7 @@ document.addEventListener('visibilitychange',function(){
 """.replace("__VER__", APP_VERSION)
 
 class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args): pass
     def log_message(self, *a): pass
 
     def _json(self, obj, code=200):
@@ -2510,7 +2511,7 @@ def main():
     _load_alert_cfg()
     _load_gate_cfg()
 
-    server = http.server.HTTPServer(("0.0.0.0", PORT), Handler)
+    server = http.server.ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print(f"{_C_GRN}SMC Optimizer v{APP_VERSION} — http://0.0.0.0:{PORT}{_C_RST}", flush=True)
     try:
         server.serve_forever()
