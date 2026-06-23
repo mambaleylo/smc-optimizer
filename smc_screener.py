@@ -85,7 +85,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "2.5"
+APP_VERSION  = "2.6"
 GATE_API     = "https://fx-api.gateio.ws/api/v4"
 PORT         = 8765
 GH_REPO      = os.environ.get("GH_REPO", "mambaleylo/smc-optimizer")
@@ -1878,32 +1878,65 @@ function drawChart(){
     var y1=toY(Math.max(c.o,c.c)),y2=toY(Math.min(c.o,c.c));
     ctx2.fillRect(x-candleW/2,y1,candleW,Math.max(1,y2-y1));
   });
+  function fmt(v){return v>1000?v.toFixed(1):v>10?v.toFixed(2):v.toFixed(4);}
+  // ── Сигналы: фон зоны TP/SL ─────────────────────────────────────────────
   _sig.forEach(function(sg){
     if(sg.entry_i<s||sg.entry_i>e)return;
-    var xe=toX(sg.entry_i);
-    var xe2=(sg.exit_i!==undefined&&sg.exit_i<=e)?toX(sg.exit_i):W-PAD.r;
-    var ye=toY(sg.entry),yt=toY(sg.tp),ys=toY(sg.sl);
+    var xe=toX(sg.entry_i), xe2=(sg.exit_i!==undefined&&sg.exit_i<=e)?toX(sg.exit_i):W-PAD.r;
+    var ye=toY(sg.entry), yt=toY(sg.tp), ys=toY(sg.sl);
     var isLong=sg.dir==='long';
-    ctx2.fillStyle=isLong?'rgba(8,153,129,0.07)':'rgba(242,54,69,0.07)';
-    ctx2.fillRect(xe,Math.min(yt,ys),Math.max(0,xe2-xe),Math.abs(yt-ys));
-    ctx2.strokeStyle='rgba(8,153,129,0.55)';ctx2.lineWidth=1;ctx2.setLineDash([4,3]);
+    // TP зона — зелёная
+    ctx2.fillStyle=isLong?'rgba(8,180,129,0.13)':'rgba(8,180,129,0.13)';
+    var tpTop=Math.min(yt,ye), tpH=Math.abs(yt-ye);
+    ctx2.fillRect(xe,tpTop,Math.max(0,xe2-xe),tpH);
+    // SL зона — красная
+    ctx2.fillStyle='rgba(242,54,69,0.13)';
+    var slTop=Math.min(ys,ye), slH=Math.abs(ys-ye);
+    ctx2.fillRect(xe,slTop,Math.max(0,xe2-xe),slH);
+    // TP линия — яркая зелёная сплошная
+    ctx2.strokeStyle='#00e676';ctx2.lineWidth=1.2;ctx2.setLineDash([5,3]);
     ctx2.beginPath();ctx2.moveTo(xe,yt);ctx2.lineTo(xe2,yt);ctx2.stroke();
-    ctx2.strokeStyle='rgba(242,54,69,0.55)';
+    // SL линия — яркая красная сплошная
+    ctx2.strokeStyle='#ff1744';ctx2.lineWidth=1.2;
     ctx2.beginPath();ctx2.moveTo(xe,ys);ctx2.lineTo(xe2,ys);ctx2.stroke();
+    // Entry линия — белая пунктирная
+    ctx2.strokeStyle='rgba(255,255,255,0.7)';ctx2.lineWidth=1;ctx2.setLineDash([3,4]);
+    ctx2.beginPath();ctx2.moveTo(xe,ye);ctx2.lineTo(xe2,ye);ctx2.stroke();
     ctx2.setLineDash([]);
+    // Метки TP/SL/Entry
+    ctx2.font='bold 9px monospace';ctx2.textAlign='left';
+    ctx2.fillStyle='#00e676';ctx2.fillText('TP '+fmt(sg.tp),xe2-42,yt-3);
+    ctx2.fillStyle='#ff1744';ctx2.fillText('SL '+fmt(sg.sl),xe2-42,ys+10);
+    ctx2.fillStyle='rgba(220,220,220,0.85)';ctx2.fillText(fmt(sg.entry),xe2-42,ye-3);
+    // Точка выхода
     if(sg.exit_i!==undefined&&sg.exit_i>=s&&sg.exit_i<=e){
-      ctx2.fillStyle=sg.win?'rgba(8,153,129,0.8)':'rgba(242,54,69,0.8)';
-      ctx2.beginPath();ctx2.arc(toX(sg.exit_i),toY(sg.win?sg.tp:sg.sl),4,0,Math.PI*2);ctx2.fill();
+      var exitX=toX(sg.exit_i), exitY=toY(sg.win?sg.tp:sg.sl);
+      ctx2.fillStyle=sg.win?'#00e676':'#ff1744';
+      ctx2.beginPath();ctx2.arc(exitX,exitY,5,0,Math.PI*2);ctx2.fill();
+      ctx2.strokeStyle='#fff';ctx2.lineWidth=1;ctx2.stroke();
     }
-    ctx2.fillStyle=isLong?'#089981':'#F23645';
+  });
+  // ── Треугольники входа поверх всего ──────────────────────────────────────
+  _sig.forEach(function(sg){
+    if(sg.entry_i<s||sg.entry_i>e)return;
+    var xe=toX(sg.entry_i), ye=toY(sg.entry);
+    var isLong=sg.dir==='long';
+    var clr=isLong?'#00e676':'#ff1744';
+    var sz=10;
+    // Тень для контраста
+    ctx2.fillStyle='rgba(0,0,0,0.6)';
     ctx2.beginPath();
-    if(isLong){ctx2.moveTo(xe-5,ye+9);ctx2.lineTo(xe+5,ye+9);ctx2.lineTo(xe,ye+1);}
-    else{ctx2.moveTo(xe-5,ye-9);ctx2.lineTo(xe+5,ye-9);ctx2.lineTo(xe,ye-1);}
+    if(isLong){ctx2.moveTo(xe-sz-1,ye+sz*2+2);ctx2.lineTo(xe+sz+1,ye+sz*2+2);ctx2.lineTo(xe,ye-1);}
+    else{ctx2.moveTo(xe-sz-1,ye-sz*2-2);ctx2.lineTo(xe+sz+1,ye-sz*2-2);ctx2.lineTo(xe,ye+1);}
     ctx2.fill();
-    ctx2.fillStyle='rgba(180,180,180,0.7)';ctx2.font='9px monospace';ctx2.textAlign='left';
-    function fmt(v){return v>100?v.toFixed(1):v.toFixed(4);}
-    ctx2.fillText('TP '+fmt(sg.tp),xe+4,yt-2);
-    ctx2.fillText('SL '+fmt(sg.sl),xe+4,ys+9);
+    // Сам треугольник
+    ctx2.fillStyle=clr;
+    ctx2.beginPath();
+    if(isLong){ctx2.moveTo(xe-sz,ye+sz*2);ctx2.lineTo(xe+sz,ye+sz*2);ctx2.lineTo(xe,ye);}
+    else{ctx2.moveTo(xe-sz,ye-sz*2);ctx2.lineTo(xe+sz,ye-sz*2);ctx2.lineTo(xe,ye);}
+    ctx2.fill();
+    // Обводка
+    ctx2.strokeStyle='#fff';ctx2.lineWidth=0.8;ctx2.stroke();
   });
   ctx2.fillStyle='rgba(140,140,140,0.4)';ctx2.font='9px monospace';ctx2.textAlign='center';
   var every=Math.ceil(vis.length/8);
