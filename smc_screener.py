@@ -90,7 +90,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.7"
+APP_VERSION  = "3.8"
 GATE_API     = "https://fx-api.gateio.ws/api/v4"
 PORT         = 8765
 GH_REPO      = os.environ.get("GH_REPO", "mambaleylo/smc-optimizer")
@@ -2338,6 +2338,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._json({k:v for k,v in chart_mon_state.items() if k != "params"})
         elif self.path == "/alert_cfg":
             self._json({"tg_token": TG_TOKEN, "tg_chat": TG_CHAT, "ntfy_url": NTFY_URL})
+        elif self.path == "/scan_all_status":
+            with screener_lock:
+                self._json(dict(screener_state))
         else:
             self.send_response(404); self.end_headers()
 
@@ -2397,9 +2400,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             _screener_stop.set()
             self._json({"ok":True})
 
-        elif self.path == "/scan_all_status":
-            with screener_lock:
-                self._json(dict(screener_state))
+
 
         elif self.path == "/chart_monitor_start":
             global _chart_mon_thread
