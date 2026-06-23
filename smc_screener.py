@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 """
-SMC Optimizer v3.4
+SMC Optimizer v3.16
+- v3.16: параллелизм как в WickFill. ProcessPoolExecutor создаётся один раз при старте
+  оптимизатора (initializer=_worker_init передаёт свечи в глобали воркера). Локальный
+  поиск Basin Hopping теперь отправляет пачки соседей в пул (n_workers*2 за итерацию),
+  результаты собираются через concurrent.futures.wait. Скринер тоже параллелен:
+  ProcessPoolExecutor обрабатывает все монеты одновременно через as_completed.
+  multiprocessing.set_start_method("spawn") в if __name__=="__main__" — fix падения
+  fork на Android.
+
 - v3.4: скрининг всех фьючерсных пар Gate.io. Чекбокс "Все монеты"
   рядом с полем символа — запускает прогон каждой пары по 50 циклов.
   Прогресс [N/Total] + текущая монета в реальном времени. Топ-20 монет
@@ -84,6 +92,7 @@ import os, sys, json, time, math, random, threading, base64, hashlib
 import multiprocessing
 import http.server, urllib.request, urllib.parse
 from functools import lru_cache
+from concurrent.futures import ProcessPoolExecutor, wait as _fw
 
 try:
     import requests
@@ -91,9 +100,13 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.15"
+APP_VERSION  = "3.16"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
+
+# ─── Глобали воркера ProcessPool ────────────────────────────────────────────
+_worker_candles = None
+_worker_risk    = None
 PORT         = 8765
 GH_REPO      = os.environ.get("GH_REPO", "mambaleylo/smc-optimizer")
 GH_TOKEN     = os.environ.get("GH_TOKEN", "")
@@ -1155,6 +1168,14 @@ def run_optimizer():
         olog("❌ Мало свечей, остановка"); return
     olog(f"✔ Загружено {len(candles)} свечей")
 
+    n_workers = NUM_WORKERS
+    olog(f"⚙ Запуск ProcessPool ({n_workers} процессов)...")
+    pool = ProcessPoolExecutor(
+        max_workers=n_workers,
+        initializer=_worker_init,
+        initargs=(candles, risk)
+    )
+
     best_params  = _random_params()
     best_params["sl_pct"] = sl_p; best_params["tp_pct"] = tp_p
     best_result  = _simulate(candles, best_params, sl_pct=sl_p, tp_pct=tp_p, risk_pct=risk)
@@ -1162,78 +1183,99 @@ def run_optimizer():
     top20        = []
     cycle        = 0
     TEMP_START   = 1.0
+    STEPS        = 60   # шагов локального поиска за старт
 
     with opt_lock:
         opt_state["top20"] = top20
         opt_state["best"]  = None
 
-    while not _stop_flag.is_set():
-        cycle += 1
-        temp = TEMP_START * math.exp(-0.05 * cycle)
-        with opt_lock: opt_state["cycle"] = cycle
+    try:
+        while not _stop_flag.is_set():
+            cycle += 1
+            temp = TEMP_START * math.exp(-0.05 * cycle)
+            with opt_lock: opt_state["cycle"] = cycle
 
-        # Несколько стартовых точек за цикл
-        starts = [_shake(best_params, 0.4) if best_params else _random_params(),
-                  _random_params()]
-        if len(top20) > 2:
-            starts.append(_shake(random.choice(top20)["params"], 0.3))
+            # Несколько стартовых точек за цикл
+            starts = [_shake(best_params, 0.4) if best_params else _random_params(),
+                      _random_params()]
+            if len(top20) > 2:
+                starts.append(_shake(random.choice(top20)["params"], 0.3))
 
-        for start_p in starts:
-            if _stop_flag.is_set(): break
-            current_p = start_p
-            current_r = _simulate(candles, current_p, risk_pct=risk)
-            current_fit = current_r["fitness"] if current_r else 0.0
-
-            # Локальный поиск
-            for step in range(60):
+            for start_p in starts:
                 if _stop_flag.is_set(): break
-                with opt_lock:
-                    opt_state["trials"] = opt_state.get("trials",0)+1
-                    opt_state["progress"] = int(step/60*100)
+                current_p   = start_p
+                current_r   = _simulate(candles, current_p, risk_pct=risk)
+                current_fit = current_r["fitness"] if current_r else 0.0
 
-                neighbour_p = _neighbour(current_p)
-                neighbour_r = _simulate(candles, neighbour_p, risk_pct=risk)
-                if not neighbour_r: continue
-                nfit = neighbour_r["fitness"]
-                delta = nfit - current_fit
-                if delta > 0 or random.random() < math.exp(delta / max(temp, 0.001)):
-                    current_p   = neighbour_p
-                    current_fit = nfit
-                    current_r   = neighbour_r
+                # Параллельный локальный поиск: генерируем n_workers*STEPS соседей
+                # пачками по n_workers за итерацию
+                steps_done = 0
+                while steps_done < STEPS and not _stop_flag.is_set():
+                    batch_size = min(n_workers * 2, STEPS - steps_done)
+                    neighbours = [_neighbour(current_p) for _ in range(batch_size)]
+                    futs = [pool.submit(_worker_simulate, nb) for nb in neighbours]
+                    _fw(futs, timeout=30)
 
-                    # Обновляем топ-20
                     with opt_lock:
-                        top20 = opt_state["top20"]
-                        entry = {"params": current_p, "result": current_r}
-                        top20 = [e for e in top20 if abs(e["result"]["fitness"]-nfit)>0.001]
-                        top20.append(entry)
-                        top20.sort(key=lambda x: x["result"]["fitness"], reverse=True)
-                        opt_state["top20"] = top20[:20]
+                        opt_state["trials"]   = opt_state.get("trials", 0) + batch_size
+                        opt_state["progress"] = int((steps_done + batch_size) / STEPS * 100)
 
-                    if nfit > best_fit:
-                        best_fit    = nfit
-                        best_params = current_p
-                        best_result = current_r
-                        with opt_lock:
-                            opt_state["best"] = {"params":current_p,"result":current_r}
-                        olog(f"🏆 Цикл {cycle} шаг {step} | "
-                             f"WR={current_r['winrate']}% PF={current_r['profit_factor']} "
-                             f"DD={current_r['max_dd']}% T={current_r['trades']} "
-                             f"fit={nfit:.4f} | "
-                             f"SL={current_p['sl_pct']}% TP={current_p['tp_pct']}% "
-                             f"swing={current_p['swing_len']}")
-                        threading.Thread(target=_gh_save_best,
-                            args=({"params":current_p,"result":current_r},), daemon=True).start()
-                        if cycle >= 50:
-                            _send_alert(
-                                f"🏆 SMC {sym} {tf} — новый лучший\n"
-                                f"WR={current_r['winrate']}% PF={current_r['profit_factor']} "
-                                f"DD={current_r['max_dd']}% Trades={current_r['trades']}\n"
-                                f"SL={current_p['sl_pct']}% TP={current_p['tp_pct']}% "
-                                f"swing={current_p['swing_len']}"
-                            )
+                    for nb_p, fut in zip(neighbours, futs):
+                        try:
+                            nb_r = fut.result()
+                        except Exception:
+                            nb_r = None
+                        if not nb_r:
+                            continue
+                        nfit  = nb_r["fitness"]
+                        delta = nfit - current_fit
+                        if delta > 0 or random.random() < math.exp(delta / max(temp, 0.001)):
+                            current_p   = nb_p
+                            current_fit = nfit
+                            current_r   = nb_r
 
-        olog(f"Цикл {cycle} завершён | best fit={best_fit:.4f}")
+                        if nfit > best_fit or (delta > 0):
+                            # Обновляем топ-20
+                            with opt_lock:
+                                top20 = opt_state["top20"]
+                                entry = {"params": nb_p, "result": nb_r}
+                                top20 = [e for e in top20 if abs(e["result"]["fitness"] - nfit) > 0.001]
+                                top20.append(entry)
+                                top20.sort(key=lambda x: x["result"]["fitness"], reverse=True)
+                                opt_state["top20"] = top20[:20]
+
+                        if nfit > best_fit:
+                            best_fit    = nfit
+                            best_params = nb_p
+                            best_result = nb_r
+                            with opt_lock:
+                                opt_state["best"] = {"params": nb_p, "result": nb_r}
+                            olog(f"🏆 Цикл {cycle} шаг {steps_done} | "
+                                 f"WR={nb_r['winrate']}% PF={nb_r['profit_factor']} "
+                                 f"DD={nb_r['max_dd']}% T={nb_r['trades']} "
+                                 f"fit={nfit:.4f} | "
+                                 f"SL={nb_p['sl_pct']}% TP={nb_p['tp_pct']}% "
+                                 f"swing={nb_p['swing_len']}")
+                            threading.Thread(target=_gh_save_best,
+                                args=({"params": nb_p, "result": nb_r},), daemon=True).start()
+                            if cycle >= 50:
+                                _send_alert(
+                                    f"🏆 SMC {sym} {tf} — новый лучший\n"
+                                    f"WR={nb_r['winrate']}% PF={nb_r['profit_factor']} "
+                                    f"DD={nb_r['max_dd']}% Trades={nb_r['trades']}\n"
+                                    f"SL={nb_p['sl_pct']}% TP={nb_p['tp_pct']}% "
+                                    f"swing={nb_p['swing_len']}"
+                                )
+
+                    steps_done += batch_size
+
+            olog(f"Цикл {cycle} завершён | best fit={best_fit:.4f}")
+
+    finally:
+        try:
+            pool.shutdown(wait=False)
+        except Exception:
+            pass
 
     olog("⏹ Остановлено")
     with opt_lock: opt_state["running"] = False
@@ -1267,6 +1309,19 @@ def _run_one_sym_screener(sym, tf, days, sl_p, tp_p, risk, max_cycles=50, on_cyc
                     best_fit, best_params, best_result = nfit, nb_p, nb_r
     return {"sym": sym, "params": best_params, "result": best_result} if best_result else None
 
+def _worker_init(candles, risk):
+    """Инициализатор ProcessPool — загружает свечи в глобали воркера один раз."""
+    global _worker_candles, _worker_risk
+    _worker_candles = candles
+    _worker_risk    = risk
+
+def _worker_simulate(p):
+    """Вызов _simulate из воркера ProcessPool (использует глобали)."""
+    try:
+        return _simulate(_worker_candles, p, risk_pct=_worker_risk)
+    except Exception:
+        return None
+
 def _screener_worker(args):
     """Воркер для ProcessPoolExecutor — обрабатывает одну монету."""
     sym, tf, days, sl_p, tp_p, risk = args
@@ -1290,19 +1345,33 @@ def run_screener():
         with screener_lock: screener_state["running"] = False
         olog("❌ Не удалось получить список монет"); return
     with screener_lock: screener_state["sym_total"] = len(syms)
-    olog(f"✔ {len(syms)} монет, 50 циклов каждая")
+    n_workers = NUM_WORKERS
+    olog(f"✔ {len(syms)} монет, 50 циклов каждая | {n_workers} процессов")
     all_results = []
-    for idx, sym in enumerate(syms):
-        if _screener_stop.is_set(): break
-        with screener_lock:
-            screener_state["current_sym"] = sym
-            screener_state["sym_index"]   = idx + 1
-        olog(f"[{idx+1}/{len(syms)}] {sym}")
-        res = _run_one_sym_screener(sym, tf, days, sl_p, tp_p, risk)
-        if res:
-            all_results.append(res)
-            all_results.sort(key=lambda x: x["result"]["fitness"], reverse=True)
-            with screener_lock: screener_state["results"] = all_results[:20]
+    args_list = [(sym, tf, days, sl_p, tp_p, risk) for sym in syms]
+
+    with ProcessPoolExecutor(max_workers=n_workers) as pool:
+        fut_to_sym = {pool.submit(_screener_worker, args): args[0] for args in args_list}
+        done_count = 0
+        for fut in __import__("concurrent.futures", fromlist=["as_completed"]).as_completed(fut_to_sym):
+            if _screener_stop.is_set():
+                break
+            sym = fut_to_sym[fut]
+            done_count += 1
+            with screener_lock:
+                screener_state["current_sym"] = sym
+                screener_state["sym_index"]   = done_count
+            try:
+                res = fut.result()
+            except Exception:
+                res = None
+            if res:
+                all_results.append(res)
+                all_results.sort(key=lambda x: x["result"]["fitness"], reverse=True)
+                with screener_lock:
+                    screener_state["results"] = all_results[:20]
+            olog(f"[{done_count}/{len(syms)}] {sym}")
+
     with screener_lock:
         screener_state["results"] = all_results[:20]
         screener_state["running"] = False
@@ -2533,5 +2602,11 @@ def main():
         print("\nЗавершено"); server.shutdown()
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
+    try:
+        multiprocessing.set_start_method("spawn", force=True)
+    except RuntimeError:
+        pass
     main()
+
 
