@@ -85,7 +85,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "2.7"
+APP_VERSION  = "2.8"
 GATE_API     = "https://fx-api.gateio.ws/api/v4"
 PORT         = 8765
 GH_REPO      = os.environ.get("GH_REPO", "mambaleylo/smc-optimizer")
@@ -744,7 +744,7 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
                     sl_hit = abs(open_i - sl_price) <= abs(open_i - tp_price)
                     tp_hit = not sl_hit
                 if sl_hit:
-                    pnl = equity * (risk_pct/100.0) * (-1.0)
+                    pnl = init_deposit * (risk_pct/100.0) * (-1.0)
                     equity += pnl
                     trades.append({"dir":"long","entry":entry_px,"exit":sl_price,
                                    "pnl_pct":-sl_pct,"pnl":pnl,"win":False,"i":i})
@@ -754,7 +754,7 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
                     in_trade = False
                 elif tp_hit:
                     rr = tp_pct / sl_pct
-                    pnl = equity * (risk_pct/100.0) * rr
+                    pnl = init_deposit * (risk_pct/100.0) * rr
                     equity += pnl
                     trades.append({"dir":"long","entry":entry_px,"exit":tp_price,
                                    "pnl_pct":tp_pct,"pnl":pnl,"win":True,"i":i})
@@ -769,7 +769,7 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
                     sl_hit = abs(open_i - sl_price) <= abs(open_i - tp_price)
                     tp_hit = not sl_hit
                 if sl_hit:
-                    pnl = equity * (risk_pct/100.0) * (-1.0)
+                    pnl = init_deposit * (risk_pct/100.0) * (-1.0)
                     equity += pnl
                     trades.append({"dir":"short","entry":entry_px,"exit":sl_price,
                                    "pnl_pct":-sl_pct,"pnl":pnl,"win":False,"i":i})
@@ -779,7 +779,7 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
                     in_trade = False
                 elif tp_hit:
                     rr = tp_pct / sl_pct
-                    pnl = equity * (risk_pct/100.0) * rr
+                    pnl = init_deposit * (risk_pct/100.0) * rr
                     equity += pnl
                     trades.append({"dir":"short","entry":entry_px,"exit":tp_price,
                                    "pnl_pct":tp_pct,"pnl":pnl,"win":True,"i":i})
