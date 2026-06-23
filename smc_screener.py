@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """
-SMC Optimizer v3.17
+SMC Optimizer v3.18
+- v3.18: фикс зависания [0/795]. Проблема: ThreadPool запускал все 795 монет
+  одновременно, каждая = fetch_candles + 50×2×60 симуляций — на Android с GIL
+  первая монета заканчивалась через минуты, UI висел на [0/795]. Решение:
+  max_cycles=10 для скринера (достаточно для ранжирования), print в stdout
+  для видимости прогресса в Termux.
+
 - v3.17: фикс зависания скринера. ProcessPoolExecutor заменён на ThreadPoolExecutor
   для скринера (IO-bound: fetch свечей + simulate) — на Android spawn 795 процессов
   вешает систему. Потоков max(4, NUM_WORKERS*2). Фикс кривого __import__ as_completed
@@ -105,7 +111,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.17"
+APP_VERSION  = "3.18"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -1350,15 +1356,26 @@ def run_screener():
         with screener_lock: screener_state["running"] = False
         olog("❌ Не удалось получить список монет"); return
     with screener_lock: screener_state["sym_total"] = len(syms)
-    # Скринер IO-bound (fetch свечей + CPU simulate) — ThreadPoolExecutor,
-    # не ProcessPool: на Android spawn 795 процессов это краш/зависание.
+    # Скринер IO+CPU bound — ThreadPoolExecutor.
+    # max_cycles=10 (не 50) — на Android каждая монета иначе 2-3 мин CPU
     n_threads = max(4, NUM_WORKERS * 2)
-    olog(f"✔ {len(syms)} монет, 50 циклов каждая | {n_threads} потоков")
+    SCREENER_CYCLES = 10
+    olog(f"✔ {len(syms)} монет, {SCREENER_CYCLES} циклов каждая | {n_threads} потоков")
+    print(f"[screener] старт: {len(syms)} монет × {SCREENER_CYCLES} циклов, {n_threads} потоков", flush=True)
     all_results = []
+
+    def _worker_fn(args):
+        sym, tf, days, sl_p, tp_p, risk = args
+        try:
+            return _run_one_sym_screener(sym, tf, days, sl_p, tp_p, risk, max_cycles=SCREENER_CYCLES)
+        except Exception as e:
+            print(f"[screener] {sym} ERR: {e}", flush=True)
+            return None
+
     args_list = [(sym, tf, days, sl_p, tp_p, risk) for sym in syms]
 
     with ThreadPoolExecutor(max_workers=n_threads) as pool:
-        fut_to_sym = {pool.submit(_screener_worker, args): args[0] for args in args_list}
+        fut_to_sym = {pool.submit(_worker_fn, args): args[0] for args in args_list}
         done_count = 0
         for fut in _as_completed(fut_to_sym):
             if _screener_stop.is_set():
@@ -1377,6 +1394,8 @@ def run_screener():
                 all_results.sort(key=lambda x: x["result"]["fitness"], reverse=True)
                 with screener_lock:
                     screener_state["results"] = all_results[:20]
+            if done_count % 10 == 0 or done_count == 1:
+                print(f"[screener] [{done_count}/{len(syms)}] {sym}", flush=True)
             olog(f"[{done_count}/{len(syms)}] {sym}")
 
     with screener_lock:
@@ -1384,6 +1403,7 @@ def run_screener():
         screener_state["running"] = False
         screener_state["done"]    = True
     olog(f"✅ Скрининг завершён")
+    print(f"[screener] завершён, топ: {len(all_results)} результатов", flush=True)
     if all_results:
         top3 = ", ".join(f"{r['sym']} WR={r['result']['winrate']}%" for r in all_results[:3])
         _send_alert(f"🔍 Скрининг завершён\nТоп-3: {top3}")
@@ -2615,6 +2635,7 @@ if __name__ == "__main__":
     except RuntimeError:
         pass
     main()
+
 
 
 
