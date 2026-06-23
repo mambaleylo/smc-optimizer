@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """
 SMC Optimizer v3.4
+- v3.10: диагностика — статика (байты, JS-синтаксис через node --check, jsdom-выполнение
+  скрипта) не показывает ошибок в v3.9, все функции (startOpt/toggleScanAll/pollScreener)
+  создаются корректно. Добавлен window.onerror, который выводит текст ошибки прямо на
+  экран красной плашкой сверху — нужно для диагностики на Android без доступа к консоли.
+  Если после обновления плашка не появляется и кнопки всё равно не реагируют — проблема
+  не в JS, а в том, что браузер/сервер не подтянули свежую версию (кэш страницы или
+  процесс не перезапущен).
 - v3.9: фикс JS ошибки в copyUpdate — вложенные onclick в innerHTML
   строке давали некорректное экранирование, ломавшее весь скрипт.
   Переписано через createElement без вложенных строковых обработчиков.
@@ -110,7 +117,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.9"
+APP_VERSION  = "3.10"
 GATE_API     = "https://fx-api.gateio.ws/api/v4"
 PORT         = 8765
 GH_REPO      = os.environ.get("GH_REPO", "mambaleylo/smc-optimizer")
@@ -1504,6 +1511,16 @@ input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;p
   <div id="chartMetrics"></div>
 </div>
 <script>
+window.onerror=function(msg,src,line,col,err){
+  try{
+    var info='JS ERROR v__VER__: '+msg+'\n@'+(src||'?').split('/').pop()+':'+line+':'+col+(err&&err.stack?('\n'+err.stack.split('\n').slice(0,3).join('\n')):'');
+    var box=document.createElement('div');
+    box.style.cssText='position:fixed;z-index:99999;top:0;left:0;right:0;background:#400;color:#fff;font:11px monospace;padding:10px;white-space:pre-wrap;max-height:50vh;overflow:auto';
+    box.textContent=info;
+    document.body.appendChild(box);
+  }catch(e){alert('JS ERROR: '+msg+' @'+line+':'+col);}
+  return false;
+};
 var _bestParams = null;
 var _autoAppliedAt30 = false;
 var _chartExtra = {internal_len:5, ob_filter:'atr', ob_mitigation:'highlow',
