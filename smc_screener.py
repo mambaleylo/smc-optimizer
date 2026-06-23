@@ -90,7 +90,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.10"
+APP_VERSION  = "3.11"
 GATE_API     = "https://api.gateio.ws/api/v4"
 PORT         = 8765
 GH_REPO      = os.environ.get("GH_REPO", "mambaleylo/smc-optimizer")
@@ -143,6 +143,7 @@ screener_lock  = threading.Lock()
 screener_state = {
     "running": False, "done": False,
     "current_sym": "", "sym_index": 0, "sym_total": 0,
+    "current_cycle": 0, "max_cycles": 50,
     "results": [], "tf":"15m", "days":30,
     "sl_pct":0.6, "tp_pct":1.2, "risk_pct":10.0,
 }
@@ -1235,7 +1236,7 @@ def run_optimizer():
     olog("⏹ Остановлено")
     with opt_lock: opt_state["running"] = False
 
-def _run_one_sym_screener(sym, tf, days, sl_p, tp_p, risk, max_cycles=50):
+def _run_one_sym_screener(sym, tf, days, sl_p, tp_p, risk, max_cycles=50, on_cycle=None):
     candles = _fetch_candles(sym, tf, days)
     if not candles or len(candles) < 100: return None
     best_params = _random_params()
@@ -1244,6 +1245,7 @@ def _run_one_sym_screener(sym, tf, days, sl_p, tp_p, risk, max_cycles=50):
     best_fit    = best_result["fitness"] if best_result else 0.0
     for cycle in range(1, max_cycles + 1):
         if _screener_stop.is_set(): return None
+        if on_cycle: on_cycle(cycle, max_cycles)
         temp = 1.0 * math.exp(-0.05 * cycle)
         for start_p in [_shake(best_params, 0.4), _random_params()]:
             if _screener_stop.is_set(): return None
@@ -1286,7 +1288,12 @@ def run_screener():
             screener_state["current_sym"] = sym
             screener_state["sym_index"]   = idx + 1
         olog(f"[{idx+1}/{len(syms)}] {sym}")
-        res = _run_one_sym_screener(sym, tf, days, sl_p, tp_p, risk)
+        def _upd_cycle(c, mx):
+            with screener_lock:
+                screener_state["current_cycle"] = c
+                screener_state["max_cycles"] = mx
+        with screener_lock: screener_state["current_cycle"] = 0
+        res = _run_one_sym_screener(sym, tf, days, sl_p, tp_p, risk, on_cycle=_upd_cycle)
         if res:
             all_results.append(res)
             all_results.sort(key=lambda x: x["result"]["fitness"], reverse=True)
@@ -2215,8 +2222,9 @@ function pollScreener(){
   fetch('/scan_all_status').then(function(r){return r.json();}).then(function(d){
     var pct=d.sym_total>0?Math.round(d.sym_index/d.sym_total*100):0;
     document.getElementById('screenerProg').style.width=pct+'%';
+    var cycleStr=d.current_cycle>0?' cycle '+d.current_cycle+'/'+d.max_cycles:'';
     document.getElementById('screenerStatus').textContent=
-      d.running?('['+d.sym_index+'/'+d.sym_total+'] '+d.current_sym+'...'):
+      d.running?('['+d.sym_index+'/'+d.sym_total+'] '+d.current_sym+cycleStr):
       d.done?('\u2705 Готово — проверено '+d.sym_total+' монет'):'—';
     renderScreenerResults(d.results||[]);
     if(d.running){_screenerPoll=setTimeout(pollScreener,2000);}
