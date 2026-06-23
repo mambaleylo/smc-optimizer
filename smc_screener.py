@@ -1,40 +1,6 @@
 #!/usr/bin/env python3
 """
 SMC Optimizer v3.4
-- v3.11: кнопки шапки "Обновить"/"Стоп Termux" были источником 5 багов подряд
-  (v3.5 clipboard на HTTP, v3.7 модалка, v3.8 ETX-байт, v3.9 экранирование
-  innerHTML). Убраны JS-функции copyUpdate/copyKill полностью — заменены на
-  <details>/<summary> с чистым CSS (.cmdbox), без onclick и без JS вообще.
-  Тап по кнопке раскрывает текст команды для ручного выделения/копирования
-  (long-press). Эти два элемента больше не могут сломать остальной скрипт,
-  т.к. не являются JS-кодом.
-- v3.10: диагностика — статика (байты, JS-синтаксис через node --check, jsdom-выполнение
-  скрипта) не показывает ошибок в v3.9, все функции (startOpt/toggleScanAll/pollScreener)
-  создаются корректно. Добавлен window.onerror, который выводит текст ошибки прямо на
-  экран красной плашкой сверху — нужно для диагностики на Android без доступа к консоли.
-  Если после обновления плашка не появляется и кнопки всё равно не реагируют — проблема
-  не в JS, а в том, что браузер/сервер не подтянули свежую версию (кэш страницы или
-  процесс не перезапущен).
-- v3.9: фикс JS ошибки в copyUpdate — вложенные onclick в innerHTML
-  строке давали некорректное экранирование, ломавшее весь скрипт.
-  Переписано через createElement без вложенных строковых обработчиков.
-- v3.8: критический фикс — символ \x03 (ETX/Ctrl+C) попал буквально в
-  JS-комментарий внутри HTML, из-за чего браузер обрывал парсинг скрипта
-  на этой строке. Всё что ниже (startOpt override, toggleScanAll,
-  pollScreener) не выполнялось — поэтому кнопка Старт не реагировала и
-  галочка не меняла текст. Убран литеральный байт, заменён на \u0003.
-- v3.7: фикс кнопок в шапке и чекбокса "Все монеты". (1) текст кнопки
-  Старт менялся через textContent — заменено на innerHTML чтобы сохранить
-  иконку; (2) clipboard API на Android в HTTP заблокирован — "↑ Обновить"
-  теперь открывает модалку с командой для ручного копирования; (3) "Стоп
-  Termux" пробует clipboard и при ошибке показывает подсказку по Ctrl+C.
-- v3.6: фикс скрининга всех монет — кнопка Старт не реагировала визуально
-  т.к. UI обновлялся только после ответа fetch, а не сразу; display:""
-  не показывал screenerCard в некоторых браузерах (исправлено на "block");
-  добавлена немедленная обратная связь до ответа сервера и обработка ошибок.
-- v3.5: кнопки в шапке для Termux. "↑ Обновить" копирует curl-команду
-  скачивания свежей версии с GitHub (использует $GH_TOKEN из окружения);
-  "■ Стоп Termux" копирует Ctrl+C (ETX) для остановки процесса в Termux.
 - v3.4: скрининг всех фьючерсных пар Gate.io. Чекбокс "Все монеты"
   рядом с полем символа — запускает прогон каждой пары по 50 циклов.
   Прогресс [N/Total] + текущая монета в реальном времени. Топ-20 монет
@@ -124,7 +90,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.11"
+APP_VERSION  = "3.4"
 GATE_API     = "https://fx-api.gateio.ws/api/v4"
 PORT         = 8765
 GH_REPO      = os.environ.get("GH_REPO", "mambaleylo/smc-optimizer")
@@ -1347,16 +1313,6 @@ body{background:#0d0d0d;color:#e0e0e0;font-family:'JetBrains Mono',monospace,san
 .btn-go{background:#1a8f4a;color:#fff}.btn-go:hover{background:#22b85e}
 .btn-stop{background:#8f1a1a;color:#fff}.btn-stop:hover{background:#b82222}
 .btn-sm{background:#222;color:#aaa;padding:4px 10px;font-size:11px}
-.cmdbox{position:relative}
-.cmdbox summary{list-style:none;cursor:pointer;padding:4px 10px;border-radius:5px;font-size:10px;border:1px solid #333;font-weight:600}
-.cmdbox summary::-webkit-details-marker{display:none}
-.cmdbox[open] summary{background:#222}
-.cmdbox pre{display:none}
-.cmdbox[open] pre{display:block;position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);
-  z-index:9999;background:#111;border:1px solid #444;border-radius:8px;padding:14px;
-  max-width:90vw;width:340px;white-space:pre-wrap;word-break:break-all;font-size:11px;
-  font-family:monospace;color:#7a9fff;box-shadow:0 4px 24px rgba(0,0,0,0.6)}
-.cmdbox[open]::before{content:'';position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.7);z-index:9998}
 .tabs{display:flex;gap:4px;padding:0 12px;background:#111;border-bottom:1px solid #222}
 .tab{padding:7px 16px;font-size:12px;cursor:pointer;color:#666;border-bottom:2px solid transparent;background:none;border:none}
 .tab.active{color:#f0b800;border-bottom:2px solid #f0b800}
@@ -1398,15 +1354,6 @@ input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;p
   <button class="btn btn-go" id="btnStart" onclick="startOpt()">&#9654; Старт</button>
   <button class="btn btn-stop" id="btnStop" onclick="stopOpt()" style="display:none">&#9632; Стоп</button>
   <span id="statusBadge" style="color:#555;font-size:11px">готов</span>
-  <details class="cmdbox" style="margin-left:auto">
-    <summary style="background:#1a1a2e;color:#7a9fff">&#8593; Обновить</summary>
-    <pre>curl -H 'Accept: application/vnd.github.v3.raw' -H "Authorization: token $GH_TOKEN" -L 'https://api.github.com/repos/mambaleylo/smc-optimizer/contents/smc_screener.py' -o ~/smc_screener.py && python3 ~/smc_screener.py</pre>
-  </details>
-  <details class="cmdbox">
-    <summary style="background:#2a1a1a;color:#ff6b6b">&#9632; Стоп Termux</summary>
-    <pre>Зажмите Ctrl+C в Termux
-(или Volume Down + C на клавиатуре телефона)</pre>
-  </details>
 </div>
 <div class="tabs">
   <button class="tab active" onclick="switchTab('opt',this)">Оптимизатор</button>
@@ -1535,16 +1482,6 @@ input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;p
   <div id="chartMetrics"></div>
 </div>
 <script>
-window.onerror=function(msg,src,line,col,err){
-  try{
-    var info='JS ERROR v__VER__: '+msg+'\n@'+(src||'?').split('/').pop()+':'+line+':'+col+(err&&err.stack?('\n'+err.stack.split('\n').slice(0,3).join('\n')):'');
-    var box=document.createElement('div');
-    box.style.cssText='position:fixed;z-index:99999;top:0;left:0;right:0;background:#400;color:#fff;font:11px monospace;padding:10px;white-space:pre-wrap;max-height:50vh;overflow:auto';
-    box.textContent=info;
-    document.body.appendChild(box);
-  }catch(e){alert('JS ERROR: '+msg+' @'+line+':'+col);}
-  return false;
-};
 var _bestParams = null;
 var _autoAppliedAt30 = false;
 var _chartExtra = {internal_len:5, ob_filter:'atr', ob_mitigation:'highlow',
@@ -2220,24 +2157,17 @@ cv.addEventListener('touchmove',function(e){
   drawChart();
 },{passive:false});
 window.addEventListener('resize',drawChart);
-// copyUpdate/copyKill removed in v3.11 — заменены на чисто-CSS <details> в шапке (см. CSS .cmdbox), без JS и без clipboard API
 
 /* ── Screener all symbols ── */
 var _screenerPoll=null;
 function toggleScanAll(cb){
-  document.getElementById('screenerCard').style.display=cb.checked?'block':'none';
+  document.getElementById('screenerCard').style.display=cb.checked?'':'none';
   document.getElementById('sym').disabled=cb.checked;
-  document.getElementById('btnStart').innerHTML=cb.checked?'&#9654; Скан всех':'&#9654; Старт';
+  document.getElementById('btnStart').textContent=cb.checked?'\u25ba Скан всех':'\u25ba Старт';
 }
 var _origStartOpt=startOpt;
 startOpt=function(){
   if(document.getElementById('scanAll')&&document.getElementById('scanAll').checked){
-    // Немедленная обратная связь
-    document.getElementById('btnStart').style.display='none';
-    document.getElementById('btnStop').style.display='';
-    document.getElementById('statusBadge').textContent='\u23f3 запуск скрининга...';
-    document.getElementById('screenerCard').style.display='block';
-    document.getElementById('screenerStatus').textContent='Получаем список монет с Gate.io...';
     var body={tf:document.getElementById('tf').value,
       days:parseInt(document.getElementById('days').value),
       sl_pct:parseFloat(document.getElementById('sl_pct').value),
@@ -2246,19 +2176,11 @@ startOpt=function(){
     fetch('/scan_all',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
       .then(function(r){return r.json();})
       .then(function(d){
-        if(!d.ok){
-          document.getElementById('btnStart').style.display='';
-          document.getElementById('btnStop').style.display='none';
-          document.getElementById('statusBadge').textContent='ошибка';
-          alert(d.msg||'ошибка запуска скрининга'); return;
-        }
+        if(!d.ok){alert(d.msg||'ошибка');return;}
+        document.getElementById('btnStart').style.display='none';
+        document.getElementById('btnStop').style.display='';
         document.getElementById('statusBadge').textContent='скрининг...';
         pollScreener();
-      })
-      .catch(function(e){
-        document.getElementById('btnStart').style.display='';
-        document.getElementById('btnStop').style.display='none';
-        document.getElementById('statusBadge').textContent='ошибка соединения';
       });
     return;
   }
