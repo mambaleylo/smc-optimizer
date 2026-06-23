@@ -90,7 +90,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.6"
+APP_VERSION  = "3.7"
 GATE_API     = "https://fx-api.gateio.ws/api/v4"
 PORT         = 8765
 GH_REPO      = os.environ.get("GH_REPO", "mambaleylo/smc-optimizer")
@@ -2342,7 +2342,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_response(404); self.end_headers()
 
     def do_POST(self):
-        global _opt_thread
+        global _opt_thread, _screener_thread
         try:
             length = int(self.headers.get("Content-Length",0))
             body   = json.loads(self.rfile.read(length)) if length else {}
@@ -2374,7 +2374,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         elif self.path == "/scan_all":
             try:
-                global _screener_thread
                 if _screener_thread and _screener_thread.is_alive():
                     self._json({"ok":False,"msg":"скрининг уже идёт"}); return
                 _screener_stop.clear()
