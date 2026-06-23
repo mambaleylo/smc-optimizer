@@ -81,6 +81,8 @@ SMC Optimizer v3.4
   Эндпоинты: GET /alert_cfg, POST /alert_cfg, POST /alert_test.
 """
 import os, sys, json, time, math, random, threading, base64, hashlib
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing
 import http.server, urllib.request, urllib.parse
 from functools import lru_cache
 
@@ -90,8 +92,9 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.11"
+APP_VERSION  = "3.12"
 GATE_API     = "https://api.gateio.ws/api/v4"
+NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 PORT         = 8765
 GH_REPO      = os.environ.get("GH_REPO", "mambaleylo/smc-optimizer")
 GH_TOKEN     = os.environ.get("GH_TOKEN", "")
@@ -1265,6 +1268,14 @@ def _run_one_sym_screener(sym, tf, days, sl_p, tp_p, risk, max_cycles=50, on_cyc
                     best_fit, best_params, best_result = nfit, nb_p, nb_r
     return {"sym": sym, "params": best_params, "result": best_result} if best_result else None
 
+def _screener_worker(args):
+    """Воркер для ProcessPoolExecutor — обрабатывает одну монету."""
+    sym, tf, days, sl_p, tp_p, risk = args
+    try:
+        return _run_one_sym_screener(sym, tf, days, sl_p, tp_p, risk)
+    except Exception:
+        return None
+
 def run_screener():
     global _screener_thread
     tf   = screener_state["tf"]
@@ -1282,22 +1293,30 @@ def run_screener():
     with screener_lock: screener_state["sym_total"] = len(syms)
     olog(f"✔ {len(syms)} монет, 50 циклов каждая")
     all_results = []
-    for idx, sym in enumerate(syms):
-        if _screener_stop.is_set(): break
-        with screener_lock:
-            screener_state["current_sym"] = sym
-            screener_state["sym_index"]   = idx + 1
-        olog(f"[{idx+1}/{len(syms)}] {sym}")
-        def _upd_cycle(c, mx):
+    args_list = [(sym, tf, days, sl_p, tp_p, risk) for sym in syms]
+    olog(f"⚡ Запускаем {NUM_WORKERS} воркеров...")
+    done_count = 0
+    with ProcessPoolExecutor(max_workers=NUM_WORKERS) as executor:
+        futures = {executor.submit(_screener_worker, a): a[0] for a in args_list}
+        for future in as_completed(futures):
+            if _screener_stop.is_set():
+                executor.shutdown(wait=False, cancel_futures=True)
+                break
+            sym_name = futures[future]
+            done_count += 1
             with screener_lock:
-                screener_state["current_cycle"] = c
-                screener_state["max_cycles"] = mx
-        with screener_lock: screener_state["current_cycle"] = 0
-        res = _run_one_sym_screener(sym, tf, days, sl_p, tp_p, risk, on_cycle=_upd_cycle)
-        if res:
-            all_results.append(res)
-            all_results.sort(key=lambda x: x["result"]["fitness"], reverse=True)
-            with screener_lock: screener_state["results"] = all_results[:20]
+                screener_state["current_sym"] = sym_name
+                screener_state["sym_index"]   = done_count
+                screener_state["current_cycle"] = 0
+            try:
+                res = future.result()
+            except Exception:
+                res = None
+            olog(f"[{done_count}/{len(syms)}] {sym_name}")
+            if res:
+                all_results.append(res)
+                all_results.sort(key=lambda x: x["result"]["fitness"], reverse=True)
+                with screener_lock: screener_state["results"] = all_results[:20]
     with screener_lock:
         screener_state["results"] = all_results[:20]
         screener_state["running"] = False
