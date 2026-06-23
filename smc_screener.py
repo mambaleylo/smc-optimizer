@@ -85,7 +85,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.2"
+APP_VERSION  = "3.3"
 GATE_API     = "https://fx-api.gateio.ws/api/v4"
 PORT         = 8765
 GH_REPO      = os.environ.get("GH_REPO", "mambaleylo/smc-optimizer")
@@ -1710,11 +1710,11 @@ function poll(){
 
     if(d.best){
       var r=d.best.result, p=d.best.params;
+      var prevFit = _bestParams ? (_bestParams._fitness||0) : 0;
+      p._fitness = r.fitness;
       _bestParams = p;
-      // Авто-применение: один раз когда цикл перевалил за 30
-      var cyc = d.cycle||0;
-      if(cyc >= 30 && !_autoAppliedAt30){
-        _autoAppliedAt30 = true;
+      // Авто-применение: каждый раз когда fitness улучшился И цикл >= 30
+      if((d.cycle||0) >= 30 && r.fitness > prevFit){
         applyBestToChart();
       }
       var wrC=r.winrate>=55?'green':r.winrate>=45?'yellow':'red';
