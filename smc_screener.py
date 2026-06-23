@@ -730,20 +730,24 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
 
         # Управление открытой позицией
         if in_trade:
+            open_i = candles[i]["o"]
             if trade_dir == "long":
-                sl_src = low_i if ob_mit == "highlow" else close_i
-                tp_src = high_i
-                if sl_src <= sl_price:
-                    pnl_pct = -sl_pct
+                sl_hit = (low_i  <= sl_price)
+                tp_hit = (high_i >= tp_price)
+                if sl_hit and tp_hit:
+                    # Оба задеты на одной свече — побеждает тот, что ближе к open
+                    sl_hit = abs(open_i - sl_price) <= abs(open_i - tp_price)
+                    tp_hit = not sl_hit
+                if sl_hit:
                     pnl = equity * (risk_pct/100.0) * (-1.0)
                     equity += pnl
                     trades.append({"dir":"long","entry":entry_px,"exit":sl_price,
-                                   "pnl_pct":pnl_pct,"pnl":pnl,"win":False,"i":i})
+                                   "pnl_pct":-sl_pct,"pnl":pnl,"win":False,"i":i})
                     if _collect:
                         signals.append({"dir":"long","entry_i":entry_i,"exit_i":i,
                                         "entry":entry_px,"tp":tp_price,"sl":sl_price,"win":False})
                     in_trade = False
-                elif tp_src >= tp_price:
+                elif tp_hit:
                     rr = tp_pct / sl_pct
                     pnl = equity * (risk_pct/100.0) * rr
                     equity += pnl
@@ -754,9 +758,12 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
                                         "entry":entry_px,"tp":tp_price,"sl":sl_price,"win":True})
                     in_trade = False
             else:  # short
-                sl_src = high_i if ob_mit == "highlow" else close_i
-                tp_src = low_i
-                if sl_src >= sl_price:
+                sl_hit = (high_i >= sl_price)
+                tp_hit = (low_i  <= tp_price)
+                if sl_hit and tp_hit:
+                    sl_hit = abs(open_i - sl_price) <= abs(open_i - tp_price)
+                    tp_hit = not sl_hit
+                if sl_hit:
                     pnl = equity * (risk_pct/100.0) * (-1.0)
                     equity += pnl
                     trades.append({"dir":"short","entry":entry_px,"exit":sl_price,
@@ -765,7 +772,7 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
                         signals.append({"dir":"short","entry_i":entry_i,"exit_i":i,
                                         "entry":entry_px,"tp":tp_price,"sl":sl_price,"win":False})
                     in_trade = False
-                elif tp_src <= tp_price:
+                elif tp_hit:
                     rr = tp_pct / sl_pct
                     pnl = equity * (risk_pct/100.0) * rr
                     equity += pnl
@@ -814,11 +821,15 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
 
         if sig_dir is not None and entry_candidate is not None:
             entry_px  = close_i
+            ob_hi = entry_candidate["hi"]
+            ob_lo = entry_candidate["lo"]
             if sig_dir == "long":
-                sl_price = entry_px * (1 - sl_pct/100)
+                # SL — чуть ниже низа OB, TP — от entry вверх на tp_pct
+                sl_price = ob_lo * (1 - sl_pct/100)
                 tp_price = entry_px * (1 + tp_pct/100)
             else:
-                sl_price = entry_px * (1 + sl_pct/100)
+                # SL — чуть выше верха OB, TP — от entry вниз на tp_pct
+                sl_price = ob_hi * (1 + sl_pct/100)
                 tp_price = entry_px * (1 - tp_pct/100)
             in_trade  = True
             trade_dir = sig_dir
