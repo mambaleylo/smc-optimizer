@@ -90,7 +90,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.4"
+APP_VERSION  = "3.5"
 GATE_API     = "https://fx-api.gateio.ws/api/v4"
 PORT         = 8765
 GH_REPO      = os.environ.get("GH_REPO", "mambaleylo/smc-optimizer")
@@ -1285,7 +1285,7 @@ def run_screener():
             screener_state["current_sym"] = sym
             screener_state["sym_index"]   = idx + 1
         olog(f"[{idx+1}/{len(syms)}] {sym}")
-        res = _run_one_sym_screener(sym, tf, days, sl_p, tp_p, risk, max_cycles=15)
+        res = _run_one_sym_screener(sym, tf, days, sl_p, tp_p, risk)
         if res:
             all_results.append(res)
             all_results.sort(key=lambda x: x["result"]["fitness"], reverse=True)
@@ -2342,8 +2342,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         global _opt_thread
-        length = int(self.headers.get("Content-Length",0))
-        body   = json.loads(self.rfile.read(length)) if length else {}
+        try:
+            length = int(self.headers.get("Content-Length",0))
+            body   = json.loads(self.rfile.read(length)) if length else {}
+        except Exception as e:
+            self._json({"ok":False,"msg":f"bad request: {e}"}); return
 
         if self.path == "/scan":
             if _opt_thread and _opt_thread.is_alive():
@@ -2369,22 +2372,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json({"ok":True})
 
         elif self.path == "/scan_all":
-            global _screener_thread
-            if _screener_thread and _screener_thread.is_alive():
-                self._json({"ok":False,"msg":"скрининг уже идёт"}); return
-            _screener_stop.clear()
-            with screener_lock:
-                screener_state.update({
-                    "running":True,"done":False,
-                    "tf":body.get("tf","15m"),
-                    "days":int(body.get("days",30)),
-                    "sl_pct":float(body.get("sl_pct",0.6)),
-                    "tp_pct":float(body.get("tp_pct",1.2)),
-                    "risk_pct":float(body.get("risk_pct",10.0)),
-                })
-            _screener_thread = threading.Thread(target=run_screener, daemon=True)
-            _screener_thread.start()
-            self._json({"ok":True})
+            try:
+                global _screener_thread
+                if _screener_thread and _screener_thread.is_alive():
+                    self._json({"ok":False,"msg":"скрининг уже идёт"}); return
+                _screener_stop.clear()
+                with screener_lock:
+                    screener_state.update({
+                        "running":True,"done":False,
+                        "tf":body.get("tf","15m"),
+                        "days":int(body.get("days",30)),
+                        "sl_pct":float(body.get("sl_pct",0.6)),
+                        "tp_pct":float(body.get("tp_pct",1.2)),
+                        "risk_pct":float(body.get("risk_pct",10.0)),
+                        "current_sym":"",
+                    })
+                _screener_thread = threading.Thread(target=run_screener, daemon=True)
+                _screener_thread.start()
+                self._json({"ok":True})
+            except Exception as e:
+                self._json({"ok":False,"msg":f"scan_all error: {e}"})
 
         elif self.path == "/scan_all_stop":
             _screener_stop.set()
