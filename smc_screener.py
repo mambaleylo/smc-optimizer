@@ -85,7 +85,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.1"
+APP_VERSION  = "3.2"
 GATE_API     = "https://fx-api.gateio.ws/api/v4"
 PORT         = 8765
 GH_REPO      = os.environ.get("GH_REPO", "mambaleylo/smc-optimizer")
@@ -1380,6 +1380,7 @@ input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;p
 </div>
 <script>
 var _bestParams = null;
+var _autoAppliedAt30 = false;
 var _chartExtra = {internal_len:5, ob_filter:'atr', ob_mitigation:'highlow',
   fvg_enabled:true, fvg_threshold:0.1, choch_only:false, use_internal:true,
   min_ob_size:1.0, require_fvg_confirm:false};
@@ -1636,6 +1637,7 @@ function startOpt(){
     risk_pct:parseFloat(document.getElementById('risk_pct').value),
   };
   // Сразу показываем что идёт загрузка — не ждём ответа сервера
+  _autoAppliedAt30 = false;
   document.getElementById('btnStart').style.display='none';
   document.getElementById('btnStop').style.display='';
   var badge = document.getElementById('statusBadge');
@@ -1708,12 +1710,11 @@ function poll(){
 
     if(d.best){
       var r=d.best.result, p=d.best.params;
-      var prevFit = _bestParams ? (_bestParams._fitness||0) : 0;
-      p._fitness = r.fitness;
-      var isNewBest = r.fitness > prevFit;
       _bestParams = p;
-      // Авто-применение на график начиная с 30-го цикла при улучшении fitness
-      if(isNewBest && (d.cycle||0) >= 30){
+      // Авто-применение: один раз когда цикл перевалил за 30
+      var cyc = d.cycle||0;
+      if(cyc >= 30 && !_autoAppliedAt30){
+        _autoAppliedAt30 = true;
         applyBestToChart();
       }
       var wrC=r.winrate>=55?'green':r.winrate>=45?'yellow':'red';
