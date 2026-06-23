@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """
-SMC Optimizer v3.18
+SMC Optimizer v3.19
+- v3.19: скрининг возвращён в последовательный режим (как до параллелизма) — 50
+  циклов, 1 монета за раз, без ThreadPool. Параллелизм ProcessPool только в
+  оптимизаторе (по аналогии с WickFill). Добавлена WickFill-логика определения
+  типа пула: на python3.14t (no GIL) → ThreadPoolExecutor, иначе ProcessPoolExecutor
+  (_PoolExecutor/_POOL_TYPE). Это ключевое отличие WickFill — именно оно позволяет
+  работать параллелизму на Android.
+
 - v3.18: фикс зависания [0/795]. Проблема: ThreadPool запускал все 795 монет
   одновременно, каждая = fetch_candles + 50×2×60 симуляций — на Android с GIL
   первая монета заканчивалась через минуты, UI висел на [0/795]. Решение:
@@ -103,7 +110,15 @@ import os, sys, json, time, math, random, threading, base64, hashlib
 import multiprocessing
 import http.server, urllib.request, urllib.parse
 from functools import lru_cache
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, wait as _fw, as_completed as _as_completed
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, wait as _fw, as_completed as _as_completed
+import sys as _sys
+# python3.14t (free-threaded, no GIL) не поддерживает ProcessPoolExecutor
+if hasattr(_sys, '_is_gil_enabled') and not _sys._is_gil_enabled():
+    _PoolExecutor = ThreadPoolExecutor
+    _POOL_TYPE = "thread"
+else:
+    _PoolExecutor = ProcessPoolExecutor
+    _POOL_TYPE = "process"
 
 try:
     import requests
@@ -111,7 +126,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.18"
+APP_VERSION  = "3.19"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -1180,8 +1195,8 @@ def run_optimizer():
     olog(f"✔ Загружено {len(candles)} свечей")
 
     n_workers = NUM_WORKERS
-    olog(f"⚙ Запуск ProcessPool ({n_workers} процессов)...")
-    pool = ProcessPoolExecutor(
+    olog(f"⚙ Запуск {'ThreadPool' if _POOL_TYPE=='thread' else 'ProcessPool'} ({n_workers} {'потоков' if _POOL_TYPE=='thread' else 'процессов'})...")
+    pool = _PoolExecutor(
         max_workers=n_workers,
         initializer=_worker_init,
         initargs=(candles, risk)
@@ -1356,54 +1371,24 @@ def run_screener():
         with screener_lock: screener_state["running"] = False
         olog("❌ Не удалось получить список монет"); return
     with screener_lock: screener_state["sym_total"] = len(syms)
-    # Скринер IO+CPU bound — ThreadPoolExecutor.
-    # max_cycles=10 (не 50) — на Android каждая монета иначе 2-3 мин CPU
-    n_threads = max(4, NUM_WORKERS * 2)
-    SCREENER_CYCLES = 10
-    olog(f"✔ {len(syms)} монет, {SCREENER_CYCLES} циклов каждая | {n_threads} потоков")
-    print(f"[screener] старт: {len(syms)} монет × {SCREENER_CYCLES} циклов, {n_threads} потоков", flush=True)
+    olog(f"✔ {len(syms)} монет, 50 циклов каждая")
     all_results = []
-
-    def _worker_fn(args):
-        sym, tf, days, sl_p, tp_p, risk = args
-        try:
-            return _run_one_sym_screener(sym, tf, days, sl_p, tp_p, risk, max_cycles=SCREENER_CYCLES)
-        except Exception as e:
-            print(f"[screener] {sym} ERR: {e}", flush=True)
-            return None
-
-    args_list = [(sym, tf, days, sl_p, tp_p, risk) for sym in syms]
-
-    with ThreadPoolExecutor(max_workers=n_threads) as pool:
-        fut_to_sym = {pool.submit(_worker_fn, args): args[0] for args in args_list}
-        done_count = 0
-        for fut in _as_completed(fut_to_sym):
-            if _screener_stop.is_set():
-                break
-            sym = fut_to_sym[fut]
-            done_count += 1
-            with screener_lock:
-                screener_state["current_sym"] = sym
-                screener_state["sym_index"]   = done_count
-            try:
-                res = fut.result()
-            except Exception:
-                res = None
-            if res:
-                all_results.append(res)
-                all_results.sort(key=lambda x: x["result"]["fitness"], reverse=True)
-                with screener_lock:
-                    screener_state["results"] = all_results[:20]
-            if done_count % 10 == 0 or done_count == 1:
-                print(f"[screener] [{done_count}/{len(syms)}] {sym}", flush=True)
-            olog(f"[{done_count}/{len(syms)}] {sym}")
-
+    for idx, sym in enumerate(syms):
+        if _screener_stop.is_set(): break
+        with screener_lock:
+            screener_state["current_sym"] = sym
+            screener_state["sym_index"]   = idx + 1
+        olog(f"[{idx+1}/{len(syms)}] {sym}")
+        res = _run_one_sym_screener(sym, tf, days, sl_p, tp_p, risk)
+        if res:
+            all_results.append(res)
+            all_results.sort(key=lambda x: x["result"]["fitness"], reverse=True)
+            with screener_lock: screener_state["results"] = all_results[:20]
     with screener_lock:
         screener_state["results"] = all_results[:20]
         screener_state["running"] = False
         screener_state["done"]    = True
     olog(f"✅ Скрининг завершён")
-    print(f"[screener] завершён, топ: {len(all_results)} результатов", flush=True)
     if all_results:
         top3 = ", ".join(f"{r['sym']} WR={r['result']['winrate']}%" for r in all_results[:3])
         _send_alert(f"🔍 Скрининг завершён\nТоп-3: {top3}")
@@ -2635,6 +2620,7 @@ if __name__ == "__main__":
     except RuntimeError:
         pass
     main()
+
 
 
 
