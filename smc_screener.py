@@ -85,7 +85,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "2.8"
+APP_VERSION  = "2.9"
 GATE_API     = "https://fx-api.gateio.ws/api/v4"
 PORT         = 8765
 GH_REPO      = os.environ.get("GH_REPO", "mambaleylo/smc-optimizer")
@@ -1620,6 +1620,7 @@ loadAlertCfg();
 /* ── Optimizer polling ── */
 var polling=null, lastLogTotal=0, logsDropped=0;
 
+var _startingDots = null;
 function startOpt(){
   var body={
     symbol:document.getElementById('sym').value,
@@ -1629,12 +1630,34 @@ function startOpt(){
     tp_pct:parseFloat(document.getElementById('tp_pct').value),
     risk_pct:parseFloat(document.getElementById('risk_pct').value),
   };
+  // Сразу показываем что идёт загрузка — не ждём ответа сервера
+  document.getElementById('btnStart').style.display='none';
+  document.getElementById('btnStop').style.display='';
+  var badge = document.getElementById('statusBadge');
+  badge.style.color='#f0b800';
+  var dots=0, phases=['⏳ загрузка свечей.','⏳ загрузка свечей..','⏳ загрузка свечей...'];
+  if(_startingDots) clearInterval(_startingDots);
+  _startingDots = setInterval(function(){
+    badge.textContent = phases[dots%3]; dots++;
+  }, 400);
+  // Добавляем строку в лог сразу
+  var lb=document.getElementById('logBox');
+  var div=document.createElement('div'); div.className='log-line';
+  div.innerHTML='<span style="color:#555">[--:--:--]</span> ▶ Запускаем оптимизатор: '
+    +body.symbol+' '+body.tf+' '+body.days+'д SL='+body.sl_pct+'% TP='+body.tp_pct+'%';
+  lb.appendChild(div); lb.scrollTop=lb.scrollHeight;
+
   fetch('/scan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
     .then(function(){
-      document.getElementById('btnStart').style.display='none';
-      document.getElementById('btnStop').style.display='';
-      document.getElementById('statusBadge').textContent='работает...';
+      clearInterval(_startingDots); _startingDots=null;
+      badge.textContent='работает...'; badge.style.color='#0f9';
       scheduleNext();
+    })
+    .catch(function(e){
+      clearInterval(_startingDots); _startingDots=null;
+      badge.textContent='ошибка запуска'; badge.style.color='#f45';
+      document.getElementById('btnStart').style.display='';
+      document.getElementById('btnStop').style.display='none';
     });
 }
 function stopOpt(){
@@ -1668,8 +1691,15 @@ function poll(){
     if(!d.running){
       document.getElementById('btnStop').style.display='none';
       document.getElementById('btnStart').style.display='';
-      document.getElementById('statusBadge').textContent='завершено';
-    } else scheduleNext();
+      var badge=document.getElementById('statusBadge');
+      badge.textContent='завершено'; badge.style.color='#aaa';
+    } else {
+      var badge=document.getElementById('statusBadge');
+      var cyc=d.cycle||0, tri=(d.trials||0).toLocaleString();
+      badge.textContent = cyc>0 ? ('цикл '+cyc+' · '+tri+' попыток') : '⏳ инициализация...';
+      badge.style.color = cyc>0?'#0f9':'#f0b800';
+      scheduleNext();
+    }
 
     if(d.best){
       var r=d.best.result, p=d.best.params;
