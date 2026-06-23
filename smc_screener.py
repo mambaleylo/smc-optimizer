@@ -85,7 +85,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "2.9"
+APP_VERSION  = "3.0"
 GATE_API     = "https://fx-api.gateio.ws/api/v4"
 PORT         = 8765
 GH_REPO      = os.environ.get("GH_REPO", "mambaleylo/smc-optimizer")
@@ -1420,8 +1420,13 @@ function applyBestToChart(){
     min_ob_size:        p.min_ob_size        != null ? p.min_ob_size        : 1.0,
     require_fvg_confirm:p.require_fvg_confirm!= null ? p.require_fvg_confirm: false,
   };
-  switchTab('chart', document.querySelectorAll('.tab')[1]);
-  loadChart();
+  // Переключаем вкладку надёжно — ищем кнопку по тексту
+  var tabBtns = document.querySelectorAll('.tab');
+  var chartBtn = null;
+  for(var i=0;i<tabBtns.length;i++){ if(tabBtns[i].textContent.trim()==='График'){ chartBtn=tabBtns[i]; break; } }
+  if(chartBtn) switchTab('chart', chartBtn);
+  // setTimeout чтобы canvas успел стать видимым перед drawChart
+  setTimeout(function(){ loadChart(); }, 80);
 }
 
 function toggleChartMonitor(){
