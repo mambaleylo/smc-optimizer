@@ -82,7 +82,6 @@ SMC Optimizer v3.4
 """
 import os, sys, json, time, math, random, threading, base64, hashlib
 import multiprocessing
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import http.server, urllib.request, urllib.parse
 from functools import lru_cache
 
@@ -92,7 +91,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.14"
+APP_VERSION  = "3.15"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 PORT         = 8765
@@ -1293,37 +1292,17 @@ def run_screener():
     with screener_lock: screener_state["sym_total"] = len(syms)
     olog(f"✔ {len(syms)} монет, 50 циклов каждая")
     all_results = []
-    results_lock = threading.Lock()
-    done_count_ref = [0]
-
-    def _worker(sym):
-        if _screener_stop.is_set(): return None
-        return sym, _run_one_sym_screener(sym, tf, days, sl_p, tp_p, risk)
-
-    olog(f"⚡ Запускаем {NUM_WORKERS} потоков...")
-    with ThreadPoolExecutor(max_workers=NUM_WORKERS) as ex:
-        futs = {ex.submit(_worker, sym): sym for sym in syms}
-        for fut in as_completed(futs):
-            if _screener_stop.is_set(): break
-            try:
-                result = fut.result()
-            except Exception:
-                result = None
-            if not result: continue
-            sym, res = result
-            with results_lock:
-                done_count_ref[0] += 1
-                cnt = done_count_ref[0]
-            with screener_lock:
-                screener_state["current_sym"] = sym
-                screener_state["sym_index"]   = cnt
-            olog(f"[{cnt}/{len(syms)}] {sym}")
-            if res:
-                with results_lock:
-                    all_results.append(res)
-                    all_results.sort(key=lambda x: x["result"]["fitness"], reverse=True)
-                with screener_lock:
-                    screener_state["results"] = all_results[:20]
+    for idx, sym in enumerate(syms):
+        if _screener_stop.is_set(): break
+        with screener_lock:
+            screener_state["current_sym"] = sym
+            screener_state["sym_index"]   = idx + 1
+        olog(f"[{idx+1}/{len(syms)}] {sym}")
+        res = _run_one_sym_screener(sym, tf, days, sl_p, tp_p, risk)
+        if res:
+            all_results.append(res)
+            all_results.sort(key=lambda x: x["result"]["fitness"], reverse=True)
+            with screener_lock: screener_state["results"] = all_results[:20]
     with screener_lock:
         screener_state["results"] = all_results[:20]
         screener_state["running"] = False
