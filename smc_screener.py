@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
 SMC Optimizer v3.4
+- v3.5: кнопки в шапке для Termux. "↑ Обновить" копирует curl-команду
+  скачивания свежей версии с GitHub (использует $GH_TOKEN из окружения);
+  "■ Стоп Termux" копирует Ctrl+C (ETX) для остановки процесса в Termux.
 - v3.4: скрининг всех фьючерсных пар Gate.io. Чекбокс "Все монеты"
   рядом с полем символа — запускает прогон каждой пары по 50 циклов.
   Прогресс [N/Total] + текущая монета в реальном времени. Топ-20 монет
@@ -90,7 +93,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.4"
+APP_VERSION  = "3.5"
 GATE_API     = "https://fx-api.gateio.ws/api/v4"
 PORT         = 8765
 GH_REPO      = os.environ.get("GH_REPO", "mambaleylo/smc-optimizer")
@@ -1354,6 +1357,8 @@ input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;p
   <button class="btn btn-go" id="btnStart" onclick="startOpt()">&#9654; Старт</button>
   <button class="btn btn-stop" id="btnStop" onclick="stopOpt()" style="display:none">&#9632; Стоп</button>
   <span id="statusBadge" style="color:#555;font-size:11px">готов</span>
+  <button class="btn" style="margin-left:auto;background:#1a1a2e;color:#7a9fff;font-size:10px;border:1px solid #333" onclick="copyUpdate()" title="Команда обновления для Termux">&#8593; Обновить</button>
+  <button class="btn" style="background:#2a1a1a;color:#ff6b6b;font-size:10px;border:1px solid #333" onclick="copyKill()" title="Ctrl+C для Termux">&#9632; Стоп Termux</button>
 </div>
 <div class="tabs">
   <button class="tab active" onclick="switchTab('opt',this)">Оптимизатор</button>
@@ -2157,6 +2162,29 @@ cv.addEventListener('touchmove',function(e){
   drawChart();
 },{passive:false});
 window.addEventListener('resize',drawChart);
+var _UPDATE_CMD='curl -H \'Accept: application/vnd.github.v3.raw\' -H "Authorization: token ${GH_TOKEN}" -L \'https://api.github.com/repos/mambaleylo/smc-optimizer/contents/smc_screener.py\' -o ~/smc_screener.py && python3 ~/smc_screener.py';
+function copyUpdate(){
+  var b=document.querySelector('[onclick="copyUpdate()"]');
+  navigator.clipboard.writeText(_UPDATE_CMD).then(function(){
+    var o=b.textContent;b.textContent='\u2713 Скопировано!';
+    setTimeout(function(){b.textContent=o;},2000);
+  }).catch(function(){
+    var t=document.createElement('textarea');
+    t.value=_UPDATE_CMD;document.body.appendChild(t);
+    t.select();document.execCommand('copy');document.body.removeChild(t);
+    alert('Скопировано! Вставьте в Termux (GH_TOKEN должен быть задан в окружении).');
+  });
+}
+function copyKill(){
+  var b=document.querySelector('[onclick="copyKill()"]');
+  navigator.clipboard.writeText('\x03').catch(function(){
+    var t=document.createElement('textarea');
+    t.value='\x03';document.body.appendChild(t);
+    t.select();document.execCommand('copy');document.body.removeChild(t);
+  });
+  var o=b.textContent;b.textContent='\u2713 Ctrl+C скопирован';
+  setTimeout(function(){b.textContent=o;},2000);
+}
 
 /* ── Screener all symbols ── */
 var _screenerPoll=null;
