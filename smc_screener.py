@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
 SMC Optimizer v3.4
+- v3.6: фикс скрининга всех монет — кнопка Старт не реагировала визуально
+  т.к. UI обновлялся только после ответа fetch, а не сразу; display:""
+  не показывал screenerCard в некоторых браузерах (исправлено на "block");
+  добавлена немедленная обратная связь до ответа сервера и обработка ошибок.
 - v3.5: кнопки в шапке для Termux. "↑ Обновить" копирует curl-команду
   скачивания свежей версии с GitHub (использует $GH_TOKEN из окружения);
   "■ Стоп Termux" копирует Ctrl+C (ETX) для остановки процесса в Termux.
@@ -93,7 +97,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.5"
+APP_VERSION  = "3.6"
 GATE_API     = "https://fx-api.gateio.ws/api/v4"
 PORT         = 8765
 GH_REPO      = os.environ.get("GH_REPO", "mambaleylo/smc-optimizer")
@@ -2189,13 +2193,19 @@ function copyKill(){
 /* ── Screener all symbols ── */
 var _screenerPoll=null;
 function toggleScanAll(cb){
-  document.getElementById('screenerCard').style.display=cb.checked?'':'none';
+  document.getElementById('screenerCard').style.display=cb.checked?'block':'none';
   document.getElementById('sym').disabled=cb.checked;
   document.getElementById('btnStart').textContent=cb.checked?'\u25ba Скан всех':'\u25ba Старт';
 }
 var _origStartOpt=startOpt;
 startOpt=function(){
   if(document.getElementById('scanAll')&&document.getElementById('scanAll').checked){
+    // Немедленная обратная связь
+    document.getElementById('btnStart').style.display='none';
+    document.getElementById('btnStop').style.display='';
+    document.getElementById('statusBadge').textContent='\u23f3 запуск скрининга...';
+    document.getElementById('screenerCard').style.display='block';
+    document.getElementById('screenerStatus').textContent='Получаем список монет с Gate.io...';
     var body={tf:document.getElementById('tf').value,
       days:parseInt(document.getElementById('days').value),
       sl_pct:parseFloat(document.getElementById('sl_pct').value),
@@ -2204,11 +2214,19 @@ startOpt=function(){
     fetch('/scan_all',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
       .then(function(r){return r.json();})
       .then(function(d){
-        if(!d.ok){alert(d.msg||'ошибка');return;}
-        document.getElementById('btnStart').style.display='none';
-        document.getElementById('btnStop').style.display='';
+        if(!d.ok){
+          document.getElementById('btnStart').style.display='';
+          document.getElementById('btnStop').style.display='none';
+          document.getElementById('statusBadge').textContent='ошибка';
+          alert(d.msg||'ошибка запуска скрининга'); return;
+        }
         document.getElementById('statusBadge').textContent='скрининг...';
         pollScreener();
+      })
+      .catch(function(e){
+        document.getElementById('btnStart').style.display='';
+        document.getElementById('btnStop').style.display='none';
+        document.getElementById('statusBadge').textContent='ошибка соединения';
       });
     return;
   }
