@@ -81,7 +81,6 @@ SMC Optimizer v3.4
   Эндпоинты: GET /alert_cfg, POST /alert_cfg, POST /alert_test.
 """
 import os, sys, json, time, math, random, threading, base64, hashlib
-from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing
 import http.server, urllib.request, urllib.parse
 from functools import lru_cache
@@ -92,7 +91,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.12"
+APP_VERSION  = "3.13"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 PORT         = 8765
@@ -1293,30 +1292,37 @@ def run_screener():
     with screener_lock: screener_state["sym_total"] = len(syms)
     olog(f"✔ {len(syms)} монет, 50 циклов каждая")
     all_results = []
-    args_list = [(sym, tf, days, sl_p, tp_p, risk) for sym in syms]
-    olog(f"⚡ Запускаем {NUM_WORKERS} воркеров...")
-    done_count = 0
-    with ProcessPoolExecutor(max_workers=NUM_WORKERS) as executor:
-        futures = {executor.submit(_screener_worker, a): a[0] for a in args_list}
-        for future in as_completed(futures):
-            if _screener_stop.is_set():
-                executor.shutdown(wait=False, cancel_futures=True)
-                break
-            sym_name = futures[future]
-            done_count += 1
+    results_lock = threading.Lock()
+    done_count_ref = [0]
+    sem = threading.Semaphore(NUM_WORKERS)
+
+    def _worker(sym):
+        with sem:
+            if _screener_stop.is_set(): return
+            res = _run_one_sym_screener(sym, tf, days, sl_p, tp_p, risk)
+            with results_lock:
+                done_count_ref[0] += 1
+                cnt = done_count_ref[0]
             with screener_lock:
-                screener_state["current_sym"] = sym_name
-                screener_state["sym_index"]   = done_count
-                screener_state["current_cycle"] = 0
-            try:
-                res = future.result()
-            except Exception:
-                res = None
-            olog(f"[{done_count}/{len(syms)}] {sym_name}")
+                screener_state["current_sym"] = sym
+                screener_state["sym_index"]   = cnt
+            olog(f"[{cnt}/{len(syms)}] {sym}")
             if res:
-                all_results.append(res)
-                all_results.sort(key=lambda x: x["result"]["fitness"], reverse=True)
-                with screener_lock: screener_state["results"] = all_results[:20]
+                with results_lock:
+                    all_results.append(res)
+                    all_results.sort(key=lambda x: x["result"]["fitness"], reverse=True)
+                with screener_lock:
+                    screener_state["results"] = all_results[:20]
+
+    olog(f"⚡ Запускаем {NUM_WORKERS} потоков...")
+    threads = []
+    for sym in syms:
+        if _screener_stop.is_set(): break
+        t = threading.Thread(target=_worker, args=(sym,), daemon=True)
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join()
     with screener_lock:
         screener_state["results"] = all_results[:20]
         screener_state["running"] = False
