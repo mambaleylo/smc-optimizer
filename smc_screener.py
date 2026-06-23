@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
-SMC Optimizer v3.19
+SMC Optimizer v3.20
+- v3.20: прогресс цикла внутри монеты при скрининге. on_cycle колбэк передаётся
+  в _run_one_sym_screener — current_cycle/max_cycles обновляются в screener_state
+  на каждом цикле. UI уже показывал cycleStr (cycle N/50) — теперь заполняется.
+
 - v3.19: скрининг возвращён в последовательный режим (как до параллелизма) — 50
   циклов, 1 монета за раз, без ThreadPool. Параллелизм ProcessPool только в
   оптимизаторе (по аналогии с WickFill). Добавлена WickFill-логика определения
@@ -126,7 +130,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.19"
+APP_VERSION  = "3.20"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -1376,10 +1380,17 @@ def run_screener():
     for idx, sym in enumerate(syms):
         if _screener_stop.is_set(): break
         with screener_lock:
-            screener_state["current_sym"] = sym
-            screener_state["sym_index"]   = idx + 1
+            screener_state["current_sym"]   = sym
+            screener_state["sym_index"]     = idx + 1
+            screener_state["current_cycle"] = 0
         olog(f"[{idx+1}/{len(syms)}] {sym}")
-        res = _run_one_sym_screener(sym, tf, days, sl_p, tp_p, risk)
+
+        def _on_cycle(c, mx, _sym=sym):
+            with screener_lock:
+                screener_state["current_cycle"] = c
+                screener_state["max_cycles"]    = mx
+
+        res = _run_one_sym_screener(sym, tf, days, sl_p, tp_p, risk, on_cycle=_on_cycle)
         if res:
             all_results.append(res)
             all_results.sort(key=lambda x: x["result"]["fitness"], reverse=True)
@@ -2620,6 +2631,7 @@ if __name__ == "__main__":
     except RuntimeError:
         pass
     main()
+
 
 
 
