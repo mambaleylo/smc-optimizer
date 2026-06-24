@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.48.1
+- v3.48.1: хотфикс сломанного JS — закрывающая скобка wtPoll() слипалась
+  с текстом комментария (} ──), что роняло весь <script> и делало все кнопки
+  интерфейса неактивными.
 SMC Optimizer v3.48
 - v3.48: эко-режим теперь включается по стагнации, а не по номеру цикла.
   Раньше: eco_mode = cycle > 300 — нагрузка всегда снижалась после 300 цикла,
@@ -295,7 +299,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.48"
+APP_VERSION  = "3.48.1"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -2633,7 +2637,9 @@ function wtPoll(){
       logEl.scrollTop=logEl.scrollHeight;
     }
   }).catch(function(){});
-} ──
+}
+
+/* ── Единый индикатор статуса трёх независимых процессов в шапке ──
    Перебор/Монитор/Авто-торговля управляются раздельно (3 разных кнопки
    Старт/Стоп), но статус виден всегда, на любой вкладке. */
 function _gsSet(pillId, dotId, txtId, state, text){
