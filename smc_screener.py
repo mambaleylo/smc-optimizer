@@ -213,7 +213,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.39"
+APP_VERSION  = "3.40"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -1576,13 +1576,15 @@ def run_screener():
     tp_p = screener_state["tp_pct"]
     risk = screener_state["risk_pct"]
     with screener_lock:
-        screener_state.update({"results":[],"done":False,"sym_index":0,"sym_total":0,"current_sym":"","active_workers":{}})
+        screener_state.update({"results":[],"done":False,"sym_index":0,"sym_total":0,"current_sym":"","active_workers":{},"sym_list":[]})
     olog("🔍 Получаем список монет...")
     syms = _fetch_all_symbols()
     if not syms:
         with screener_lock: screener_state["running"] = False
         olog("❌ Не удалось получить список монет"); return
-    with screener_lock: screener_state["sym_total"] = len(syms)
+    with screener_lock:
+        screener_state["sym_total"] = len(syms)
+        screener_state["sym_list"] = syms
     olog(f"✔ {len(syms)} монет, 50 циклов каждая, последовательно (как одиночный режим)")
     all_results = []
 
@@ -1817,6 +1819,7 @@ input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;p
     <h3>🔍 Скрининг всех монет</h3>
     <div id="screenerStatus" style="color:#555;font-size:11px;margin-bottom:8px;white-space:pre;line-height:1.6">—</div>
     <div class="prog-bar"><div class="prog-fill" id="screenerProg" style="width:0%"></div></div>
+    <div id="screenerSymList" style="margin-top:6px;font-size:10px;color:#888;line-height:1.8;word-break:break-all"></div>
     <div id="screenerTable" style="margin-top:8px"></div>
   </div>
 </div>
@@ -2706,6 +2709,19 @@ function pollScreener(){
     document.getElementById('screenerStatus').textContent=
       workerLines ? mainLine+String.fromCharCode(10)+workerLines : mainLine;
     renderScreenerResults(d.results||[]);
+    var symList=d.sym_list||[];
+    if(symList.length){
+      var doneSet={};
+      (d.results||[]).forEach(function(r){doneSet[r.sym]=true;});
+      var cur=d.current_sym;
+      var chips=symList.map(function(s){
+        var done=doneSet[s];
+        var active=s===cur&&d.running;
+        var col=done?'#4caf50':active?'#ff9800':'#555';
+        return '<span style="color:'+col+';margin-right:4px">'+s.replace('_USDT','')+'</span>';
+      }).join('');
+      document.getElementById('screenerSymList').innerHTML=chips;
+    }
     if(d.running){_screenerPoll=setTimeout(pollScreener,1000);}
     else{
       document.getElementById('btnStop').style.display='none';
