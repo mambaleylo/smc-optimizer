@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.48
+- v3.48: эко-режим теперь включается по стагнации, а не по номеру цикла.
+  Раньше: eco_mode = cycle > 300 — нагрузка всегда снижалась после 300 цикла,
+  даже если оптимизатор активно находил новые best-конфиги.
+  Теперь: eco_mode = no_improve >= 10 — эко включается только когда 10 циклов
+  подряд нет улучшения (реальная стагнация, жечь CPU бесполезно); при появлении
+  нового best автоматически выключается и поиск возвращается к полной скорости.
+  Лог: «🌡 стагнация N циклов — включён эко» и «⚡ новый best — эко выключен».
 SMC Optimizer v3.47
 - v3.47: автотюнинг весов эквалайзера fitness (coordinate descent + walk-forward).
   Кнопка «🎯 Автотюнинг» под слайдерами запускает _run_weight_tune() в фоне:
@@ -287,7 +295,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.47"
+APP_VERSION  = "3.48"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -1710,10 +1718,10 @@ def run_optimizer():
     # После ECO_AFTER_CYCLE циклов снижаем параллелизм (меньше воркеров в
     # батче за раз — CPU/NPU меньше греется) и добавляем паузы между батчами
     # и между циклами — цикл становится длиннее и менее "жадным" к ресурсам.
-    ECO_AFTER_CYCLE = 300
-    ECO_WORKERS_DIV = 2     # урезаем параллелизм в эко-режиме в N раз
-    ECO_BATCH_PAUSE = 0.4   # сек, пауза между пачками внутри цикла
-    ECO_CYCLE_PAUSE = 8.0   # сек, пауза между циклами (обычно паузы нет совсем)
+    ECO_AFTER_STAGNATION = 10   # циклов без улучшения → включить эко
+    ECO_WORKERS_DIV = 2         # урезаем параллелизм в эко-режиме в N раз
+    ECO_BATCH_PAUSE = 0.4       # сек, пауза между пачками внутри цикла
+    ECO_CYCLE_PAUSE = 8.0       # сек, пауза между циклами
     _eco_announced  = False
 
     with opt_lock:
@@ -1724,14 +1732,17 @@ def run_optimizer():
         while not _stop_flag.is_set():
             cycle += 1
             temp = TEMP_START * math.exp(-0.05 * cycle)
-            eco_mode = cycle > ECO_AFTER_CYCLE
+            eco_mode = no_improve >= ECO_AFTER_STAGNATION
             with opt_lock:
                 opt_state["cycle"] = cycle
                 opt_state["eco_mode"] = eco_mode
             if eco_mode and not _eco_announced:
                 _eco_announced = True
-                olog(f"🌡 Цикл {cycle}: включён режим слабой производительности "
-                     f"(телефон греется) — меньше параллелизма, паузы между циклами")
+                olog(f"🌡 Цикл {cycle}: стагнация {no_improve} циклов — включён эко-режим "
+                     f"(меньше параллелизма, паузы между циклами)")
+            elif not eco_mode and _eco_announced:
+                _eco_announced = False
+                olog(f"⚡ Цикл {cycle}: новый best — эко-режим выключен, возврат к полной скорости")
 
             # ── Защита от тупиков ──────────────────────────────────────────
             if no_improve >= RESTART_AFTER:
