@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 """
-SMC Optimizer v3.23
+SMC Optimizer v3.33
+- v3.33: скрининг "все монеты" возвращён в последовательный режим, по аналогии
+  с одиночным режимом — прогнали монету (50 циклов), переключились на
+  следующую. Раньше ThreadPoolExecutor(max_workers=4) гонял 4 монеты
+  одновременно: на Android (GIL) это не давало параллелизма для CPU-bound
+  _simulate(), а только взаимную конкуренцию за процессор — отсюда "медленно
+  делает 50 циклов" при scan all, хотя одиночный прогон быстрый. Теперь
+  run_screener — простой for по списку монет, без ThreadPool/as_completed.
+  active_workers всегда содержит ровно одну текущую монету (UI не менялся).
 - v3.23: fix вечного зависания на "инициализация..." при старте оптимизатора.
   Две причины: (1) _fetch_candles() при не-200 от Gate.io (например, контракт
   не существует — невалидный символ) просто спал 5с и повторял запрос с тем
@@ -185,7 +193,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.32"
+APP_VERSION  = "3.33"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -1484,54 +1492,39 @@ def run_screener():
         with screener_lock: screener_state["running"] = False
         olog("❌ Не удалось получить список монет"); return
     with screener_lock: screener_state["sym_total"] = len(syms)
-    N_SCR = 4  # параллельных монет (ThreadPool — без spawn, безопасно на Android)
-    olog(f"✔ {len(syms)} монет, 50 циклов каждая, {N_SCR} потока параллельно")
+    olog(f"✔ {len(syms)} монет, 50 циклов каждая, последовательно (как одиночный режим)")
     all_results = []
-    done_count  = [0]
 
-    def _run_sym(sym, idx):
-        if _screener_stop.is_set(): return None
+    for idx, sym in enumerate(syms, 1):
+        if _screener_stop.is_set():
+            break
+
         with screener_lock:
             screener_state["current_sym"] = sym
             screener_state["sym_index"]   = idx
-            screener_state["active_workers"][sym] = {"cycle": 0, "max_cycles": 50, "phase": "fetch"}
+            screener_state["active_workers"] = {sym: {"cycle": 0, "max_cycles": 50, "phase": "fetch"}}
 
         def _on_cycle(c, mx):
             with screener_lock:
-                screener_state["active_workers"][sym] = {"cycle": c, "max_cycles": mx, "phase": "opt"}
+                screener_state["active_workers"] = {sym: {"cycle": c, "max_cycles": mx, "phase": "opt"}}
 
         try:
-            return _run_one_sym_screener(sym, tf, days, sl_p, tp_p, risk, on_cycle=_on_cycle)
+            res = _run_one_sym_screener(sym, tf, days, sl_p, tp_p, risk, on_cycle=_on_cycle)
         except Exception:
-            return None
-        finally:
-            with screener_lock:
-                screener_state["active_workers"].pop(sym, None)
+            res = None
 
-    with ThreadPoolExecutor(max_workers=N_SCR) as pool:
-        fut_map = {pool.submit(_run_sym, sym, idx): sym for idx, sym in enumerate(syms, 1)}
-        for fut in _as_completed(fut_map):
-            if _screener_stop.is_set():
-                for f in fut_map:
-                    f.cancel()
-                break
-            done_count[0] += 1
-            sym = fut_map[fut]
-            olog(f"[{done_count[0]}/{len(syms)}] {sym} готово")
-            try:
-                res = fut.result()
-            except Exception:
-                res = None
-            if res:
-                all_results.append(res)
-                all_results.sort(key=lambda x: x["result"]["fitness"], reverse=True)
-                with screener_lock:
-                    screener_state["results"] = all_results[:20]
+        olog(f"[{idx}/{len(syms)}] {sym} готово")
+        if res:
+            all_results.append(res)
+            all_results.sort(key=lambda x: x["result"]["fitness"], reverse=True)
+            with screener_lock:
+                screener_state["results"] = all_results[:20]
 
     with screener_lock:
-        screener_state["results"] = all_results[:20]
-        screener_state["running"] = False
-        screener_state["done"]    = True
+        screener_state["results"]       = all_results[:20]
+        screener_state["active_workers"] = {}
+        screener_state["running"]       = False
+        screener_state["done"]          = True
     olog(f"✅ Скрининг завершён")
     if all_results:
         top3 = ", ".join(f"{r['sym']} WR={r['result']['winrate']}%" for r in all_results[:3])
