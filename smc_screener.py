@@ -213,7 +213,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.38"
+APP_VERSION  = "3.39"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -665,8 +665,13 @@ def _fetch_all_symbols():
         if r.status_code != 200: return []
         data = r.json()
         if not isinstance(data, list): return []
-        return sorted(c["name"] for c in data
-                      if isinstance(c, dict) and not c.get("in_delisting") and "_USDT" in c.get("name",""))
+        valid = [c for c in data
+                 if isinstance(c, dict) and not c.get("in_delisting") and "_USDT" in c.get("name","")]
+        # Сортируем по объёму за 24ч (volume_24h_quote — объём в USDT), берём топ-50
+        valid.sort(key=lambda c: float(c.get("volume_24h_quote") or c.get("volume_24h_settle") or 0), reverse=True)
+        top50 = [c["name"] for c in valid[:50]]
+        olog(f"Топ-50 монет по объёму: {top50}")
+        return top50
     except Exception as e:
         olog(f"fetch_all_symbols error: {e}")
         return []
