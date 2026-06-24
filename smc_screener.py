@@ -56,6 +56,10 @@ SMC Optimizer v3.23
   multiprocessing.set_start_method("spawn") в if __name__=="__main__" — fix падения
   fork на Android.
 
+- v3.27: фикс зависания скринера на fetch. _fetch_candles принимает _stop_event:
+  все sleep(5)/sleep(0.12) заменены на _stop_event.wait(timeout=...) — поток
+  мгновенно просыпается при нажатии Стоп. При ошибке Gate.io в режиме скринера
+  ждёт 1с вместо 5с. _run_one_sym_screener передаёт _screener_stop в fetch.
 - v3.26: фикс зависания скринера на старте. (1) olog использовал opt_lock —
   4 потока скринера конкурировали с оптимизатором за один лок, вызывая deadlock;
   введён отдельный _log_lock. (2) _run_sym теперь принимает idx и сразу пишет
@@ -170,7 +174,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.26"
+APP_VERSION  = "3.27"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -621,7 +625,7 @@ def _fetch_all_symbols():
         olog(f"fetch_all_symbols error: {e}")
         return []
 
-def _fetch_candles(symbol, tf, days):
+def _fetch_candles(symbol, tf, days, _stop_event=None):
     interval_sec = TF_SECONDS.get(tf, 3600)
     now   = int(time.time())
     since = now - days * 86400
@@ -631,6 +635,7 @@ def _fetch_candles(symbol, tf, days):
     fail_count = 0
     MAX_FAILS = 5
     while current_from < now:
+        if _stop_event and _stop_event.is_set(): return []
         try:
             r = requests.get(f"{GATE_API}/futures/usdt/candlesticks",
                 params={"contract":symbol,"interval":tf,"from":current_from,"limit":LIMIT},
@@ -642,7 +647,12 @@ def _fetch_candles(symbol, tf, days):
                     olog(f"❌ {symbol}: {fail_count} ошибок подряд — контракт не существует "
                          f"или недоступен на Gate.io Futures, прерываю загрузку")
                     break
-                time.sleep(5); continue
+                sleep_t = 1 if _stop_event else 5
+                if _stop_event:
+                    _stop_event.wait(timeout=sleep_t)
+                else:
+                    time.sleep(sleep_t)
+                continue
             fail_count = 0
             raw = r.json()
             if not raw: break
@@ -659,14 +669,22 @@ def _fetch_candles(symbol, tf, days):
             last_t = batch[-1]["t"]
             if last_t >= now - interval_sec: break
             current_from = last_t + interval_sec
-            time.sleep(0.12)
+            if _stop_event:
+                if _stop_event.is_set(): return []
+                _stop_event.wait(timeout=0.12)
+            else:
+                time.sleep(0.12)
         except Exception as e:
             fail_count += 1
             olog(f"fetch error: {e}")
             if fail_count >= MAX_FAILS:
                 olog(f"❌ {symbol}: {fail_count} ошибок подряд, прерываю загрузку")
                 break
-            time.sleep(5)
+            sleep_t = 1 if _stop_event else 5
+            if _stop_event:
+                _stop_event.wait(timeout=sleep_t)
+            else:
+                time.sleep(sleep_t)
     seen = set()
     result = []
     for c in sorted(all_candles, key=lambda x: x["t"]):
@@ -1369,7 +1387,7 @@ def run_optimizer():
     with opt_lock: opt_state["running"] = False
 
 def _run_one_sym_screener(sym, tf, days, sl_p, tp_p, risk, max_cycles=50, on_cycle=None):
-    candles = _fetch_candles(sym, tf, days)
+    candles = _fetch_candles(sym, tf, days, _stop_event=_screener_stop)
     if not candles or len(candles) < 100: return None
     best_params = _random_params()
     best_params["sl_pct"] = sl_p; best_params["tp_pct"] = tp_p
