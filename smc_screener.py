@@ -185,7 +185,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.29"
+APP_VERSION  = "3.30"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -2500,12 +2500,12 @@ function pollScreener(){
       return w.phase==='fetch'
         ? '  '+s+' — загрузка свечей...'
         : '  '+s+' — цикл '+w.cycle+'/'+w.max_cycles;
-    }).join('\n');
+    }).join(String.fromCharCode(10));
     var mainLine=d.running
       ? '['+d.sym_index+'/'+d.sym_total+'] завершено'
       : d.done?('\u2705 Готово — проверено '+d.sym_total+' монет'):'—';
     document.getElementById('screenerStatus').textContent=
-      workerLines ? mainLine+'\n'+workerLines : mainLine;
+      workerLines ? mainLine+String.fromCharCode(10)+workerLines : mainLine;
     renderScreenerResults(d.results||[]);
     if(d.running){_screenerPoll=setTimeout(pollScreener,1000);}
     else{
