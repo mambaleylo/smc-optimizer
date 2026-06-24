@@ -207,7 +207,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.34"
+APP_VERSION  = "3.35"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -1654,10 +1654,11 @@ input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;p
 .eq-bar{display:flex;justify-content:space-between;gap:2px;padding:4px 0 2px}
 .eq-ch{display:flex;flex-direction:column;align-items:center;gap:4px;flex:1;min-width:0}
 .eq-val{font-size:10px;color:#f0b800;font-weight:700;min-height:12px}
-.eq-slot{position:relative;height:88px;width:100%}
+.eq-slot{position:relative;height:88px;width:100%;cursor:pointer;touch-action:none}
 .eq-slider{position:absolute;top:50%;left:50%;width:80px;height:18px;
   transform:translate(-50%,-50%) rotate(-90deg);
-  -webkit-appearance:none;appearance:none;background:transparent;margin:0;cursor:pointer;touch-action:none}
+  -webkit-appearance:none;appearance:none;background:transparent;margin:0;
+  pointer-events:none}
 .eq-slider::-webkit-slider-runnable-track{height:5px;background:#222;border-radius:3px}
 .eq-slider::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;border-radius:50%;
   background:#f0b800;border:2px solid #0d0d0d;margin-top:-5.5px;box-shadow:0 0 4px rgba(240,184,0,.5)}
@@ -1742,26 +1743,22 @@ input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;p
     <h3>🎛 Эквалайзер fitness <span style="color:#555;font-size:10px;font-weight:400">(на ходу)</span></h3>
     <div class="eq-bar" id="eqBar">
       <div class="eq-ch"><div class="eq-val" id="eqVal_wr">1.00</div>
-        <div class="eq-slot"><input type="range" class="eq-slider" id="eq_wr" min="0" max="3" step="0.05" value="1" oninput="onEqInput('wr',this.value)"></div>
+        <div class="eq-slot" onmousedown="eqAdjust(event,'wr')" ontouchstart="eqAdjust(event,'wr')"><input type="range" class="eq-slider" id="eq_wr" min="0" max="3" step="0.05" value="1"></div>
         <div class="eq-lbl">WR</div></div>
       <div class="eq-ch"><div class="eq-val" id="eqVal_pf">1.00</div>
-        <div class="eq-slot"><input type="range" class="eq-slider" id="eq_pf" min="0" max="3" step="0.05" value="1" oninput="onEqInput('pf',this.value)"></div>
+        <div class="eq-slot" onmousedown="eqAdjust(event,'pf')" ontouchstart="eqAdjust(event,'pf')"><input type="range" class="eq-slider" id="eq_pf" min="0" max="3" step="0.05" value="1"></div>
         <div class="eq-lbl">PF</div></div>
       <div class="eq-ch"><div class="eq-val" id="eqVal_trades">1.00</div>
-        <div class="eq-slot"><input type="range" class="eq-slider" id="eq_trades" min="0" max="3" step="0.05" value="1" oninput="onEqInput('trades',this.value)"></div>
+        <div class="eq-slot" onmousedown="eqAdjust(event,'trades')" ontouchstart="eqAdjust(event,'trades')"><input type="range" class="eq-slider" id="eq_trades" min="0" max="3" step="0.05" value="1"></div>
         <div class="eq-lbl">Кол-во</div></div>
       <div class="eq-ch"><div class="eq-val" id="eqVal_rr">1.00</div>
-        <div class="eq-slot"><input type="range" class="eq-slider" id="eq_rr" min="0" max="3" step="0.05" value="1" oninput="onEqInput('rr',this.value)"></div>
+        <div class="eq-slot" onmousedown="eqAdjust(event,'rr')" ontouchstart="eqAdjust(event,'rr')"><input type="range" class="eq-slider" id="eq_rr" min="0" max="3" step="0.05" value="1"></div>
         <div class="eq-lbl">RR</div></div>
       <div class="eq-ch"><div class="eq-val" id="eqVal_dd">1.00</div>
-        <div class="eq-slot"><input type="range" class="eq-slider" id="eq_dd" min="0" max="3" step="0.05" value="1" oninput="onEqInput('dd',this.value)"></div>
+        <div class="eq-slot" onmousedown="eqAdjust(event,'dd')" ontouchstart="eqAdjust(event,'dd')"><input type="range" class="eq-slider" id="eq_dd" min="0" max="3" step="0.05" value="1"></div>
         <div class="eq-lbl">Просадка</div></div>
     </div>
     <button class="btn btn-sm" style="width:100%;margin-top:4px" onclick="resetEq()">↺ Сброс к 1.0</button>
-    <div style="font-size:10px;color:#555;margin-top:6px;line-height:1.5">
-      WR — винрейт · PF — профит-фактор · Кол-во — число сделок · RR — бонус TP/SL · Просадка — штраф за DD.<br>
-      Выше 1.0 — сильнее влияет на ранжирование в поиске, ниже — слабее. Меняется без остановки оптимизатора/скрининга.
-    </div>
   </div>
   <div class="card">
     <h3>Лучший конфиг</h3>
@@ -2110,8 +2107,24 @@ loadAlertCfg();
 
 var EQ_KEYS = ['wr','pf','trades','rr','dd'];
 var _eqDebounce = null;
-function onEqInput(k, val){
-  document.getElementById('eqVal_'+k).textContent = parseFloat(val).toFixed(2);
+function eqAdjust(e, k){
+  e.preventDefault();
+  var slot = e.currentTarget;
+  var rect = slot.getBoundingClientRect();
+  var clientY = (e.touches && e.touches.length) ? e.touches[0].clientY : e.clientY;
+  var clickY = clientY - rect.top;
+  var input = document.getElementById('eq_'+k);
+  var min = parseFloat(input.min), max = parseFloat(input.max), step = parseFloat(input.step);
+  var val = parseFloat(input.value);
+  var frac = (val - min) / (max - min);
+  var thumbY = (1 - frac) * rect.height;   // визуально верх слота = max, низ = min
+  var dir = (clickY < thumbY) ? 1 : -1;     // клик выше ползунка — +шаг, ниже — -шаг
+  var newVal = val + dir * step;
+  newVal = Math.max(min, Math.min(max, newVal));
+  newVal = Math.round(newVal / step) * step;
+  newVal = Math.round(newVal * 1000) / 1000;
+  input.value = newVal;
+  document.getElementById('eqVal_'+k).textContent = newVal.toFixed(2);
   clearTimeout(_eqDebounce);
   _eqDebounce = setTimeout(saveEqWeights, 250);
 }
@@ -3199,9 +3212,3 @@ if __name__ == "__main__":
     except RuntimeError:
         pass
     main()
-
-
-
-
-
-
