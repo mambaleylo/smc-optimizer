@@ -185,7 +185,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.30"
+APP_VERSION  = "3.31"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -1302,6 +1302,9 @@ def run_optimizer():
     cycle        = 0
     TEMP_START   = 1.0
     STEPS        = 60   # шагов локального поиска за старт
+    no_improve   = 0    # циклов без улучшения глобального best
+    SHAKE_AFTER  = 5    # мягкая встряска через N циклов без улучшения
+    RESTART_AFTER= 15   # полный рестарт через N циклов без улучшения
 
     with opt_lock:
         opt_state["top20"] = top20
@@ -1313,11 +1316,26 @@ def run_optimizer():
             temp = TEMP_START * math.exp(-0.05 * cycle)
             with opt_lock: opt_state["cycle"] = cycle
 
+            # ── Защита от тупиков ──────────────────────────────────────────
+            if no_improve >= RESTART_AFTER:
+                olog(f"🔄 Цикл {cycle}: {no_improve} циклов без улучшения — полный рестарт")
+                best_params = _random_params()
+                best_params["sl_pct"] = sl_p; best_params["tp_pct"] = tp_p
+                no_improve  = 0
+            elif no_improve >= SHAKE_AFTER:
+                strength = 0.5 + 0.05 * (no_improve - SHAKE_AFTER)  # 0.5→0.75
+                olog(f"⚡ Цикл {cycle}: встряска strength={strength:.2f} (стагнация {no_improve})")
+
             # Несколько стартовых точек за цикл
             starts = [_shake(best_params, 0.4) if best_params else _random_params(),
                       _random_params()]
             if len(top20) > 2:
                 starts.append(_shake(random.choice(top20)["params"], 0.3))
+            if no_improve >= SHAKE_AFTER:
+                strength = 0.5 + 0.05 * (no_improve - SHAKE_AFTER)
+                starts.append(_shake(best_params, min(strength, 0.9)))
+                if len(top20) > 0:
+                    starts.append(_shake(top20[0]["params"], min(strength, 0.9)))
 
             for start_p in starts:
                 if _stop_flag.is_set(): break
@@ -1366,6 +1384,7 @@ def run_optimizer():
                             best_fit    = nfit
                             best_params = nb_p
                             best_result = nb_r
+                            no_improve  = 0
                             with opt_lock:
                                 opt_state["best"] = {"params": nb_p, "result": nb_r}
                             olog(f"🏆 Цикл {cycle} шаг {steps_done} | "
@@ -1387,7 +1406,9 @@ def run_optimizer():
 
                     steps_done += batch_size
 
-            olog(f"Цикл {cycle} завершён | best fit={best_fit:.4f}")
+            # Счётчик стагнации
+            no_improve += 1
+            olog(f"Цикл {cycle} завершён | best fit={best_fit:.4f} | стагнация={no_improve}")
 
     finally:
         try:
