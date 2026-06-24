@@ -1,6 +1,22 @@
 #!/usr/bin/env python3
 """
-SMC Optimizer v3.20
+SMC Optimizer v3.22
+- v3.22: fix "мега-стоп / микро-тейк" на графике и нереалистичный бэктест
+  (WR 88%+, Return 10000%+). Причина: sl_price считался от низа/верха
+  Order Block (ob_lo/ob_hi), а tp_price — от entry_px на tp_pct; OB может
+  быть на десятки свечей назад и в разы дальше от текущей цены, чем tp_pct —
+  визуально SL улетал далеко, TP стоял рядом, а в бэктесте PnL всё равно
+  считался по configured sl_pct (как будто SL рядом), хотя реально цене
+  почти невозможно было его достать → завышенный WR и фейковая доходность.
+  Теперь sl_price = entry_px*(1∓sl_pct/100), симметрично с tp_price — OB
+  остаётся только триггером входа (возврат цены в зону), не якорем стопа.
+- v3.21: AMOLED-скринсейвер (по аналогии с WickFill) — кнопка ⬤ AMOLED в
+  шапке; при 15с простоя экран гасится чёрным оверлеем (время/дата +
+  WR/PF/Return/T лучшего конфига + статус оптимизатора/авто-трейда/алертов),
+  каждые 30с контент и кнопка-отпечаток выхода случайно мигрируют по экрану —
+  защита AMOLED-дисплея от выгорания пикселей. Подключены Fullscreen API
+  (прячет адресную строку) и Screen Wake Lock (не даёт ОС гасить экран);
+  состояние и восстановление после reload/auto-update — как в WickFill.
 - v3.20: прогресс цикла внутри монеты при скрининге. on_cycle колбэк передаётся
   в _run_one_sym_screener — current_cycle/max_cycles обновляются в screener_state
   на каждом цикле. UI уже показывал cycleStr (cycle N/50) — теперь заполняется.
@@ -130,7 +146,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.20"
+APP_VERSION  = "3.22"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -899,15 +915,17 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
 
         if sig_dir is not None and entry_candidate is not None:
             entry_px  = close_i
-            ob_hi = entry_candidate["hi"]
-            ob_lo = entry_candidate["lo"]
             if sig_dir == "long":
-                # SL — чуть ниже низа OB, TP — от entry вверх на tp_pct
-                sl_price = ob_lo * (1 - sl_pct/100)
+                # v3.22: SL и TP — чистый % от entry (как в WickFill), симметрично.
+                # OB используется только как триггер входа, не как якорь стопа —
+                # раньше sl_price считался от ob_lo (низа order block), который мог
+                # оказаться в десятках свечей назад и в разы дальше entry, чем tp_pct.
+                # На графике это выглядело как микро-тейк/мега-стоп, а в бэктесте
+                # SL почти не задевался → WR 88%+ и Return 10000%+ (нереалистично).
+                sl_price = entry_px * (1 - sl_pct/100)
                 tp_price = entry_px * (1 + tp_pct/100)
             else:
-                # SL — чуть выше верха OB, TP — от entry вниз на tp_pct
-                sl_price = ob_hi * (1 + sl_pct/100)
+                sl_price = entry_px * (1 + sl_pct/100)
                 tp_price = entry_px * (1 - tp_pct/100)
             in_trade  = True
             trade_dir = sig_dir
@@ -1452,13 +1470,53 @@ input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;p
 .cm .cl{font-size:10px;color:#555}.cm .cv{font-size:16px;font-weight:700;color:#e0e0e0}
 #chartCanvas{display:block;width:100%;cursor:grab;border:1px solid #222;border-radius:5px;background:#0a0a0a}
 #chartStatus{font-size:11px;color:#555;padding:4px 0}
+/* ── AMOLED screensaver ── */
+#amoledContent{
+  position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);
+  text-align:center;font-family:'JetBrains Mono',monospace,sans-serif;
+  color:rgba(255,255,255,.92);
+  transition:opacity 1.1s ease,color 1.1s ease,top 1.1s ease,left 1.1s ease;
+  user-select:none;pointer-events:none;white-space:nowrap;
+  min-width:260px;
+}
+#amoledContent .as-time{font-size:4.2rem;font-weight:500;letter-spacing:.04em;line-height:1;color:#f0b800}
+#amoledContent .as-date{font-size:1rem;margin-top:8px;opacity:.7;text-transform:capitalize}
+#amoledContent .as-divider{width:40px;height:1px;background:currentColor;opacity:.3;margin:16px auto}
+#amoledContent .as-row{display:flex;gap:22px;justify-content:center;flex-wrap:wrap}
+#amoledContent .as-row b{font-size:1.5rem;font-weight:600;display:block;color:inherit;line-height:1.1}
+#amoledContent .as-row span{font-size:.68rem;opacity:.55;display:block;margin-top:4px;letter-spacing:.1em;text-transform:uppercase}
+#amoledContent .as-status{margin-top:14px;font-size:.78rem;opacity:.6;letter-spacing:.05em}
+#amoledContent.night{color:rgba(255,255,255,.10)}
+#amoledContent.night .as-time{color:inherit;font-weight:400}
+@media (max-width:480px){
+  #amoledContent .as-time{font-size:3rem}
+  #amoledContent .as-row{gap:16px}
+  #amoledContent .as-row b{font-size:1.2rem}
+}
 </style></head><body>
+
+<div id="amoledOverlay" style="display:none;position:fixed;inset:0;background:#000;z-index:99999;">
+  <div id="amoledContent"></div>
+  <button id="amoledExitBtn" onclick="event.stopPropagation();toggleAmoled();" ontouchstart="event.stopPropagation();" ontouchend="event.stopPropagation();toggleAmoled();" title="Выйти из AMOLED" style="position:fixed;bottom:36px;right:32px;z-index:100000;background:rgba(255,255,255,0.06);border:1.5px solid rgba(255,255,255,0.13);border-radius:50%;width:54px;height:54px;display:flex;align-items:center;justify-content:center;cursor:pointer;backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);touch-action:manipulation;transition:background .2s,transform .1s,top .9s ease,left .9s ease;-webkit-tap-highlight-color:transparent;" onpointerdown="this.style.transform='scale(.9)';this.style.background='rgba(255,255,255,0.14)'" onpointerup="this.style.transform='';this.style.background='rgba(255,255,255,0.06)'" onpointerleave="this.style.transform='';this.style.background='rgba(255,255,255,0.06)'">
+    <svg width="30" height="30" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" style="opacity:.75;display:block">
+      <path d="M12 4a5 5 0 0 1 5 5" stroke="#fff" stroke-width="1.5" stroke-linecap="round"/>
+      <path d="M7 9a5 5 0 0 1 10 0" stroke="#fff" stroke-width="1.5" stroke-linecap="round"/>
+      <path d="M4.5 9a7.5 7.5 0 0 1 15 0c0 4-1 7.5-3 10" stroke="#fff" stroke-width="1.5" stroke-linecap="round"/>
+      <path d="M12 9c0 3.5-.8 6.5-2.5 9" stroke="#fff" stroke-width="1.5" stroke-linecap="round"/>
+      <path d="M12 9a3 3 0 0 1 3 3c0 2.5-.6 5-1.8 7" stroke="#fff" stroke-width="1.5" stroke-linecap="round"/>
+      <path d="M9 10.5a3 3 0 0 1 .5-1.5" stroke="#fff" stroke-width="1.5" stroke-linecap="round"/>
+      <path d="M6.5 12.5c0 3 .7 5.5 2 7.5" stroke="#fff" stroke-width="1.5" stroke-linecap="round"/>
+    </svg>
+  </button>
+</div>
+
 <div class="topbar">
   <h1>&#9889; SMC Optimizer</h1>
   <span class="ver" id="verBadge">v__VER__</span>
   <button class="btn btn-go" id="btnStart" onclick="startOpt()">&#9654; Старт</button>
   <button class="btn btn-stop" id="btnStop" onclick="stopOpt()" style="display:none">&#9632; Стоп</button>
   <span id="statusBadge" style="color:#555;font-size:11px">готов</span>
+  <button class="btn-sm" id="amoledBtn" onclick="toggleAmoled()" title="AMOLED режим — гасит экран через 15с неактивности, защита от выгорания пикселей">&#11044; AMOLED</button>
 </div>
 <div class="tabs">
   <button class="tab active" onclick="switchTab('opt',this)">Оптимизатор</button>
@@ -1921,6 +1979,7 @@ function poll(){
       var prevFit = _bestParams ? (_bestParams._fitness||0) : 0;
       p._fitness = r.fitness;
       _bestParams = p;
+      window._lastBestResult = r;
       // Авто-применение: каждый раз когда fitness улучшился И цикл >= 30
       if((d.cycle||0) >= 30 && r.fitness > prevFit){
         applyBestToChart();
@@ -2368,6 +2427,213 @@ document.addEventListener('visibilitychange',function(){
     }
   }
 });
+
+/* ── AMOLED-режим — гасит экран чёрным после простоя, защита от выгорания
+   пикселей на AMOLED-дисплеях (по аналогии с WickFill). Кнопка-отпечаток
+   выхода и сам блок с данными случайно мигрируют по экрану каждые 30с. ── */
+let _amoledOn = localStorage.getItem('smc_amoled')==='1';
+let _amoledTimer = null;
+const AMOLED_DELAY = 15000; // 15с без активности
+const AMOLED_SHIFT_INTERVAL = 30000; // сдвиг раз в 30с
+let _amoledShiftTimer = null;
+
+function _amoledIsNight(){
+  const h=new Date().getHours();
+  return (h>=22 || h<7); // приглушённый режим ночью, не слепит
+}
+
+function _amoledPanel(night){
+  const now=new Date();
+  const time=now.toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'});
+  const date=now.toLocaleDateString('ru-RU',{weekday:'long',day:'numeric',month:'long'});
+  let html=`<div class="as-time">${time}</div><div class="as-date">${date}</div>`;
+
+  const p=_bestParams, r=window._lastBestResult;
+  if(p && r){
+    const wrCol=night?'inherit':(r.winrate>=55?'#0f9':r.winrate>=45?'#f0b800':'#f45');
+    const retCol=night?'inherit':(r.total_return>=0?'#0f9':'#f45');
+    html+=`<div class="as-divider"></div>`+
+      `<div class="as-row">`+
+        `<div><b style="color:${wrCol}">${r.winrate}%</b><span>WR</span></div>`+
+        `<div><b>${r.profit_factor}</b><span>PF</span></div>`+
+        `<div><b style="color:${retCol}">${r.total_return}%</b><span>Return</span></div>`+
+        `<div><b>${r.trades}</b><span>T</span></div>`+
+      `</div>`;
+  }
+
+  let statusLine='';
+  const statusBadge=document.getElementById('statusBadge');
+  if(statusBadge && statusBadge.textContent && statusBadge.textContent!=='готов'){
+    statusLine+=statusBadge.textContent;
+  }
+  const atBadge=document.getElementById('atStatusBadge');
+  if(atBadge && atBadge.textContent.indexOf('активен')>=0){
+    statusLine+=(statusLine?' · ':'')+'🤖 '+atBadge.textContent.replace('🟢 ','');
+  }
+  const monBtn=document.getElementById('monBtn');
+  if(monBtn && monBtn.classList.contains('btn-go')){
+    statusLine+=(statusLine?' · ':'')+'🔔 алерты вкл';
+  }
+  if(statusLine) html+=`<div class="as-status">${statusLine}</div>`;
+
+  return html;
+}
+
+function _amoledExitBtnShift(){
+  // кнопка-отпечаток мигрирует по 4 углам экрана со случайным джиттером —
+  // сама неподвижная кнопка тоже источник локального выгорания AMOLED.
+  const btn=document.getElementById('amoledExitBtn');
+  if(!btn) return;
+  const w=window.innerWidth, h=window.innerHeight;
+  const size=54, m=28, jitter=40;
+  const corners=[
+    {top:m+Math.random()*jitter,        left:m+Math.random()*jitter},
+    {top:m+Math.random()*jitter,        left:w-size-m-Math.random()*jitter},
+    {top:h-size-m-Math.random()*jitter, left:m+Math.random()*jitter},
+    {top:h-size-m-Math.random()*jitter, left:w-size-m-Math.random()*jitter},
+  ];
+  const c=corners[Math.floor(Math.random()*corners.length)];
+  btn.style.top=Math.max(m,c.top)+'px';
+  btn.style.left=Math.max(m,c.left)+'px';
+  btn.style.bottom='auto';
+  btn.style.right='auto';
+}
+
+function _amoledShift(){
+  const ov=document.getElementById('amoledOverlay');
+  const content=document.getElementById('amoledContent');
+  if(!ov||!content||ov.style.display!=='block') return;
+  const night=_amoledIsNight();
+  content.style.opacity='0';
+  setTimeout(()=>{
+    if(ov.style.display!=='block') return; // уже разбудили — не дорисовываем
+    content.classList.toggle('night',night);
+    content.innerHTML=_amoledPanel(night);
+    // случайное смещение в пределах центральной зоны — защита от выгорания
+    content.style.top=(32+Math.random()*36)+'%';
+    content.style.left=(28+Math.random()*44)+'%';
+    content.style.opacity='1';
+    _amoledExitBtnShift();
+  },350);
+}
+
+function _amoledStartScreensaver(){
+  _amoledShift();
+  if(_amoledShiftTimer) clearInterval(_amoledShiftTimer);
+  _amoledShiftTimer=setInterval(_amoledShift, AMOLED_SHIFT_INTERVAL);
+}
+
+function _amoledStopScreensaver(){
+  if(_amoledShiftTimer){clearInterval(_amoledShiftTimer);_amoledShiftTimer=null;}
+  const content=document.getElementById('amoledContent');
+  if(content){content.style.opacity='0';content.innerHTML='';content.classList.remove('night');}
+}
+
+/* ── Screen Wake Lock — не даём ОС гасить экран пока AMOLED активен ── */
+let _wakeLock = null;
+async function _acquireWakeLock(){
+  if(!('wakeLock' in navigator)) return;
+  try{
+    _wakeLock = await navigator.wakeLock.request('screen');
+    _wakeLock.addEventListener('release', ()=>{ _wakeLock=null; });
+  }catch(e){ console.warn('WakeLock denied:', e); }
+}
+function _releaseWakeLock(){
+  if(_wakeLock){ _wakeLock.release(); _wakeLock=null; }
+}
+document.addEventListener('visibilitychange', ()=>{
+  if(document.visibilityState==='visible' && _amoledOn) _acquireWakeLock();
+});
+
+function _amoledBtnRefresh(){
+  const btn=document.getElementById('amoledBtn');
+  if(btn){
+    btn.style.background=_amoledOn?'#1a8f4a':'';
+    btn.style.color=_amoledOn?'#fff':'';
+  }
+}
+
+function _resetAmoledTimer(){
+  if(_amoledTimer){clearTimeout(_amoledTimer);_amoledTimer=null;}
+  if(_amoledOn){
+    _amoledTimer=setTimeout(()=>{
+      const ov=document.getElementById('amoledOverlay');
+      if(ov) ov.style.display='block';
+      _amoledStartScreensaver();
+    }, AMOLED_DELAY);
+  }
+}
+
+function _requestFS(){
+  const el=document.documentElement;
+  try{
+    if(el.requestFullscreen) el.requestFullscreen({navigationUI:'hide'});
+    else if(el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+  }catch(e){}
+}
+function _exitFS(){
+  try{
+    if(document.exitFullscreen) document.exitFullscreen();
+    else if(document.webkitExitFullscreen) document.webkitExitFullscreen();
+  }catch(e){}
+}
+// Если фуллскрин закрыли свайпом/кнопкой браузера — синхронизируем состояние
+document.addEventListener('fullscreenchange',()=>{
+  if(!document.fullscreenElement && _amoledOn){
+    _amoledOn=false;
+    localStorage.setItem('smc_amoled','0');
+    _amoledBtnRefresh();
+    _releaseWakeLock();
+    if(_amoledTimer){clearTimeout(_amoledTimer);_amoledTimer=null;}
+    const ov=document.getElementById('amoledOverlay');
+    if(ov) ov.style.display='none';
+    _amoledStopScreensaver();
+  }
+});
+
+function toggleAmoled(){
+  // Если AMOLED уже был включён (восстановлен из localStorage после
+  // reload/auto-update), а реального fullscreen нет — requestFullscreen()
+  // нельзя вызвать программно без жеста пользователя, поэтому кнопка
+  // сначала просто чинит fullscreen вместо выключения режима.
+  if(_amoledOn && !document.fullscreenElement){
+    _requestFS();
+    _acquireWakeLock();
+    _resetAmoledTimer();
+    return;
+  }
+  _amoledOn=!_amoledOn;
+  localStorage.setItem('smc_amoled', _amoledOn?'1':'0');
+  _amoledBtnRefresh();
+  if(_amoledOn){
+    _requestFS();
+    _acquireWakeLock();
+    _resetAmoledTimer();
+  } else {
+    _exitFS();
+    _releaseWakeLock();
+    if(_amoledTimer){clearTimeout(_amoledTimer);_amoledTimer=null;}
+    const ov=document.getElementById('amoledOverlay');
+    if(ov) ov.style.display='none';
+    _amoledStopScreensaver();
+  }
+}
+
+['click','touchstart','mousemove','keydown','scroll'].forEach(ev=>{
+  document.addEventListener(ev, ()=>{
+    if(_amoledOn && !document.fullscreenElement && (ev==='click'||ev==='touchstart'||ev==='keydown')){
+      _requestFS();
+    }
+    // пока оверлей показан — реагируем только на саму кнопку-отпечаток,
+    // у неё свой onclick→toggleAmoled() с event.stopPropagation()
+    const ov=document.getElementById('amoledOverlay');
+    if(ov && ov.style.display==='block') return;
+    _resetAmoledTimer();
+  }, {passive:true});
+});
+
+_amoledBtnRefresh();
+if(_amoledOn){ _acquireWakeLock(); _resetAmoledTimer(); }
 </script></body></html>
 """.replace("__VER__", APP_VERSION)
 
