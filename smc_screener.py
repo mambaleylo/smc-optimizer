@@ -185,7 +185,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.31"
+APP_VERSION  = "3.32"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -269,8 +269,8 @@ import hmac, hashlib, urllib.parse as _uparse
 auto_trade_lock  = threading.Lock()
 auto_trade_state = {
     "enabled": False, "symbol": None, "tf": None, "days": 30, "params": None,
-    "risk_pct": 2.0,          # риск на сделку %
-    "position_pct": 10.0,      # % депозита в маржу
+    "risk_pct": 10.0,         # риск на сделку %
+    "position_pct": 95.0,     # % депозита в маржу
     "position": None,         # текущая открытая позиция: {dir, entry, sl, tp, size, order_ids}
     "last_entry_ts": None,    # таймстемп свечи последнего сигнала
     "last_check": 0, "last_error": "",
@@ -1733,10 +1733,10 @@ input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;p
     </div>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:6px">
       <label style="color:#888;font-size:11px">Вход % депозита
-        <input id="atPosPct" type="number" value="10" min="1" max="100" step="1" style="width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;padding:4px 6px;border-radius:4px;font-size:11px">
+        <input id="atPosPct" type="number" value="95" min="1" max="100" step="1" style="width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;padding:4px 6px;border-radius:4px;font-size:11px">
       </label>
       <label style="color:#888;font-size:11px">Риск % (плечо=риск÷SL)
-        <input id="atRisk" type="number" value="2" min="0.5" max="20" step="0.5" style="width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;padding:4px 6px;border-radius:4px;font-size:11px">
+        <input id="atRisk" type="number" value="10" min="0.5" max="20" step="0.5" style="width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;padding:4px 6px;border-radius:4px;font-size:11px">
       </label>
     </div>
     <div style="display:flex;gap:6px;margin-bottom:6px">
@@ -1875,14 +1875,14 @@ function startAutoTrade(){
   var sym  = document.getElementById('cSym').value.trim()||'BTC_USDT';
   var tf   = document.getElementById('cTf').value;
   var days = parseInt(document.getElementById('cDays').value)||30;
-  var risk = parseFloat(document.getElementById('atRisk').value)||2.0;
+  var risk = parseFloat(document.getElementById('atRisk').value)||10.0;
   var params = Object.assign({}, _chartExtra, {
     swing_len: parseFloat(document.getElementById('cSwing').value),
     sl_pct:    parseFloat(document.getElementById('cSl').value),
     tp_pct:    parseFloat(document.getElementById('cTp').value)
   });
   fetch('/auto_trade_start',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({sym:sym,tf:tf,days:days,risk_pct:risk,position_pct:parseFloat(document.getElementById('atPosPct').value)||10,params:params})})
+    body:JSON.stringify({sym:sym,tf:tf,days:days,risk_pct:risk,position_pct:parseFloat(document.getElementById('atPosPct').value)||95,params:params})})
     .then(function(r){return r.json();})
     .then(function(d){
       if(d.ok){
