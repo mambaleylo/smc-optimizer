@@ -1,5 +1,26 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.45
+- v3.45: два фикса авто-торговли. (1) Гонка с автоприменением лучшего конфига
+  на график — оптимизатор после 30-го цикла сам вызывает applyBestToChart()
+  при новом best и тихо меняет swing/SL%/TP% в полях графика, при этом
+  авто-трейд работает с замороженным снимком этих же полей, снятым один раз
+  при нажатии "Запустить" (auto_trade_state["params"]). Поэтому entry/SL/TP
+  в Telegram-алерте могли не совпадать с тем, что нарисовано на графике —
+  это два независимых набора параметров, не баг рендера графика. Логика не
+  тронута (раздельность сохранена намеренно — см. v3.43), но в панель
+  авто-торговли добавлена строка "Параметры бота (зафиксированы при
+  запуске): swing=X SL=Y% TP=Z%" + жёлтое предупреждение, если текущие
+  значения в полях графика отличаются от того, чем реально торгует бот.
+  (2) _auto_trade_loop закрывал и переоткрывал текущую позицию на КАЖДУЮ
+  смену entry_ts последнего сигнала, даже если направление не менялось —
+  а entry_ts может сдвинуться просто из-за переразметки OB/swing на новой
+  свече без реального срабатывания TP/SL на бирже. Итог: бот закрывал
+  нормально идущую сделку и переоткрывал в том же направлении по новой
+  цене — чистый убыток на спреде/комиссии без выгоды. Теперь закрытие +
+  переоткрытие происходит только при смене направления (LONG↔SHORT); если
+  направление совпадает с уже открытой позицией — бот её не трогает,
+  исходные TP/SL ордера продолжают действовать сами.
 SMC Optimizer v3.44
 - v3.44: режим слабой производительности в оптимизаторе — после 300 циклов
   телефон ощутимо греется на долгих прогонах. Теперь при cycle > 300:
@@ -236,7 +257,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.44"
+APP_VERSION  = "3.45"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -632,25 +653,42 @@ def _auto_trade_loop():
                             sl_px         = sig["sl"]
                             tp_px         = sig["tp"]
 
-                            olog(f"🤖 Новый сигнал: {direction.upper()} "
-                                 f"entry={_fmt_px(entry_px)} sl={_fmt_px(sl_px)} tp={_fmt_px(tp_px)}")
-
-                            # Закрываем старую позицию (если есть)
                             existing = _gate_get_position(sym)
-                            if existing:
-                                olog(f"🔄 Закрываем старую позицию {existing['dir']} перед открытием новой")
-                                _gate_close_position(sym)
-                                time.sleep(1.0)
+                            if existing and existing["dir"] == direction:
+                                # entry_ts сменился (структура OB/swing
+                                # переразметилась на новой свече), но
+                                # направление совпадает с уже открытой на
+                                # бирже позицией — TP/SL ордера от исходного
+                                # входа продолжают действовать сами, реальная
+                                # позиция TP/SL ещё не задевала. Закрывать и
+                                # переоткрывать здесь только в убыток на
+                                # спреде/комиссии без всякой выгоды — не трогаем.
+                                olog(f"↔ Сигнал обновился ({direction.upper()} "
+                                     f"entry={_fmt_px(entry_px)}), но направление совпадает с "
+                                     f"открытой позицией {existing['dir'].upper()} — не трогаем, "
+                                     f"TP/SL уже выставлены")
+                                with auto_trade_lock:
+                                    auto_trade_state["last_entry_ts"] = entry_ts
+                            else:
+                                olog(f"🤖 Новый сигнал: {direction.upper()} "
+                                     f"entry={_fmt_px(entry_px)} sl={_fmt_px(sl_px)} tp={_fmt_px(tp_px)}")
 
-                            # Открываем новую
-                            with auto_trade_lock:
-                                pos_pct = auto_trade_state.get("position_pct", risk_pct)
-                            pos_info = _gate_open_position(
-                                sym, direction, entry_px, sl_px, tp_px, risk_pct,
-                                position_pct=pos_pct)
-                            with auto_trade_lock:
-                                auto_trade_state["position"] = pos_info
-                                auto_trade_state["last_entry_ts"] = entry_ts
+                                # Закрываем старую позицию (если есть, и направление другое)
+                                if existing:
+                                    olog(f"🔄 Закрываем старую позицию {existing['dir'].upper()} "
+                                         f"перед открытием новой ({direction.upper()})")
+                                    _gate_close_position(sym)
+                                    time.sleep(1.0)
+
+                                # Открываем новую
+                                with auto_trade_lock:
+                                    pos_pct = auto_trade_state.get("position_pct", risk_pct)
+                                pos_info = _gate_open_position(
+                                    sym, direction, entry_px, sl_px, tp_px, risk_pct,
+                                    position_pct=pos_pct)
+                                with auto_trade_lock:
+                                    auto_trade_state["position"] = pos_info
+                                    auto_trade_state["last_entry_ts"] = entry_ts
                         else:
                             # Тот же сигнал — просто логируем статус позиции
                             cur_price = _gate_get_price(sym)
@@ -2112,6 +2150,19 @@ function pollAtStatus(){
     if(!d.enabled){ _atActive=false; return; }
     var pos = d.position;
     var info = '';
+    var p = d.params || {};
+    if(p.swing_len!=null){
+      info += '<span style="color:#888">Параметры бота (зафиксированы при запуске): swing='
+        +p.swing_len+' SL='+p.sl_pct+'% TP='+p.tp_pct+'%</span><br>';
+      var curSw = parseFloat(document.getElementById('cSwing').value);
+      var curSl = parseFloat(document.getElementById('cSl').value);
+      var curTp = parseFloat(document.getElementById('cTp').value);
+      if(curSw!==p.swing_len || curSl!==p.sl_pct || curTp!==p.tp_pct){
+        info += '<span style="color:#f0b800">⚠ На графике сейчас другие параметры (swing='
+          +curSw+' SL='+curSl+'% TP='+curTp+'%) — бот их не видит и не использует, '
+          +'пока вы не перезапустите авто-трейд</span><br>';
+      }
+    }
     if(pos){
       var dirEmoji = pos.dir==='long'?'🟢':'🔴';
       info += dirEmoji+' <b>Позиция: '+pos.dir.toUpperCase()+'</b><br>';
