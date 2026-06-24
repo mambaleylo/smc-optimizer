@@ -56,6 +56,11 @@ SMC Optimizer v3.23
   multiprocessing.set_start_method("spawn") в if __name__=="__main__" — fix падения
   fork на Android.
 
+- v3.29: фикс зависания интерфейса. (1) /scan_all_status делал dict() —
+  мелкая копия, active_workers мутировался потоком во время json.dumps →
+  исключение в HTTP-обработчике. Теперь deep copy под локом. (2) do_GET
+  обёрнут в try/except — раньше любое исключение в обработчике убивало
+  поток сервера и всё переставало работать.
 - v3.28: статус каждого потока скринера в реальном времени. screener_state
   добавлен active_workers {sym: {cycle, max_cycles, phase}} — каждый из 4
   потоков пишет свою фазу (fetch/opt) и номер цикла. pollScreener обновляется
@@ -180,7 +185,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.28"
+APP_VERSION  = "3.29"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -2769,6 +2774,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+      try:
         if self.path == "/" or self.path == "/index.html":
             body = HTML.encode()
             self.send_response(200)
@@ -2831,9 +2837,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json({"tg_token": TG_TOKEN, "tg_chat": TG_CHAT, "ntfy_url": NTFY_URL})
         elif self.path == "/scan_all_status":
             with screener_lock:
-                self._json(dict(screener_state))
+                snap = dict(screener_state)
+                snap["active_workers"] = {k: dict(v) for k, v in screener_state["active_workers"].items()}
+            self._json(snap)
         else:
             self.send_response(404); self.end_headers()
+      except Exception as e:
+        try:
+            self.send_response(500); self.end_headers()
+        except Exception: pass
 
     def do_POST(self):
         global _opt_thread, _screener_thread
