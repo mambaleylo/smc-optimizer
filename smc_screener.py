@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-SMC Optimizer v3.36
+SMC Optimizer v3.37
+- v3.37: метка PnL% на графике у точки выхода каждой сделки — показывает
+  процент от депо с учётом плеча (+X% зелёным при TP, -X% красным при SL).
+  dep_pct передаётся в signals при _collect=True.
 - v3.36: колонка "$100→$X" в топ-20 — показывает итоговый баланс при старте $100
   (Return% / 10, т.к. риск=10% от депо на сделку). Заменяет "Return%" на
   наглядный "$100→$X" в обеих таблицах (оптимизатор и скринер).
@@ -210,7 +213,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.36"
+APP_VERSION  = "3.37"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -937,8 +940,10 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
                     trades.append({"dir":"long","entry":entry_px,"exit":sl_price,
                                    "pnl_pct":-sl_pct,"pnl":pnl,"win":False,"i":i})
                     if _collect:
+                        _lev = max(1, round(risk_pct / sl_pct))
                         signals.append({"dir":"long","entry_i":entry_i,"exit_i":i,
-                                        "entry":entry_px,"tp":tp_price,"sl":sl_price,"win":False})
+                                        "entry":entry_px,"tp":tp_price,"sl":sl_price,"win":False,
+                                        "dep_pct": round(-risk_pct, 1), "lev": _lev})
                     in_trade = False
                 elif tp_hit:
                     rr = tp_pct / sl_pct
@@ -947,8 +952,10 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
                     trades.append({"dir":"long","entry":entry_px,"exit":tp_price,
                                    "pnl_pct":tp_pct,"pnl":pnl,"win":True,"i":i})
                     if _collect:
+                        _lev = max(1, round(risk_pct / sl_pct))
                         signals.append({"dir":"long","entry_i":entry_i,"exit_i":i,
-                                        "entry":entry_px,"tp":tp_price,"sl":sl_price,"win":True})
+                                        "entry":entry_px,"tp":tp_price,"sl":sl_price,"win":True,
+                                        "dep_pct": round(risk_pct * (tp_pct/sl_pct), 1), "lev": _lev})
                     in_trade = False
             else:  # short
                 sl_hit = (high_i >= sl_price)
@@ -962,8 +969,10 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
                     trades.append({"dir":"short","entry":entry_px,"exit":sl_price,
                                    "pnl_pct":-sl_pct,"pnl":pnl,"win":False,"i":i})
                     if _collect:
+                        _lev = max(1, round(risk_pct / sl_pct))
                         signals.append({"dir":"short","entry_i":entry_i,"exit_i":i,
-                                        "entry":entry_px,"tp":tp_price,"sl":sl_price,"win":False})
+                                        "entry":entry_px,"tp":tp_price,"sl":sl_price,"win":False,
+                                        "dep_pct": round(-risk_pct, 1), "lev": _lev})
                     in_trade = False
                 elif tp_hit:
                     rr = tp_pct / sl_pct
@@ -972,8 +981,10 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
                     trades.append({"dir":"short","entry":entry_px,"exit":tp_price,
                                    "pnl_pct":tp_pct,"pnl":pnl,"win":True,"i":i})
                     if _collect:
+                        _lev = max(1, round(risk_pct / sl_pct))
                         signals.append({"dir":"short","entry_i":entry_i,"exit_i":i,
-                                        "entry":entry_px,"tp":tp_price,"sl":sl_price,"win":True})
+                                        "entry":entry_px,"tp":tp_price,"sl":sl_price,"win":True,
+                                        "dep_pct": round(risk_pct * (tp_pct/sl_pct), 1), "lev": _lev})
                     in_trade = False
             if in_trade: continue
 
@@ -2502,10 +2513,21 @@ function drawChart(){
       ctx2.beginPath();ctx2.moveTo(xe,ys);ctx2.lineTo(xe2,ys);ctx2.stroke();
       ctx2.setLineDash([]);
     }
-    // Точка выхода
+    // Точка выхода + метка PnL
     if(sg.exit_i!==undefined&&sg.exit_i>=s&&sg.exit_i<=e){
+      var exitY=toY(sg.win?sg.tp:sg.sl);
+      var exitX=toX(sg.exit_i);
       ctx2.fillStyle=sg.win?clrTP:clrSL;
-      ctx2.beginPath();ctx2.arc(toX(sg.exit_i),toY(sg.win?sg.tp:sg.sl),3.5,0,Math.PI*2);ctx2.fill();
+      ctx2.beginPath();ctx2.arc(exitX,exitY,3.5,0,Math.PI*2);ctx2.fill();
+      if(sg.dep_pct!==undefined){
+        var lbl=(sg.dep_pct>0?'+':'')+sg.dep_pct+'%';
+        ctx2.font='bold 9px monospace';
+        ctx2.fillStyle=sg.win?clrTP:clrSL;
+        ctx2.textAlign= exitX > W*0.85 ? 'right' : 'left';
+        var lx = exitX > W*0.85 ? exitX-6 : exitX+6;
+        var ly = sg.win ? exitY-5 : exitY+12;
+        ctx2.fillText(lbl,lx,ly);
+      }
     }
   });
   // ── Стрелки входа — маленькие, только последние N ────────────────────────
