@@ -1,6 +1,18 @@
 #!/usr/bin/env python3
 """
-SMC Optimizer v3.46
+SMC Optimizer v3.47
+- v3.47: автотюнинг весов эквалайзера fitness (coordinate descent + walk-forward).
+  Кнопка «🎯 Автотюнинг» под слайдерами запускает _run_weight_tune() в фоне:
+  (1) история делится на N train/test окон (по умолчанию 4 окна, train≈60%,
+  test≈40%); (2) для каждого из 5 весов последовательно перебирается сетка
+  [0.5, 1.0, 1.5, 2.0, 3.0]; (3) для каждого значения запускается мини-BH
+  (20 циклов) на train-кусках и считается средний total_return на соответствующих
+  test-кусках (OOS — честная оценка без оверфита); (4) выбирается значение с
+  лучшим средним OOS; (5) passes=2 прохода по всем весам для сходимости.
+  Итоговые веса применяются глобально к FITNESS_WEIGHTS, сохраняются в
+  ~/.smc_fitness_weights.json и отображаются на слайдерах без перезапуска.
+  Алерт в Telegram/ntfy по завершении. Прогресс и лог видны под кнопкой.
+  Эндпоинты: GET /weight_tune_status, POST /weight_tune_start, POST /weight_tune_stop.
 - v3.46: опциональный авто-синк параметров авто-трейда с оптимизатором.
   Чекбокс "🔁 Автоматически подхватывать новый лучший конфиг" в панели
   авто-торговли (выключен по умолчанию). Если включён: при каждом новом
@@ -275,7 +287,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.46"
+APP_VERSION  = "3.47"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -326,6 +338,19 @@ _log_lock  = threading.Lock()  # отдельный лок для olog — не 
 # При всех весах=1.0 формула математически совпадает с исходной (см. _simulate).
 fitness_w_lock  = threading.Lock()
 FITNESS_WEIGHTS = {"wr": 1.0, "pf": 1.0, "trades": 1.0, "rr": 1.0, "dd": 1.0}
+
+# ─── Автотюнинг весов (coordinate descent + walk-forward) ──────────────────
+weight_tune_lock  = threading.Lock()
+weight_tune_state = {
+    "running": False, "logs": [],
+    "stage": "",      # текущий этап: "WR weight: 0.5...", "done" и т.п.
+    "best_weights": None,  # итоговые веса после тюнинга
+    "n_windows": 4,   # кол-во train/test пар
+    "bh_cycles": 20,  # BH-циклов на каждый train-кусок
+    "passes": 2,      # проходов по всем 5 весам
+}
+_weight_tune_stop   = threading.Event()
+_weight_tune_thread = None
 opt_state  = {
     "running": False, "logs": [], "best": None, "top20": [],
     "cycle": 0, "trials": 0, "progress": 0,
@@ -1365,6 +1390,201 @@ def _save_fitness_weights():
     except Exception as e:
         olog(f"⚠ Не удалось сохранить {FITNESS_W_PATH}: {e}")
 
+def _wtlog(msg):
+    """Лог в weight_tune_state."""
+    with weight_tune_lock:
+        weight_tune_state["logs"].append({"ts": time.strftime("%H:%M:%S"), "msg": msg})
+        if len(weight_tune_state["logs"]) > 200:
+            weight_tune_state["logs"] = weight_tune_state["logs"][-150:]
+
+def _wt_bh_on_slice(candles_slice, sl_p, tp_p, risk, fw, cycles=20):
+    """Мини-BH на одном куске свечей с заданными весами fw.
+    Возвращает лучший params + result."""
+    best_p = _random_params()
+    best_p["sl_pct"] = sl_p; best_p["tp_pct"] = tp_p
+    best_r = _simulate(candles_slice, best_p, sl_pct=sl_p, tp_pct=tp_p,
+                       risk_pct=risk, fitness_weights=fw)
+    best_f = best_r["fitness"] if best_r else 0.0
+    for cyc in range(1, cycles + 1):
+        if _weight_tune_stop.is_set():
+            break
+        temp = 1.0 * math.exp(-0.05 * cyc)
+        for start_p in [_shake(best_p, 0.4) if best_p else _random_params(),
+                         _random_params()]:
+            cur_p, cur_r = start_p, _simulate(candles_slice, start_p, risk_pct=risk,
+                                               fitness_weights=fw)
+            cur_f = cur_r["fitness"] if cur_r else 0.0
+            for _ in range(30):
+                if _weight_tune_stop.is_set(): break
+                nb_p = _neighbour(cur_p)
+                nb_r = _simulate(candles_slice, nb_p, risk_pct=risk, fitness_weights=fw)
+                if not nb_r: continue
+                nfit = nb_r["fitness"]
+                delta = nfit - cur_f
+                if delta > 0 or random.random() < math.exp(delta / max(temp, 0.001)):
+                    cur_p, cur_f, cur_r = nb_p, nfit, nb_r
+                if nfit > best_f:
+                    best_f, best_p, best_r = nfit, nb_p, nb_r
+    return best_p, best_r
+
+def _wt_eval_weight(key, val, current_fw, windows, sl_p, tp_p, risk, bh_cycles):
+    """Для одного значения одного веса: считает средний OOS-результат по всем окнам.
+    Возвращает средний total_return на test-кусках (честная оценка OOS)."""
+    fw = dict(current_fw)
+    fw[key] = val
+    oos_returns = []
+    for (train_c, test_c) in windows:
+        if _weight_tune_stop.is_set(): return None
+        best_p, _ = _wt_bh_on_slice(train_c, sl_p, tp_p, risk, fw, bh_cycles)
+        if best_p is None: continue
+        test_r = _simulate(test_c, best_p, sl_pct=sl_p, tp_pct=tp_p, risk_pct=risk)
+        if test_r and test_r.get("trades", 0) >= 3:
+            oos_returns.append(test_r.get("total_return", 0.0))
+    if not oos_returns:
+        return None
+    return sum(oos_returns) / len(oos_returns)
+
+def _run_weight_tune():
+    """Coordinate descent + walk-forward автотюнинг 5 весов эквалайзера.
+    Алгоритм:
+      1. Делим историю на N окон (train 60% + test 40% со сдвигом).
+      2. Для каждого веса перебираем сетку [0.5,1.0,1.5,2.0,3.0].
+      3. Для каждого значения: BH на train → оцениваем на test (OOS).
+      4. Выбираем значение с лучшим средним OOS total_return.
+      5. Зафиксированные веса применяем глобально и сохраняем.
+      6. Повторяем passes раз (сходимость).
+    """
+    global _weight_tune_thread
+    with weight_tune_lock:
+        weight_tune_state["running"] = True
+        weight_tune_state["logs"] = []
+        weight_tune_state["best_weights"] = None
+
+    try:
+        # Читаем текущие параметры оптимизатора для SL/TP/risk
+        with opt_lock:
+            sym  = opt_state["symbol"]
+            tf   = opt_state["tf"]
+            days = int(opt_state["days"])
+            sl_p = float(opt_state["sl_pct"])
+            tp_p = float(opt_state["tp_pct"])
+            risk = float(opt_state["risk_pct"])
+        with weight_tune_lock:
+            n_windows  = weight_tune_state["n_windows"]
+            bh_cycles  = weight_tune_state["bh_cycles"]
+            passes     = weight_tune_state["passes"]
+
+        _wtlog(f"▶ Автотюнинг весов | {sym} {tf} {days}д | {n_windows} окон, {bh_cycles} BH-цикл/окно, {passes} прохода")
+
+        # Загружаем свечи
+        candles = _fetch_candles(sym, tf, days)
+        if not candles or len(candles) < 200:
+            _wtlog("❌ Мало свечей (нужно ≥200), остановка")
+            with weight_tune_lock: weight_tune_state["running"] = False
+            return
+
+        _wtlog(f"✔ Загружено {len(candles)} свечей")
+
+        # Строим train/test окна
+        # Каждое окно: train = 60% общей длины, test = следующие 40%/(n_windows-1) свечей
+        # Окна сдвигаем вправо так, чтобы покрыть всю историю
+        total = len(candles)
+        train_ratio = 0.6
+        train_size  = int(total * train_ratio)
+        remain_size = total - train_size   # для test-кусков
+        window_step = max(1, remain_size // n_windows)
+        test_size   = window_step          # размер одного test-куска
+
+        windows = []
+        for i in range(n_windows):
+            t_start = i * window_step
+            t_end   = t_start + train_size
+            v_start = t_end
+            v_end   = min(v_start + test_size, total)
+            if v_end <= v_start or t_end > total:
+                break
+            windows.append((candles[t_start:t_end], candles[v_start:v_end]))
+
+        if not windows:
+            _wtlog("❌ Не удалось построить окна, остановка")
+            with weight_tune_lock: weight_tune_state["running"] = False
+            return
+
+        _wtlog(f"✔ Построено {len(windows)} train/test окон "
+               f"(train≈{len(windows[0][0])} свечей, test≈{len(windows[0][1])} свечей)")
+
+        # Стартовые веса — текущие из глобального эквалайзера
+        with fitness_w_lock:
+            current_fw = dict(FITNESS_WEIGHTS)
+
+        GRID = [0.5, 1.0, 1.5, 2.0, 3.0]
+        WR_KEYS = ["wr", "pf", "trades", "rr", "dd"]
+        WR_NAMES = {"wr": "WinRate", "pf": "ProfitFactor", "trades": "Кол-во сделок",
+                    "rr": "RR", "dd": "Просадка"}
+
+        for pass_i in range(1, passes + 1):
+            if _weight_tune_stop.is_set(): break
+            _wtlog(f"━━ Проход {pass_i}/{passes} ━━")
+            for key in WR_KEYS:
+                if _weight_tune_stop.is_set(): break
+                _wtlog(f"  🔍 {WR_NAMES[key]} (текущий={current_fw[key]:.2f}): "
+                       f"перебираем {GRID}...")
+                with weight_tune_lock:
+                    weight_tune_state["stage"] = f"Проход {pass_i}: {WR_NAMES[key]}"
+
+                best_val  = current_fw[key]
+                best_oos  = None
+
+                for val in GRID:
+                    if _weight_tune_stop.is_set(): break
+                    _wtlog(f"    {WR_NAMES[key]}={val}: оцениваем OOS...")
+                    oos = _wt_eval_weight(key, val, current_fw, windows,
+                                          sl_p, tp_p, risk, bh_cycles)
+                    if oos is None:
+                        _wtlog(f"    {WR_NAMES[key]}={val}: ❌ мало сделок на тесте, пропуск")
+                        continue
+                    _wtlog(f"    {WR_NAMES[key]}={val}: OOS avg return={oos:.2f}%")
+                    if best_oos is None or oos > best_oos:
+                        best_oos = oos
+                        best_val = val
+
+                if best_oos is not None:
+                    old_val = current_fw[key]
+                    current_fw[key] = best_val
+                    _wtlog(f"  ✅ {WR_NAMES[key]}: {old_val:.2f} → {best_val:.2f} "
+                           f"(OOS={best_oos:.2f}%)")
+                else:
+                    _wtlog(f"  ⚠ {WR_NAMES[key]}: не удалось выбрать (нет данных), оставляем {current_fw[key]:.2f}")
+
+        if _weight_tune_stop.is_set():
+            _wtlog("⏹ Прервано пользователем")
+            with weight_tune_lock:
+                weight_tune_state["running"] = False
+                weight_tune_state["stage"]   = "остановлено"
+            return
+
+        # Применяем найденные веса глобально
+        with fitness_w_lock:
+            for k in FITNESS_WEIGHTS:
+                FITNESS_WEIGHTS[k] = current_fw.get(k, 1.0)
+        _save_fitness_weights()
+
+        summary = " | ".join(f"{WR_NAMES[k]}={current_fw[k]:.2f}" for k in WR_KEYS)
+        _wtlog(f"🏆 Автотюнинг завершён: {summary}")
+        _wtlog("✔ Веса применены к эквалайзеру и сохранены")
+        _send_alert(f"🎛 SMC Автотюнинг весов завершён\n{summary}")
+
+        with weight_tune_lock:
+            weight_tune_state["best_weights"] = dict(current_fw)
+            weight_tune_state["stage"] = "done"
+
+    except Exception as e:
+        _wtlog(f"❌ Ошибка автотюнинга: {e}")
+    finally:
+        with weight_tune_lock:
+            weight_tune_state["running"] = False
+
+
 def _test_alert():
     """Шлёт тестовое уведомление и честно проверяет, дошло ли оно."""
     if not ((TG_TOKEN and TG_CHAT) or NTFY_URL):
@@ -1917,6 +2137,12 @@ input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;p
         <div class="eq-lbl">Просадка</div></div>
     </div>
     <button class="btn btn-sm" style="width:100%;margin-top:4px" onclick="resetEq()">↺ Сброс к 1.0</button>
+    <div style="display:flex;gap:6px;margin-top:6px">
+      <button class="btn btn-go" id="btnWtStart" style="flex:1;font-size:11px" onclick="wtStart()">🎯 Автотюнинг</button>
+      <button class="btn btn-stop" id="btnWtStop" style="flex:1;font-size:11px;display:none" onclick="wtStop()">⏹ Стоп</button>
+    </div>
+    <div id="wtStatus" style="font-size:10px;color:#888;margin-top:4px;min-height:14px"></div>
+    <div id="wtLog" style="font-size:9.5px;color:#aaa;max-height:90px;overflow-y:auto;margin-top:3px;display:none"></div>
   </div>
   <div class="card">
     <h3>Лучший конфиг</h3>
@@ -2342,7 +2568,61 @@ function loadEqWeights(){
 }
 loadEqWeights();
 
-/* ── Единый индикатор статуса трёх независимых процессов в шапке ──
+/* ── Автотюнинг весов ── */
+var _wtPollTimer = null;
+var _wtLogLen = 0;
+function wtStart(){
+  fetch('/weight_tune_start',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({n_windows:4,bh_cycles:20,passes:2})}).then(function(r){return r.json();}).then(function(d){
+    if(!d.ok){alert('Ошибка: '+(d.error||'?')); return;}
+    document.getElementById('btnWtStart').style.display='none';
+    document.getElementById('btnWtStop').style.display='';
+    document.getElementById('wtLog').style.display='';
+    _wtLogLen=0;
+    if(_wtPollTimer) clearInterval(_wtPollTimer);
+    _wtPollTimer=setInterval(wtPoll,2000);
+  }).catch(function(){});
+}
+function wtStop(){
+  fetch('/weight_tune_stop',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}).catch(function(){});
+}
+function wtPoll(){
+  fetch('/weight_tune_status').then(function(r){return r.json();}).then(function(d){
+    var status=document.getElementById('wtStatus');
+    var logEl=document.getElementById('wtLog');
+    if(d.running){
+      status.textContent='⏳ '+( d.stage||'...');
+      status.style.color='#f0b800';
+    } else if(d.stage==='done'){
+      status.textContent='✅ Готово — веса применены';
+      status.style.color='#4caf50';
+      document.getElementById('btnWtStart').style.display='';
+      document.getElementById('btnWtStop').style.display='none';
+      if(_wtPollTimer){clearInterval(_wtPollTimer);_wtPollTimer=null;}
+      loadEqWeights(); // обновить слайдеры
+    } else if(d.stage==='остановлено'){
+      status.textContent='⏹ Остановлено';
+      status.style.color='#888';
+      document.getElementById('btnWtStart').style.display='';
+      document.getElementById('btnWtStop').style.display='none';
+      if(_wtPollTimer){clearInterval(_wtPollTimer);_wtPollTimer=null;}
+    } else if(!d.running && _wtLogLen>0){
+      document.getElementById('btnWtStart').style.display='';
+      document.getElementById('btnWtStop').style.display='none';
+      if(_wtPollTimer){clearInterval(_wtPollTimer);_wtPollTimer=null;}
+    }
+    if(d.logs && d.logs.length>_wtLogLen){
+      var newLines=d.logs.slice(_wtLogLen);
+      _wtLogLen=d.logs.length;
+      newLines.forEach(function(l){
+        var div=document.createElement('div');
+        div.textContent=l.ts+' '+l.msg;
+        logEl.appendChild(div);
+      });
+      logEl.scrollTop=logEl.scrollHeight;
+    }
+  }).catch(function(){});
+} ──
    Перебор/Монитор/Авто-торговля управляются раздельно (3 разных кнопки
    Старт/Стоп), но статус виден всегда, на любой вкладке. */
 function _gsSet(pillId, dotId, txtId, state, text){
@@ -3253,6 +3533,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif self.path == "/fitness_weights":
             with fitness_w_lock:
                 self._json(dict(FITNESS_WEIGHTS))
+        elif self.path == "/weight_tune_status":
+            with weight_tune_lock:
+                snap = dict(weight_tune_state)
+                snap["logs"] = list(weight_tune_state["logs"])
+            self._json(snap)
         elif self.path == "/scan_all_status":
             with screener_lock:
                 snap = dict(screener_state)
@@ -3374,6 +3659,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 snap = dict(FITNESS_WEIGHTS)
             _save_fitness_weights()
             self._json({"ok": True, "weights": snap})
+
+        elif self.path == "/weight_tune_start":
+            global _weight_tune_thread
+            with weight_tune_lock:
+                if weight_tune_state["running"]:
+                    self._json({"ok": False, "error": "уже запущен"})
+                    return
+                if "n_windows" in body:
+                    try: weight_tune_state["n_windows"] = max(2, min(8, int(body["n_windows"])))
+                    except: pass
+                if "bh_cycles" in body:
+                    try: weight_tune_state["bh_cycles"] = max(5, min(50, int(body["bh_cycles"])))
+                    except: pass
+                if "passes" in body:
+                    try: weight_tune_state["passes"] = max(1, min(4, int(body["passes"])))
+                    except: pass
+            _weight_tune_stop.clear()
+            _weight_tune_thread = threading.Thread(target=_run_weight_tune, daemon=True)
+            _weight_tune_thread.start()
+            self._json({"ok": True})
+
+        elif self.path == "/weight_tune_stop":
+            _weight_tune_stop.set()
+            self._json({"ok": True})
 
         elif self.path == "/alert_test":
             ok, err = _test_alert()
