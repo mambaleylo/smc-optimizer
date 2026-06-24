@@ -1,6 +1,20 @@
 #!/usr/bin/env python3
 """
-SMC Optimizer v3.33
+SMC Optimizer v3.34
+- v3.34: эквалайзер весов fitness — 5 вертикальных слайдеров (как на
+  аудио-эквалайзере) в сайдбаре: WR, PF, Кол-во сделок, RR, Просадка.
+  Формула fitness переписана как взвешенная лог-сумма множителей
+  (log_fit = Σ wᵢ·log(factorᵢ), fitness = exp(log_fit)) — при всех весах=1.0
+  даёт точно тот же результат, что прежняя формула-произведение, но позволяет
+  тюнить вклад каждого множителя в ранжирование конфигов отдельно. Например,
+  если в найденном конфиге мало сделок — выкручиваешь "Кол-во" выше 1.0, и
+  поиск начинает сильнее предпочитать конфиги с бо́льшим числом сделок.
+  Эндпоинты GET/POST /fitness_weights, сохранение в ~/.smc_fitness_weights.json.
+  Применяется на ходу без остановки: одиночный оптимизатор и скрининг
+  (main-процесс) читают актуальные веса при каждом вызове _simulate(); для
+  ProcessPoolExecutor (соседи в локальном поиске считаются в отдельных
+  процессах — своя память) свежий снэпшот весов передаётся явно при каждой
+  пачке pool.submit(), а не один раз при старте пула.
 - v3.33: скрининг "все монеты" возвращён в последовательный режим, по аналогии
   с одиночным режимом — прогнали монету (50 циклов), переключились на
   следующую. Раньше ThreadPoolExecutor(max_workers=4) гонял 4 монеты
@@ -193,7 +207,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.33"
+APP_VERSION  = "3.34"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -207,6 +221,7 @@ TG_TOKEN     = os.environ.get("TG_TOKEN", "")
 TG_CHAT      = os.environ.get("TG_CHAT", "")
 NTFY_URL     = os.environ.get("NTFY_URL", "")
 ALERT_CFG_PATH   = os.path.expanduser("~/.smc_alert_cfg.json")
+FITNESS_W_PATH   = os.path.expanduser("~/.smc_fitness_weights.json")
 GATE_CFG_PATH    = os.path.expanduser("~/.smc_gate_cfg.json")
 GATE_KEY         = os.environ.get("GATE_KEY", "")
 GATE_SECRET      = os.environ.get("GATE_SECRET", "")
@@ -238,6 +253,11 @@ PARAM_SPACE = {
 # ─── Глобальное состояние ───────────────────────────────────────────────────
 opt_lock   = threading.Lock()
 _log_lock  = threading.Lock()  # отдельный лок для olog — не блокирует opt_lock из потоков скринера
+
+# Эквалайзер весов fitness — тюнится "на ходу" со страницы (см. /fitness_weights).
+# При всех весах=1.0 формула математически совпадает с исходной (см. _simulate).
+fitness_w_lock  = threading.Lock()
+FITNESS_WEIGHTS = {"wr": 1.0, "pf": 1.0, "trades": 1.0, "rr": 1.0, "dd": 1.0}
 opt_state  = {
     "running": False, "logs": [], "best": None, "top20": [],
     "cycle": 0, "trials": 0, "progress": 0,
@@ -762,7 +782,7 @@ def _pivot_low(candles, length):
 
 # ─── SMC симуляция ──────────────────────────────────────────────────────────
 def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
-              init_deposit=1000.0, _collect=False):
+              init_deposit=1000.0, _collect=False, fitness_weights=None):
     """
     Симуляция SMC стратегии по параметрам p.
     Возвращает dict с метриками или None если мало данных.
@@ -1036,12 +1056,31 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
         "total_return": round(total_return,2), "equity": round(equity,2),
         "fitness": 0.0,
     }
-    # Fitness: WR × PF × log(trades) / (1+max_dd) — штраф за просадку
+    # Fitness: WR × PF × log(trades) / (1+max_dd) — штраф за просадку.
+    # v3.34: каждый множитель взвешен через FITNESS_WEIGHTS (эквалайзер,
+    # тюнится на ходу со страницы). log_fit = Σ w_i·log(factor_i) →
+    # fitness = exp(log_fit); при всех весах=1.0 это математически та же
+    # формула, что раньше (произведение = exp суммы логарифмов). Увеличение
+    # веса усиливает влияние множителя на ранжирование конфигов в поиске —
+    # например, выкрутив "Кол-во" выше 1.0, оптимизатор сильнее предпочитает
+    # конфиги с бо́льшим числом сделок.
     rr_ratio = tp_pct / sl_pct if sl_pct > 0 else 1.0
     rr_bonus = math.sqrt(min(max(rr_ratio, 0.7), 2.5))  # мягкий бонус за RR
     # Штраф за малое число сделок: при <20 сделках fitness режется сильнее
     trade_factor = math.log(len(trades) + 1) * min(len(trades) / 20.0, 1.0)
-    fitness = (wr * min(pf, 5.0) * trade_factor * rr_bonus) / (1 + max_dd)
+    if fitness_weights is None:
+        with fitness_w_lock:
+            fitness_weights = dict(FITNESS_WEIGHTS)
+    fw = fitness_weights
+    _eps = 1e-6
+    log_fit = (
+        fw.get("wr",     1.0) * math.log(max(wr, _eps)) +
+        fw.get("pf",     1.0) * math.log(max(min(pf, 5.0), _eps)) +
+        fw.get("trades", 1.0) * math.log(max(trade_factor, _eps)) +
+        fw.get("rr",     1.0) * math.log(max(rr_bonus, _eps)) -
+        fw.get("dd",     1.0) * math.log(max(1 + max_dd, _eps))
+    )
+    fitness = math.exp(log_fit)
     result["fitness"] = round(fitness, 6)
     result["rr"] = round(tp_pct / sl_pct if sl_pct > 0 else 1.0, 2)
 
@@ -1192,6 +1231,32 @@ def _save_alert_cfg():
             json.dump({"tg_token": TG_TOKEN, "tg_chat": TG_CHAT, "ntfy_url": NTFY_URL}, f)
     except Exception as e:
         olog(f"⚠ Не удалось сохранить {ALERT_CFG_PATH}: {e}")
+
+def _load_fitness_weights():
+    """Подхватывает сохранённые веса эквалайзера fitness из файла."""
+    try:
+        with open(FITNESS_W_PATH, "r") as f:
+            cfg = json.load(f)
+        with fitness_w_lock:
+            for k in FITNESS_WEIGHTS:
+                if k in cfg:
+                    try:
+                        FITNESS_WEIGHTS[k] = float(cfg[k])
+                    except (TypeError, ValueError):
+                        pass
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        olog(f"⚠ Не удалось прочитать {FITNESS_W_PATH}: {e}")
+
+def _save_fitness_weights():
+    try:
+        with fitness_w_lock:
+            snap = dict(FITNESS_WEIGHTS)
+        with open(FITNESS_W_PATH, "w") as f:
+            json.dump(snap, f)
+    except Exception as e:
+        olog(f"⚠ Не удалось сохранить {FITNESS_W_PATH}: {e}")
 
 def _test_alert():
     """Шлёт тестовое уведомление и честно проверяет, дошло ли оно."""
@@ -1357,7 +1422,11 @@ def run_optimizer():
                 while steps_done < STEPS and not _stop_flag.is_set():
                     batch_size = min(n_workers * 2, STEPS - steps_done)
                     neighbours = [_neighbour(current_p) for _ in range(batch_size)]
-                    futs = [pool.submit(_worker_simulate, nb) for nb in neighbours]
+                    # Свежий снэпшот эквалайзера на каждую пачку — позволяет
+                    # тюнить веса "на ходу" во время работы оптимизатора
+                    with fitness_w_lock:
+                        _fw_snap = dict(FITNESS_WEIGHTS)
+                    futs = [pool.submit(_worker_simulate, nb, _fw_snap) for nb in neighbours]
                     _fw(futs, timeout=30)
 
                     with opt_lock:
@@ -1462,10 +1531,13 @@ def _worker_init(candles, risk):
     _worker_candles = candles
     _worker_risk    = risk
 
-def _worker_simulate(p):
-    """Вызов _simulate из воркера ProcessPool (использует глобали)."""
+def _worker_simulate(p, fw=None):
+    """Вызов _simulate из воркера ProcessPool (использует глобали).
+    fw — снэпшот весов эквалайзера: у отдельного процесса своя память,
+    обновления FITNESS_WEIGHTS в основном процессе сами туда не долетят —
+    поэтому передаём явно при каждом submit (см. run_optimizer)."""
     try:
-        return _simulate(_worker_candles, p, risk_pct=_worker_risk)
+        return _simulate(_worker_candles, p, risk_pct=_worker_risk, fitness_weights=fw)
     except Exception:
         return None
 
@@ -1578,6 +1650,20 @@ input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;p
 .cm .cl{font-size:10px;color:#555}.cm .cv{font-size:16px;font-weight:700;color:#e0e0e0}
 #chartCanvas{display:block;width:100%;cursor:grab;border:1px solid #222;border-radius:5px;background:#0a0a0a}
 #chartStatus{font-size:11px;color:#555;padding:4px 0}
+/* ── Эквалайзер fitness ── */
+.eq-bar{display:flex;justify-content:space-between;gap:2px;padding:4px 0 2px}
+.eq-ch{display:flex;flex-direction:column;align-items:center;gap:4px;flex:1;min-width:0}
+.eq-val{font-size:10px;color:#f0b800;font-weight:700;min-height:12px}
+.eq-slot{position:relative;height:88px;width:100%}
+.eq-slider{position:absolute;top:50%;left:50%;width:80px;height:18px;
+  transform:translate(-50%,-50%) rotate(-90deg);
+  -webkit-appearance:none;appearance:none;background:transparent;margin:0;cursor:pointer;touch-action:none}
+.eq-slider::-webkit-slider-runnable-track{height:5px;background:#222;border-radius:3px}
+.eq-slider::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;border-radius:50%;
+  background:#f0b800;border:2px solid #0d0d0d;margin-top:-5.5px;box-shadow:0 0 4px rgba(240,184,0,.5)}
+.eq-slider::-moz-range-track{height:5px;background:#222;border-radius:3px}
+.eq-slider::-moz-range-thumb{width:16px;height:16px;border-radius:50%;background:#f0b800;border:2px solid #0d0d0d}
+.eq-lbl{font-size:9.5px;color:#888;text-align:center;line-height:1.2}
 /* ── AMOLED screensaver ── */
 #amoledContent{
   position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);
@@ -1651,6 +1737,31 @@ input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;p
     <label>SL %</label><input id="sl_pct" type="number" value="0.6" step="0.05">
     <label>TP %</label><input id="tp_pct" type="number" value="1.2" step="0.05">
     <label>Риск на сделку %</label><input id="risk_pct" type="number" value="10" step="1">
+  </div>
+  <div class="card">
+    <h3>🎛 Эквалайзер fitness <span style="color:#555;font-size:10px;font-weight:400">(на ходу)</span></h3>
+    <div class="eq-bar" id="eqBar">
+      <div class="eq-ch"><div class="eq-val" id="eqVal_wr">1.00</div>
+        <div class="eq-slot"><input type="range" class="eq-slider" id="eq_wr" min="0" max="3" step="0.05" value="1" oninput="onEqInput('wr',this.value)"></div>
+        <div class="eq-lbl">WR</div></div>
+      <div class="eq-ch"><div class="eq-val" id="eqVal_pf">1.00</div>
+        <div class="eq-slot"><input type="range" class="eq-slider" id="eq_pf" min="0" max="3" step="0.05" value="1" oninput="onEqInput('pf',this.value)"></div>
+        <div class="eq-lbl">PF</div></div>
+      <div class="eq-ch"><div class="eq-val" id="eqVal_trades">1.00</div>
+        <div class="eq-slot"><input type="range" class="eq-slider" id="eq_trades" min="0" max="3" step="0.05" value="1" oninput="onEqInput('trades',this.value)"></div>
+        <div class="eq-lbl">Кол-во</div></div>
+      <div class="eq-ch"><div class="eq-val" id="eqVal_rr">1.00</div>
+        <div class="eq-slot"><input type="range" class="eq-slider" id="eq_rr" min="0" max="3" step="0.05" value="1" oninput="onEqInput('rr',this.value)"></div>
+        <div class="eq-lbl">RR</div></div>
+      <div class="eq-ch"><div class="eq-val" id="eqVal_dd">1.00</div>
+        <div class="eq-slot"><input type="range" class="eq-slider" id="eq_dd" min="0" max="3" step="0.05" value="1" oninput="onEqInput('dd',this.value)"></div>
+        <div class="eq-lbl">Просадка</div></div>
+    </div>
+    <button class="btn btn-sm" style="width:100%;margin-top:4px" onclick="resetEq()">↺ Сброс к 1.0</button>
+    <div style="font-size:10px;color:#555;margin-top:6px;line-height:1.5">
+      WR — винрейт · PF — профит-фактор · Кол-во — число сделок · RR — бонус TP/SL · Просадка — штраф за DD.<br>
+      Выше 1.0 — сильнее влияет на ранжирование в поиске, ниже — слабее. Меняется без остановки оптимизатора/скрининга.
+    </div>
   </div>
   <div class="card">
     <h3>Лучший конфиг</h3>
@@ -1996,6 +2107,36 @@ function saveAlertCfgSync(){
 }
 
 loadAlertCfg();
+
+var EQ_KEYS = ['wr','pf','trades','rr','dd'];
+var _eqDebounce = null;
+function onEqInput(k, val){
+  document.getElementById('eqVal_'+k).textContent = parseFloat(val).toFixed(2);
+  clearTimeout(_eqDebounce);
+  _eqDebounce = setTimeout(saveEqWeights, 250);
+}
+function saveEqWeights(){
+  var body = {};
+  EQ_KEYS.forEach(function(k){ body[k] = parseFloat(document.getElementById('eq_'+k).value); });
+  fetch('/fitness_weights', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)}).catch(function(){});
+}
+function resetEq(){
+  EQ_KEYS.forEach(function(k){
+    document.getElementById('eq_'+k).value = 1;
+    document.getElementById('eqVal_'+k).textContent = '1.00';
+  });
+  saveEqWeights();
+}
+function loadEqWeights(){
+  fetch('/fitness_weights').then(function(r){return r.json();}).then(function(d){
+    EQ_KEYS.forEach(function(k){
+      var v = (d[k] != null) ? d[k] : 1.0;
+      document.getElementById('eq_'+k).value = v;
+      document.getElementById('eqVal_'+k).textContent = parseFloat(v).toFixed(2);
+    });
+  }).catch(function(){});
+}
+loadEqWeights();
 
 /* ── Optimizer polling ── */
 var polling=null, lastLogTotal=0, logsDropped=0;
@@ -2849,6 +2990,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._json({k:v for k,v in chart_mon_state.items() if k != "params"})
         elif self.path == "/alert_cfg":
             self._json({"tg_token": TG_TOKEN, "tg_chat": TG_CHAT, "ntfy_url": NTFY_URL})
+        elif self.path == "/fitness_weights":
+            with fitness_w_lock:
+                self._json(dict(FITNESS_WEIGHTS))
         elif self.path == "/scan_all_status":
             with screener_lock:
                 snap = dict(screener_state)
@@ -2958,6 +3102,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             _save_alert_cfg()
             self._json({"ok": True})
 
+        elif self.path == "/fitness_weights":
+            with fitness_w_lock:
+                for k in FITNESS_WEIGHTS:
+                    if k in body:
+                        try:
+                            FITNESS_WEIGHTS[k] = max(0.0, min(5.0, float(body[k])))
+                        except (TypeError, ValueError):
+                            pass
+                snap = dict(FITNESS_WEIGHTS)
+            _save_fitness_weights()
+            self._json({"ok": True, "weights": snap})
+
         elif self.path == "/alert_test":
             ok, err = _test_alert()
             self._json({"ok": ok, "error": err})
@@ -3027,6 +3183,7 @@ def main():
     # Сохранённые через UI настройки имеют приоритет над env (если есть файл)
     _load_alert_cfg()
     _load_gate_cfg()
+    _load_fitness_weights()
 
     server = http.server.ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print(f"{_C_GRN}SMC Optimizer v{APP_VERSION} — http://0.0.0.0:{PORT}{_C_RST}", flush=True)
