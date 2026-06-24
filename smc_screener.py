@@ -56,6 +56,11 @@ SMC Optimizer v3.23
   multiprocessing.set_start_method("spawn") в if __name__=="__main__" — fix падения
   fork на Android.
 
+- v3.24: масштаб графика на Android. (1) Pinch-zoom двумя пальцами: сводим/
+  разводим пальцы — свечи уменьшаются/увеличиваются (ratio расстояния между
+  касаниями масштабирует текущий visibleRange); центр зума фиксируется в
+  середине текущего вида. (2) По умолчанию при загрузке показываем последние
+  80 свечей вместо 120 — чуть крупнее без зума.
 - v3.4: скрининг всех фьючерсных пар Gate.io. Чекбокс "Все монеты"
   рядом с полем символа — запускает прогон каждой пары по 50 циклов.
   Прогресс [N/Total] + текущая монета в реальном времени. Топ-20 монет
@@ -155,7 +160,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.23"
+APP_VERSION  = "3.24"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -2096,7 +2101,7 @@ function loadChart(auto){
       _obs_bull=d.bull_obs||[]; _obs_bear=d.bear_obs||[];
       _fvg_bull=d.fvg_bull||[]; _fvg_bear=d.fvg_bear||[];
       if(!auto || anchorTs===null){
-        _camStart=Math.max(0,_cd.length-120);
+        _camStart=Math.max(0,_cd.length-80);
         _camEnd=_cd.length-1;
       } else if(wasFollowing){
         _camEnd=_cd.length-1;
@@ -2332,11 +2337,32 @@ cv.addEventListener('wheel',function(e){
   _camEnd=Math.min(_cd.length-1,_camStart+nv);
   drawChart();
 },{passive:false});
-var _tc=null;
-cv.addEventListener('touchstart',function(e){_tc=e.touches[0].clientX;_dragCam=_camStart;});
+var _tc=null, _pinchDist=null, _pinchVis=null, _pinchCenter=null;
+function _touches2dist(e){ var dx=e.touches[0].clientX-e.touches[1].clientX, dy=e.touches[0].clientY-e.touches[1].clientY; return Math.sqrt(dx*dx+dy*dy); }
+cv.addEventListener('touchstart',function(e){
+  if(e.touches.length===2){
+    _pinchDist=_touches2dist(e);
+    _pinchVis=_camEnd-_camStart;
+    _pinchCenter=(_camStart+_camEnd)/2;
+    _tc=null;
+  } else {
+    _tc=e.touches[0].clientX; _dragCam=_camStart;
+    _pinchDist=null;
+  }
+});
 cv.addEventListener('touchmove',function(e){
   e.preventDefault();
   if(!_cd.length)return;
+  if(e.touches.length===2 && _pinchDist){
+    var d=_touches2dist(e);
+    var ratio=_pinchDist/d;
+    var nv=Math.min(_cd.length,Math.max(10,Math.round(_pinchVis*ratio)));
+    _camStart=Math.max(0,Math.round(_pinchCenter-nv/2));
+    _camEnd=Math.min(_cd.length-1,_camStart+nv);
+    drawChart();
+    return;
+  }
+  if(_tc===null)return;
   var W=cv.parentElement.clientWidth-20;
   var vis=_camEnd-_camStart;
   var dx=(e.touches[0].clientX-_tc)/W*vis;
