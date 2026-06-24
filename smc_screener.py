@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
 """
-SMC Optimizer v3.22
+SMC Optimizer v3.23
+- v3.23: fix вечного зависания на "инициализация..." при старте оптимизатора.
+  Две причины: (1) _fetch_candles() при не-200 от Gate.io (например, контракт
+  не существует — невалидный символ) просто спал 5с и повторял запрос с тем
+  же current_from БЕЗ лимита попыток и без единой строчки в лог — вечный
+  молчаливый retry; добавлен счётчик MAX_FAILS=5, после которого загрузка
+  прерывается с понятной причиной в логе. (2) даже после остановки run_optimizer()
+  по "Мало свечей" — opt_state["running"] не сбрасывался в False (return был
+  ДО try/finally, где он сбрасывается) — поток умирал, а UI вечно показывал
+  "⏳ инициализация..." и кнопку "Стоп", потому что running оставался True.
 - v3.22: fix "мега-стоп / микро-тейк" на графике и нереалистичный бэктест
   (WR 88%+, Return 10000%+). Причина: sl_price считался от низа/верха
   Order Block (ob_lo/ob_hi), а tp_price — от entry_px на tp_pct; OB может
@@ -146,7 +155,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.22"
+APP_VERSION  = "3.23"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -603,13 +612,22 @@ def _fetch_candles(symbol, tf, days):
     LIMIT = 999
     all_candles = []
     current_from = since
+    fail_count = 0
+    MAX_FAILS = 5
     while current_from < now:
         try:
             r = requests.get(f"{GATE_API}/futures/usdt/candlesticks",
                 params={"contract":symbol,"interval":tf,"from":current_from,"limit":LIMIT},
                 timeout=15)
             if r.status_code != 200:
+                fail_count += 1
+                olog(f"⚠ Gate.io {r.status_code} для {symbol}: {r.text[:200]}")
+                if fail_count >= MAX_FAILS:
+                    olog(f"❌ {symbol}: {fail_count} ошибок подряд — контракт не существует "
+                         f"или недоступен на Gate.io Futures, прерываю загрузку")
+                    break
                 time.sleep(5); continue
+            fail_count = 0
             raw = r.json()
             if not raw: break
             batch = []
@@ -627,7 +645,11 @@ def _fetch_candles(symbol, tf, days):
             current_from = last_t + interval_sec
             time.sleep(0.12)
         except Exception as e:
+            fail_count += 1
             olog(f"fetch error: {e}")
+            if fail_count >= MAX_FAILS:
+                olog(f"❌ {symbol}: {fail_count} ошибок подряд, прерываю загрузку")
+                break
             time.sleep(5)
     seen = set()
     result = []
@@ -1213,7 +1235,9 @@ def run_optimizer():
     olog(f"▶ Старт | {sym} {tf} {days}д | SL={sl_p}% TP={tp_p}%")
     candles = _fetch_candles(sym, tf, days)
     if not candles or len(candles) < 100:
-        olog("❌ Мало свечей, остановка"); return
+        olog("❌ Мало свечей, остановка")
+        with opt_lock: opt_state["running"] = False
+        return
     olog(f"✔ Загружено {len(candles)} свечей")
 
     n_workers = NUM_WORKERS
