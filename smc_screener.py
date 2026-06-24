@@ -56,6 +56,11 @@ SMC Optimizer v3.23
   multiprocessing.set_start_method("spawn") в if __name__=="__main__" — fix падения
   fork на Android.
 
+- v3.26: фикс зависания скринера на старте. (1) olog использовал opt_lock —
+  4 потока скринера конкурировали с оптимизатором за один лок, вызывая deadlock;
+  введён отдельный _log_lock. (2) _run_sym теперь принимает idx и сразу пишет
+  sym_index при старте (а не только по завершении через as_completed) — счётчик
+  [N/808] обновляется корректно с первой монеты.
 - v3.25: параллельный скринер. run_screener заменён с последовательного for на
   ThreadPoolExecutor(max_workers=4) — 4 монеты прогоняются одновременно (~4x
   быстрее). ThreadPool безопасен на Android (нет spawn). Стоп работает корректно:
@@ -165,7 +170,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.25"
+APP_VERSION  = "3.26"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -209,6 +214,7 @@ PARAM_SPACE = {
 
 # ─── Глобальное состояние ───────────────────────────────────────────────────
 opt_lock   = threading.Lock()
+_log_lock  = threading.Lock()  # отдельный лок для olog — не блокирует opt_lock из потоков скринера
 opt_state  = {
     "running": False, "logs": [], "best": None, "top20": [],
     "cycle": 0, "trials": 0, "progress": 0,
@@ -596,7 +602,7 @@ def _ts():
     return time.strftime("[%H:%M:%S]")
 
 def olog(msg):
-    with opt_lock:
+    with _log_lock:
         opt_state["logs"].append({"ts": time.strftime("%H:%M:%S"), "msg": msg})
         if len(opt_state["logs"]) > 500:
             opt_state["logs"] = opt_state["logs"][-300:]
@@ -1430,29 +1436,27 @@ def run_screener():
     N_SCR = 4  # параллельных монет (ThreadPool — без spawn, безопасно на Android)
     olog(f"✔ {len(syms)} монет, 50 циклов каждая, {N_SCR} потока параллельно")
     all_results = []
-    done_count  = [0]  # мutable счётчик для колбэка
+    done_count  = [0]
 
-    def _run_sym(sym):
+    def _run_sym(sym, idx):
         if _screener_stop.is_set(): return None
         with screener_lock:
             screener_state["current_sym"] = sym
+            screener_state["sym_index"]   = idx
         try:
             return _run_one_sym_screener(sym, tf, days, sl_p, tp_p, risk)
         except Exception:
             return None
 
     with ThreadPoolExecutor(max_workers=N_SCR) as pool:
-        fut_map = {pool.submit(_run_sym, sym): sym for sym in syms}
+        fut_map = {pool.submit(_run_sym, sym, idx): sym for idx, sym in enumerate(syms, 1)}
         for fut in _as_completed(fut_map):
             if _screener_stop.is_set():
-                # отменяем ещё не стартовавшие
                 for f in fut_map:
                     f.cancel()
                 break
             done_count[0] += 1
             sym = fut_map[fut]
-            with screener_lock:
-                screener_state["sym_index"] = done_count[0]
             olog(f"[{done_count[0]}/{len(syms)}] {sym} готово")
             try:
                 res = fut.result()
