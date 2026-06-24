@@ -56,6 +56,12 @@ SMC Optimizer v3.23
   multiprocessing.set_start_method("spawn") в if __name__=="__main__" — fix падения
   fork на Android.
 
+- v3.28: статус каждого потока скринера в реальном времени. screener_state
+  добавлен active_workers {sym: {cycle, max_cycles, phase}} — каждый из 4
+  потоков пишет свою фазу (fetch/opt) и номер цикла. pollScreener обновляется
+  раз в секунду и показывает все активные воркеры построчно:
+  "SYMBOL — загрузка свечей..." или "SYMBOL — цикл 12/50".
+  screenerStatus многострочный (white-space:pre).
 - v3.27: фикс зависания скринера на fetch. _fetch_candles принимает _stop_event:
   все sleep(5)/sleep(0.12) заменены на _stop_event.wait(timeout=...) — поток
   мгновенно просыпается при нажатии Стоп. При ошибке Gate.io в режиме скринера
@@ -174,7 +180,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.27"
+APP_VERSION  = "3.28"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -236,6 +242,7 @@ screener_state = {
     "current_cycle": 0, "max_cycles": 50,
     "results": [], "tf":"15m", "days":30,
     "sl_pct":0.6, "tp_pct":1.2, "risk_pct":10.0,
+    "active_workers": {},  # sym -> {"cycle": N, "max_cycles": 50, "phase": "fetch"|"opt"}
 }
 _screener_stop   = threading.Event()
 _screener_thread = None
@@ -1444,7 +1451,7 @@ def run_screener():
     tp_p = screener_state["tp_pct"]
     risk = screener_state["risk_pct"]
     with screener_lock:
-        screener_state.update({"results":[],"done":False,"sym_index":0,"sym_total":0,"current_sym":""})
+        screener_state.update({"results":[],"done":False,"sym_index":0,"sym_total":0,"current_sym":"","active_workers":{}})
     olog("🔍 Получаем список монет...")
     syms = _fetch_all_symbols()
     if not syms:
@@ -1461,10 +1468,19 @@ def run_screener():
         with screener_lock:
             screener_state["current_sym"] = sym
             screener_state["sym_index"]   = idx
+            screener_state["active_workers"][sym] = {"cycle": 0, "max_cycles": 50, "phase": "fetch"}
+
+        def _on_cycle(c, mx):
+            with screener_lock:
+                screener_state["active_workers"][sym] = {"cycle": c, "max_cycles": mx, "phase": "opt"}
+
         try:
-            return _run_one_sym_screener(sym, tf, days, sl_p, tp_p, risk)
+            return _run_one_sym_screener(sym, tf, days, sl_p, tp_p, risk, on_cycle=_on_cycle)
         except Exception:
             return None
+        finally:
+            with screener_lock:
+                screener_state["active_workers"].pop(sym, None)
 
     with ThreadPoolExecutor(max_workers=N_SCR) as pool:
         fut_map = {pool.submit(_run_sym, sym, idx): sym for idx, sym in enumerate(syms, 1)}
@@ -1653,7 +1669,7 @@ input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;p
   </div>
   <div class="card" id="screenerCard" style="display:none">
     <h3>🔍 Скрининг всех монет</h3>
-    <div id="screenerStatus" style="color:#555;font-size:11px;margin-bottom:8px">—</div>
+    <div id="screenerStatus" style="color:#555;font-size:11px;margin-bottom:8px;white-space:pre;line-height:1.6">—</div>
     <div class="prog-bar"><div class="prog-fill" id="screenerProg" style="width:0%"></div></div>
     <div id="screenerTable" style="margin-top:8px"></div>
   </div>
@@ -2472,12 +2488,21 @@ function pollScreener(){
   fetch('/scan_all_status').then(function(r){return r.json();}).then(function(d){
     var pct=d.sym_total>0?Math.round(d.sym_index/d.sym_total*100):0;
     document.getElementById('screenerProg').style.width=pct+'%';
-    var cycleStr=d.current_cycle>0?' cycle '+d.current_cycle+'/'+d.max_cycles:'';
+    var workers=d.active_workers||{};
+    var syms=Object.keys(workers);
+    var workerLines=syms.map(function(s){
+      var w=workers[s];
+      return w.phase==='fetch'
+        ? '  '+s+' — загрузка свечей...'
+        : '  '+s+' — цикл '+w.cycle+'/'+w.max_cycles;
+    }).join('\n');
+    var mainLine=d.running
+      ? '['+d.sym_index+'/'+d.sym_total+'] завершено'
+      : d.done?('\u2705 Готово — проверено '+d.sym_total+' монет'):'—';
     document.getElementById('screenerStatus').textContent=
-      d.running?('['+d.sym_index+'/'+d.sym_total+'] '+d.current_sym+cycleStr):
-      d.done?('\u2705 Готово — проверено '+d.sym_total+' монет'):'—';
+      workerLines ? mainLine+'\n'+workerLines : mainLine;
     renderScreenerResults(d.results||[]);
-    if(d.running){_screenerPoll=setTimeout(pollScreener,2000);}
+    if(d.running){_screenerPoll=setTimeout(pollScreener,1000);}
     else{
       document.getElementById('btnStop').style.display='none';
       document.getElementById('btnStart').style.display='';
