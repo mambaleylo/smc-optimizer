@@ -1,5 +1,23 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.46
+- v3.46: опциональный авто-синк параметров авто-трейда с оптимизатором.
+  Чекбокс "🔁 Автоматически подхватывать новый лучший конфиг" в панели
+  авто-торговли (выключен по умолчанию). Если включён: при каждом новом
+  best от оптимизатора того же символа/ТФ (sym+tf совпадают с
+  auto_trade_state) — auto_trade_state["params"] обновляется на лету, без
+  перезапуска бота. _auto_trade_loop теперь перечитывает params из
+  auto_trade_state на каждой итерации (раньше снимал один раз при старте
+  потока и не видел бы обновлений) — при реальном изменении параметров
+  пишет в лог. Важно: TP/SL уже открытой на бирже сделки это НЕ меняет
+  (триггерные ордера выставлены при входе и остаются как есть) — новые
+  параметры влияют только на то, как ищется следующий сигнал; закрытие
+  старой позиции и переоткрытие новой всё ещё происходит только при смене
+  направления (см. v3.45), на том же направлении бот её не трогает.
+  Включить/выключить можно на ходу через POST /auto_trade_sync, без
+  остановки бота. В панели авто-торговли строка с текущими параметрами
+  теперь показывает "(🔁 авто-синк вкл)" вместо предупреждения о
+  расхождении, когда синк активен.
 SMC Optimizer v3.45
 - v3.45: два фикса авто-торговли. (1) Гонка с автоприменением лучшего конфига
   на график — оптимизатор после 30-го цикла сам вызывает applyBestToChart()
@@ -257,7 +275,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.45"
+APP_VERSION  = "3.46"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -353,6 +371,7 @@ auto_trade_state = {
     "position": None,         # текущая открытая позиция: {dir, entry, sl, tp, size, order_ids}
     "last_entry_ts": None,    # таймстемп свечи последнего сигнала
     "last_check": 0, "last_error": "",
+    "auto_sync": False,       # подхватывать новый best от оптимизатора того же sym/tf на ходу
 }
 _auto_trade_stop   = threading.Event()
 _auto_trade_thread = None
@@ -627,6 +646,13 @@ def _auto_trade_loop():
 
     while not _auto_trade_stop.is_set():
         try:
+            with auto_trade_lock:
+                new_p        = auto_trade_state["params"]
+                risk_pct     = auto_trade_state["risk_pct"]
+            if new_p != p:
+                olog(f"🔁 Авто-трейд: параметры обновлены (синк с оптимизатором) — "
+                     f"swing={new_p.get('swing_len')} SL={new_p.get('sl_pct')}% TP={new_p.get('tp_pct')}%")
+                p = new_p
             candles = _fetch_candles(sym, tf, days)
             if candles and len(candles) > 50:
                 result = _simulate(candles, p, sl_pct=p.get("sl_pct"),
@@ -1580,6 +1606,21 @@ def run_optimizer():
                                     f"swing={nb_p['swing_len']}"
                                 )
 
+                            # Опционально подкидываем новые параметры живой авто-торговле
+                            # того же символа/ТФ, если включён чекбокс синхронизации.
+                            # TP/SL уже открытой на бирже позиции это не меняет —
+                            # только то, как _auto_trade_loop будет искать СЛЕДУЮЩИЙ сигнал.
+                            with auto_trade_lock:
+                                _at_on  = auto_trade_state["enabled"]
+                                _at_sym = auto_trade_state["symbol"]
+                                _at_tf  = auto_trade_state["tf"]
+                                _at_syn = auto_trade_state.get("auto_sync")
+                            if _at_on and _at_syn and _at_sym == sym and _at_tf == tf:
+                                with auto_trade_lock:
+                                    auto_trade_state["params"] = dict(nb_p)
+                                olog(f"🔁 Новый best отправлен в авто-трейд {sym} {tf} "
+                                     f"(swing={nb_p['swing_len']} SL={nb_p['sl_pct']}% TP={nb_p['tp_pct']}%)")
+
                     steps_done += batch_size
                     if eco_mode:
                         _stop_flag.wait(timeout=ECO_BATCH_PAUSE)
@@ -1958,6 +1999,10 @@ input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;p
         <input id="atRisk" type="number" value="10" min="0.5" max="20" step="0.5" style="width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;padding:4px 6px;border-radius:4px;font-size:11px">
       </label>
     </div>
+    <label style="display:flex;align-items:center;gap:6px;color:#888;font-size:11px;margin-bottom:6px;cursor:pointer">
+      <input id="atAutoSync" type="checkbox" onchange="toggleAutoSync()">
+      🔁 Автоматически подхватывать новый лучший конфиг от оптимизатора (того же символа/ТФ) — TP/SL уже открытой сделки не трогает, влияет только на поиск следующего сигнала
+    </label>
     <div style="display:flex;gap:6px;margin-bottom:6px">
       <button class="btn btn-sm" style="flex:1" onclick="saveGateCfg()">💾 Сохранить ключи</button>
       <button class="btn btn-sm" id="atStartBtn" style="flex:1;background:#1a5c2a;color:#0f9" onclick="startAutoTrade()">▶ Запустить</button>
@@ -2101,7 +2146,10 @@ function startAutoTrade(){
     tp_pct:    parseFloat(document.getElementById('cTp').value)
   });
   fetch('/auto_trade_start',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({sym:sym,tf:tf,days:days,risk_pct:risk,position_pct:parseFloat(document.getElementById('atPosPct').value)||95,params:params})})
+    body:JSON.stringify({sym:sym,tf:tf,days:days,risk_pct:risk,
+      position_pct:parseFloat(document.getElementById('atPosPct').value)||95,
+      params:params,
+      auto_sync:document.getElementById('atAutoSync').checked})})
     .then(function(r){return r.json();})
     .then(function(d){
       if(d.ok){
@@ -2116,6 +2164,16 @@ function startAutoTrade(){
       } else {
         atInfo('❌ '+d.msg,'#f45');
       }
+    }).catch(function(e){ atInfo('Ошибка: '+e,'#f45'); });
+}
+
+function toggleAutoSync(){
+  var on = document.getElementById('atAutoSync').checked;
+  fetch('/auto_trade_sync',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({auto_sync:on})})
+    .then(function(r){return r.json();})
+    .then(function(d){
+      if(d.ok) atInfo(on?'🔁 Авто-синк с оптимизатором включён':'Авто-синк выключен', on?'#0f9':'#888');
     }).catch(function(e){ atInfo('Ошибка: '+e,'#f45'); });
 }
 
@@ -2148,19 +2206,21 @@ function scheduleAtPoll(){
 function pollAtStatus(){
   fetch('/auto_trade_status').then(function(r){return r.json();}).then(function(d){
     if(!d.enabled){ _atActive=false; return; }
+    document.getElementById('atAutoSync').checked = !!d.auto_sync;
     var pos = d.position;
     var info = '';
     var p = d.params || {};
     if(p.swing_len!=null){
-      info += '<span style="color:#888">Параметры бота (зафиксированы при запуске): swing='
-        +p.swing_len+' SL='+p.sl_pct+'% TP='+p.tp_pct+'%</span><br>';
+      info += '<span style="color:#888">Параметры бота сейчас: swing='
+        +p.swing_len+' SL='+p.sl_pct+'% TP='+p.tp_pct+'%'
+        +(d.auto_sync?' (🔁 авто-синк вкл)':' (зафиксированы при запуске)')+'</span><br>';
       var curSw = parseFloat(document.getElementById('cSwing').value);
       var curSl = parseFloat(document.getElementById('cSl').value);
       var curTp = parseFloat(document.getElementById('cTp').value);
-      if(curSw!==p.swing_len || curSl!==p.sl_pct || curTp!==p.tp_pct){
+      if(!d.auto_sync && (curSw!==p.swing_len || curSl!==p.sl_pct || curTp!==p.tp_pct)){
         info += '<span style="color:#f0b800">⚠ На графике сейчас другие параметры (swing='
           +curSw+' SL='+curSl+'% TP='+curTp+'%) — бот их не видит и не использует, '
-          +'пока вы не перезапустите авто-трейд</span><br>';
+          +'пока вы не перезапустите авто-трейд или не включите авто-синк</span><br>';
       }
     }
     if(pos){
@@ -3333,6 +3393,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             days     = int(body.get("days", 30))
             risk_pct     = float(body.get("risk_pct",     2.0))
             position_pct = float(body.get("position_pct", 10.0))
+            auto_sync    = bool(body.get("auto_sync", False))
             p        = dict(body.get("params") or {})
             if "sl_pct"    not in p: p["sl_pct"]    = body.get("sl", 0.8)
             if "tp_pct"    not in p: p["tp_pct"]    = body.get("tp", 1.6)
@@ -3348,10 +3409,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "enabled": True, "symbol": sym, "tf": tf, "days": days,
                     "params": p, "risk_pct": risk_pct, "position_pct": position_pct, "position": None,
                     "last_entry_ts": None, "last_check": 0, "last_error": "",
+                    "auto_sync": auto_sync,
                 })
             _auto_trade_thread = threading.Thread(target=_auto_trade_loop, daemon=True)
             _auto_trade_thread.start()
             self._json({"ok": True})
+
+        elif self.path == "/auto_trade_sync":
+            auto_sync = bool(body.get("auto_sync", False))
+            with auto_trade_lock:
+                auto_trade_state["auto_sync"] = auto_sync
+            self._json({"ok": True, "auto_sync": auto_sync})
 
         elif self.path == "/auto_trade_stop":
             _auto_trade_stop.set()
