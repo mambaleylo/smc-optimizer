@@ -1,6 +1,17 @@
 #!/usr/bin/env python3
 """
-SMC Optimizer v3.37
+SMC Optimizer v3.43
+- v3.43: единый индикатор статуса в шапке (3 цветные таблетки): "Перебор",
+  "Монитор", "Авто-трейд". Перебор/Монитор/Авто-торговля — три независимых
+  фоновых процесса со своими кнопками Старт/Стоп (_stop_flag, _chart_mon_stop,
+  _auto_trade_stop никак не связаны друг с другом по дизайну) — кнопка "Стоп"
+  у перебора параметров останавливает ТОЛЬКО перебор, монитор графика и
+  авто-трейд при этом продолжают работать, если были запущены отдельно.
+  Новая строка-индикатор под шапкой опрашивает /opt_status,
+  /chart_monitor_status, /auto_trade_status раз в 2с независимо от открытой
+  вкладки — точка горит зелёным когда процесс активен, жёлтым у авто-трейда
+  если есть открытая позиция, серым когда выключен. Чисто индикация, логика
+  стопа не менялась.
 - v3.37: метка PnL% на графике у точки выхода каждой сделки — показывает
   процент от депо с учётом плеча (+X% зелёным при TP, -X% красным при SL).
   dep_pct передаётся в signals при _collect=True.
@@ -213,7 +224,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.42"
+APP_VERSION  = "3.43"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -1637,6 +1648,13 @@ body{background:#0d0d0d;color:#e0e0e0;font-family:'JetBrains Mono',monospace,san
 .btn-go{background:#1a8f4a;color:#fff}.btn-go:hover{background:#22b85e}
 .btn-stop{background:#8f1a1a;color:#fff}.btn-stop:hover{background:#b82222}
 .btn-sm{background:#222;color:#aaa;padding:4px 10px;font-size:11px}
+.global-status{display:flex;gap:8px;flex-wrap:wrap;padding:5px 12px;background:#0a0a0a;border-bottom:1px solid #1c1c1c}
+.gs-pill{display:flex;align-items:center;gap:5px;padding:3px 9px;border-radius:11px;background:#161616;border:1px solid #262626;font-size:11px;color:#888;transition:color .2s,border-color .2s}
+.gs-pill.on{color:#bdf5d8;border-color:#1a8f4a}
+.gs-pill.warn{color:#ffe2a8;border-color:#8f5a1a}
+.gs-dot{width:7px;height:7px;border-radius:50%;background:#3a3a3a;flex:none;transition:background .2s,box-shadow .2s}
+.gs-dot.on{background:#0f9;box-shadow:0 0 5px #0f9}
+.gs-dot.warn{background:#f0b800;box-shadow:0 0 5px #f0b800}
 .tabs{display:flex;gap:4px;padding:0 12px;background:#111;border-bottom:1px solid #222}
 .tab{padding:7px 16px;font-size:12px;cursor:pointer;color:#666;border-bottom:2px solid transparent;background:none;border:none}
 .tab.active{color:#f0b800;border-bottom:2px solid #f0b800}
@@ -1733,6 +1751,11 @@ input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;p
   <button class="btn btn-stop" id="btnStop" onclick="stopOpt()" style="display:none">&#9632; Стоп</button>
   <span id="statusBadge" style="color:#555;font-size:11px">готов</span>
   <button class="btn-sm" id="amoledBtn" onclick="toggleAmoled()" title="AMOLED режим — гасит экран через 15с неактивности, защита от выгорания пикселей">&#11044; AMOLED</button>
+</div>
+<div class="global-status" id="globalStatus" title="Текущий статус трёх независимых процессов: перебор параметров, монитор графика (алерты) и авто-торговля. Кнопка «Стоп» у перебора останавливает только его — монитор и авто-торговля управляются отдельно.">
+  <span class="gs-pill" id="gsOpt"><span class="gs-dot" id="gsOptDot"></span><span id="gsOptTxt">Перебор: ...</span></span>
+  <span class="gs-pill" id="gsMon"><span class="gs-dot" id="gsMonDot"></span><span id="gsMonTxt">Монитор: ...</span></span>
+  <span class="gs-pill" id="gsTrade"><span class="gs-dot" id="gsTradeDot"></span><span id="gsTradeTxt">Авто-трейд: ...</span></span>
 </div>
 <div class="tabs">
   <button class="tab active" onclick="switchTab('opt',this)">Оптимизатор</button>
@@ -2172,6 +2195,46 @@ function loadEqWeights(){
   }).catch(function(){});
 }
 loadEqWeights();
+
+/* ── Единый индикатор статуса трёх независимых процессов в шапке ──
+   Перебор/Монитор/Авто-торговля управляются раздельно (3 разных кнопки
+   Старт/Стоп), но статус виден всегда, на любой вкладке. */
+function _gsSet(pillId, dotId, txtId, state, text){
+  // state: 'off' | 'on' | 'warn'
+  var pill=document.getElementById(pillId), dot=document.getElementById(dotId), txt=document.getElementById(txtId);
+  pill.classList.remove('on','warn'); dot.classList.remove('on','warn');
+  if(state!=='off'){ pill.classList.add(state); dot.classList.add(state); }
+  txt.textContent = text;
+}
+function pollGlobalStatus(){
+  fetch('/opt_status').then(function(r){return r.json();}).then(function(d){
+    if(d.running){
+      _gsSet('gsOpt','gsOptDot','gsOptTxt','on','Перебор: цикл '+(d.cycle||0));
+    } else {
+      _gsSet('gsOpt','gsOptDot','gsOptTxt','off','Перебор: выкл');
+    }
+  }).catch(function(){});
+  fetch('/chart_monitor_status').then(function(r){return r.json();}).then(function(d){
+    if(d.active){
+      _gsSet('gsMon','gsMonDot','gsMonTxt','on','Монитор: '+(d.symbol||'')+' '+(d.tf||''));
+    } else {
+      _gsSet('gsMon','gsMonDot','gsMonTxt','off','Монитор: выкл');
+    }
+  }).catch(function(){});
+  fetch('/auto_trade_status').then(function(r){return r.json();}).then(function(d){
+    if(d.enabled){
+      if(d.position){
+        _gsSet('gsTrade','gsTradeDot','gsTradeTxt','warn','Авто-трейд: '+(d.symbol||'')+' '+(d.tf||'')+' · позиция открыта');
+      } else {
+        _gsSet('gsTrade','gsTradeDot','gsTradeTxt','on','Авто-трейд: '+(d.symbol||'')+' '+(d.tf||''));
+      }
+    } else {
+      _gsSet('gsTrade','gsTradeDot','gsTradeTxt','off','Авто-трейд: выкл');
+    }
+  }).catch(function(){});
+}
+pollGlobalStatus();
+setInterval(pollGlobalStatus, 2000);
 
 /* ── Optimizer polling ── */
 var polling=null, lastLogTotal=0, logsDropped=0;
