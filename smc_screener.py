@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
-SMC Optimizer v3.34
-- v3.34: эквалайзер весов fitness — 5 вертикальных слайдеров (как на
+SMC Optimizer v3.36
+- v3.36: колонка "$100→$X" в топ-20 — показывает итоговый баланс при старте $100
+  (Return% / 10, т.к. риск=10% от депо на сделку). Заменяет "Return%" на
+  наглядный "$100→$X" в обеих таблицах (оптимизатор и скринер).
+- v3.35: эквалайзер весов fitness — 5 вертикальных слайдеров (как на
   аудио-эквалайзере) в сайдбаре: WR, PF, Кол-во сделок, RR, Просадка.
   Формула fitness переписана как взвешенная лог-сумма множителей
   (log_fit = Σ wᵢ·log(factorᵢ), fitness = exp(log_fit)) — при всех весах=1.0
@@ -207,7 +210,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.35"
+APP_VERSION  = "3.36"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -1790,7 +1793,7 @@ input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;p
     <div id="top20Container">
       <div class="top20-row">
         <span>#</span><span>WR%</span><span>PF</span><span>DD%</span>
-        <span>T</span><span>Return%</span><span>SL/TP/swing</span>
+        <span>T</span><span>$100→$</span><span>SL/TP/swing</span>
       </div>
     </div>
   </div>
@@ -2266,18 +2269,19 @@ function poll(){
 
     var top=(d.top20||[]);
     if(top.length){
-      var html='<div class="top20-row"><span>#</span><span>WR%</span><span>PF</span><span>DD%</span><span>T</span><span>Return%</span><span>SL/TP/swing</span></div>';
+      var html='<div class="top20-row"><span>#</span><span>WR%</span><span>PF</span><span>DD%</span><span>T</span><span>$100→$</span><span>SL/TP/swing</span></div>';
       top.forEach(function(e,i){
         var r=e.result,p=e.params;
         var wrC=r.winrate>=55?'green':r.winrate>=45?'yellow':'red';
         var retC=r.total_return>=0?'green':'red';
+        var finalBal=Math.round(100*(1+r.total_return/100));
         html+='<div class="top20-row">'+
           '<span style="color:#555">'+(i+1)+'</span>'+
           '<span class="'+wrC+'">'+r.winrate+'%</span>'+
           '<span>'+r.profit_factor+'</span>'+
           '<span class="red">'+r.max_dd+'%</span>'+
           '<span>'+r.trades+'</span>'+
-          '<span class="'+retC+'">'+r.total_return+'%</span>'+
+          '<span class="'+retC+'">$'+finalBal+'</span>'+
           '<span style="color:#888">'+p.sl_pct+'/'+p.tp_pct+'/'+p.swing_len+'</span>'+
         '</div>';
       });
@@ -2688,21 +2692,8 @@ function renderScreenerResults(results){
   var cols='grid-template-columns:20px 1fr 1fr 1fr 1fr 1fr 1fr 1fr';
   var html='<div class="top20-row" style="'+cols+'">'+
     '<span>#</span><span>Монета</span><span>WR%</span><span>PF</span>'+
-    '<span>DD%</span><span>T</span><span>Return%</span><span>SL/TP/sw</span></div>';
-  results.forEach(function(e,i){
-    var r=e.result,p=e.params;
-    var wrC=r.winrate>=55?'green':r.winrate>=45?'yellow':'red';
-    var retC=r.total_return>=0?'green':'red';
-    html+='<div class="top20-row" style="'+cols+'">'+
-      '<span style="color:#555">'+(i+1)+'</span>'+
-      '<span style="color:#f0b800;font-size:10px">'+e.sym+'</span>'+
-      '<span class="'+wrC+'">'+r.winrate+'%</span>'+
-      '<span>'+r.profit_factor+'</span>'+
-      '<span class="red">'+r.max_dd+'%</span>'+
-      '<span>'+r.trades+'</span>'+
-      '<span class="'+retC+'">'+r.total_return+'%</span>'+
-      '<span style="color:#888">'+p.sl_pct+'/'+p.tp_pct+'/'+p.swing_len+'</span>'+
-    '</div>';
+    '<span>DD%</span><span>T</span><span>$100→$</span><span>SL/TP/sw</span></div>';
+  results.forEach(function(e,i){\n    var r=e.result,p=e.params;\n    var wrC=r.winrate>=55?'green':r.winrate>=45?'yellow':'red';\n    var retC=r.total_return>=0?'green':'red';\n    var finalBal=Math.round(100*(1+r.total_return/100));\n    html+='<div class=\"top20-row\" style=\"'+cols+'\">'+\n      '<span style=\"color:#555\">'+(i+1)+'</span>'+\n      '<span style=\"color:#f0b800;font-size:10px\">'+e.sym+'</span>'+\n      '<span class=\"'+wrC+'\">'+r.winrate+'%</span>'+\n      '<span>'+r.profit_factor+'</span>'+\n      '<span class=\"red\">'+r.max_dd+'%</span>'+\n      '<span>'+r.trades+'</span>'+\n      '<span class=\"'+retC+'">$'+finalBal+'</span>'+\n      '<span style=\"color:#888\">'+p.sl_pct+'/'+p.tp_pct+'/'+p.swing_len+'</span>'+\n    '</div>';
   });
   document.getElementById('screenerTable').innerHTML=html;
 }
@@ -3212,3 +3203,4 @@ if __name__ == "__main__":
     except RuntimeError:
         pass
     main()
+
