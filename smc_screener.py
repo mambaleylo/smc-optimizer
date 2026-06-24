@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.44
+- v3.44: режим слабой производительности в оптимизаторе — после 300 циклов
+  телефон ощутимо греется на долгих прогонах. Теперь при cycle > 300:
+  (1) параллелизм батча урезается вдвое (n_workers//2 вместо n_workers) —
+  меньше одновременно загруженных ядер/процессов; (2) пауза 0.4с между
+  пачками внутри цикла; (3) пауза 8с между циклами целиком (раньше паузы
+  между циклами не было совсем — следующий цикл стартовал мгновенно).
+  В сумме цикл становится заметно длиннее и менее нагревающим, поиск не
+  останавливается, просто медленнее. opt_state["eco_mode"] отражает текущее
+  состояние, индикатор "Перебор" в шапке (taблетка из v3.43) подсвечивается
+  жёлтым с "🌡 эко" пока активен режим — чисто индикация, поведение
+  пользователю не нужно никак настраивать.
 SMC Optimizer v3.43
 - v3.43: единый индикатор статуса в шапке (3 цветные таблетки): "Перебор",
   "Монитор", "Авто-трейд". Перебор/Монитор/Авто-торговля — три независимых
@@ -224,7 +236,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.43"
+APP_VERSION  = "3.44"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -281,6 +293,7 @@ opt_state  = {
     "symbol": "BTC_USDT", "tf": "15m", "days": 30,
     "sl_pct": 0.6, "tp_pct": 1.2, "risk_pct": 10.0,
     "chart": None, "fetch_pct": 0, "logs_dropped": 0,
+    "eco_mode": False,
 }
 _stop_flag = threading.Event()
 _opt_thread = None
@@ -1409,6 +1422,16 @@ def run_optimizer():
     SHAKE_AFTER  = 5    # мягкая встряска через N циклов без улучшения
     RESTART_AFTER= 15   # полный рестарт через N циклов без улучшения
 
+    # ── Режим слабой производительности (телефон греется на долгих прогонах) ──
+    # После ECO_AFTER_CYCLE циклов снижаем параллелизм (меньше воркеров в
+    # батче за раз — CPU/NPU меньше греется) и добавляем паузы между батчами
+    # и между циклами — цикл становится длиннее и менее "жадным" к ресурсам.
+    ECO_AFTER_CYCLE = 300
+    ECO_WORKERS_DIV = 2     # урезаем параллелизм в эко-режиме в N раз
+    ECO_BATCH_PAUSE = 0.4   # сек, пауза между пачками внутри цикла
+    ECO_CYCLE_PAUSE = 8.0   # сек, пауза между циклами (обычно паузы нет совсем)
+    _eco_announced  = False
+
     with opt_lock:
         opt_state["top20"] = top20
         opt_state["best"]  = None
@@ -1417,7 +1440,14 @@ def run_optimizer():
         while not _stop_flag.is_set():
             cycle += 1
             temp = TEMP_START * math.exp(-0.05 * cycle)
-            with opt_lock: opt_state["cycle"] = cycle
+            eco_mode = cycle > ECO_AFTER_CYCLE
+            with opt_lock:
+                opt_state["cycle"] = cycle
+                opt_state["eco_mode"] = eco_mode
+            if eco_mode and not _eco_announced:
+                _eco_announced = True
+                olog(f"🌡 Цикл {cycle}: включён режим слабой производительности "
+                     f"(телефон греется) — меньше параллелизма, паузы между циклами")
 
             # ── Защита от тупиков ──────────────────────────────────────────
             if no_improve >= RESTART_AFTER:
@@ -1450,7 +1480,8 @@ def run_optimizer():
                 # пачками по n_workers за итерацию
                 steps_done = 0
                 while steps_done < STEPS and not _stop_flag.is_set():
-                    batch_size = min(n_workers * 2, STEPS - steps_done)
+                    workers_now = max(1, n_workers // ECO_WORKERS_DIV) if eco_mode else n_workers
+                    batch_size = min(workers_now * 2, STEPS - steps_done)
                     neighbours = [_neighbour(current_p) for _ in range(batch_size)]
                     # Свежий снэпшот эквалайзера на каждую пачку — позволяет
                     # тюнить веса "на ходу" во время работы оптимизатора
@@ -1512,10 +1543,14 @@ def run_optimizer():
                                 )
 
                     steps_done += batch_size
+                    if eco_mode:
+                        _stop_flag.wait(timeout=ECO_BATCH_PAUSE)
 
             # Счётчик стагнации
             no_improve += 1
             olog(f"Цикл {cycle} завершён | best fit={best_fit:.4f} | стагнация={no_improve}")
+            if eco_mode:
+                _stop_flag.wait(timeout=ECO_CYCLE_PAUSE)
 
     finally:
         try:
@@ -2209,7 +2244,11 @@ function _gsSet(pillId, dotId, txtId, state, text){
 function pollGlobalStatus(){
   fetch('/opt_status').then(function(r){return r.json();}).then(function(d){
     if(d.running){
-      _gsSet('gsOpt','gsOptDot','gsOptTxt','on','Перебор: цикл '+(d.cycle||0));
+      if(d.eco_mode){
+        _gsSet('gsOpt','gsOptDot','gsOptTxt','warn','Перебор: цикл '+(d.cycle||0)+' · 🌡 эко');
+      } else {
+        _gsSet('gsOpt','gsOptDot','gsOptTxt','on','Перебор: цикл '+(d.cycle||0));
+      }
     } else {
       _gsSet('gsOpt','gsOptDot','gsOptTxt','off','Перебор: выкл');
     }
@@ -3131,6 +3170,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 opt_state.update({
                     "running":True,"logs":[],"logs_dropped":0,
                     "best":None,"top20":[],"cycle":0,"trials":0,"progress":0,
+                    "eco_mode": False,
                     "symbol": body.get("symbol","BTC_USDT"),
                     "tf":     body.get("tf","15m"),
                     "days":   body.get("days",30),
