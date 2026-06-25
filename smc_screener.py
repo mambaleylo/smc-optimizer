@@ -331,7 +331,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.48.5"
+APP_VERSION  = "3.48.6"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -410,10 +410,10 @@ screener_lock  = threading.Lock()
 screener_state = {
     "running": False, "done": False,
     "current_sym": "", "sym_index": 0, "sym_total": 0,
-    "current_cycle": 0, "max_cycles": 50,
+    "current_cycle": 0, "max_cycles": 100,
     "results": [], "tf":"15m", "days":30,
     "sl_pct":0.6, "tp_pct":1.2, "risk_pct":10.0,
-    "active_workers": {},  # sym -> {"cycle": N, "max_cycles": 50, "phase": "fetch"|"opt"}
+    "active_workers": {},  # sym -> {"cycle": N, "max_cycles": 100, "phase": "fetch"|"opt"}
 }
 _screener_stop   = threading.Event()
 _screener_thread = None
@@ -1932,7 +1932,7 @@ def run_optimizer():
     olog("⏹ Остановлено")
     with opt_lock: opt_state["running"] = False
 
-def _run_one_sym_screener(sym, tf, days, sl_p, tp_p, risk, max_cycles=50, on_cycle=None):
+def _run_one_sym_screener(sym, tf, days, sl_p, tp_p, risk, max_cycles=100, on_cycle=None):
     candles = _fetch_candles(sym, tf, days, _stop_event=_screener_stop)
     if not candles or len(candles) < 100: return None
     best_params = _random_params()
@@ -2012,7 +2012,7 @@ def run_screener():
         with screener_lock:
             screener_state["current_sym"] = sym
             screener_state["sym_index"]   = idx
-            screener_state["active_workers"] = {sym: {"cycle": 0, "max_cycles": 50, "phase": "fetch"}}
+            screener_state["active_workers"] = {sym: {"cycle": 0, "max_cycles": 100, "phase": "fetch"}}
 
         def _on_cycle(c, mx):
             with screener_lock:
