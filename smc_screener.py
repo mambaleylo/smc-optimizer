@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.50.1
+- v3.50.1: тротлинг объявлений нового best (лог 🏆 + GitHub push + Telegram)
+  — не чаще раза в минуту (ANNOUNCE_THROTTLE_SEC=60), иначе при быстром
+  улучшении лог/Telegram/GitHub спамило десятками сообщений в минуту.
+  opt_state["best"]/top20 всё ещё обновляются мгновенно (UI не тормозит),
+  тротлится только внешнее "объявление". Если за время тротлинга накопился
+  неотправленный best — он досылается при остановке оптимизатора, чтобы не
+  потерять последнее улучшение молча.
+  Эко-режим (см. v3.50) сдвинут: ECO_MIN_CYCLE 100 → 300.
 SMC Optimizer v3.50
 - v3.50: код-ревью по логике автора индикатора LuxAlgo SMC — 4 фикса.
   (1) КРИТИЧНО: lookahead-bias в свинг-пивотах. _pivot_high/_pivot_low —
@@ -354,7 +363,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.50"
+APP_VERSION  = "3.50.1"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -1874,7 +1883,7 @@ def run_optimizer():
     # батче за раз — CPU/NPU меньше греется) и добавляем паузы между батчами
     # и между циклами — цикл становится длиннее и менее "жадным" к ресурсам.
     ECO_AFTER_STAGNATION = 10   # циклов без улучшения → включить эко
-    ECO_MIN_CYCLE   = 100       # v3.50: эко не включается раньше этого цикла —
+    ECO_MIN_CYCLE   = 300       # v3.50.1: эко не включается раньше этого цикла —
                                 # даже если стагнация набралась рано (например
                                 # на старте, пока поиск ещё не "разогрелся"),
                                 # просадка по скорости в первых циклах не нужна
@@ -1882,6 +1891,33 @@ def run_optimizer():
     ECO_BATCH_PAUSE = 0.4       # сек, пауза между пачками внутри цикла
     ECO_CYCLE_PAUSE = 8.0       # сек, пауза между циклами
     _eco_announced  = False
+
+    # v3.50.1: тротлинг объявлений нового best (олог 🏆 + GitHub push + Telegram).
+    # Без этого при быстром улучшении (особенно в начале прогона) каждый
+    # новый best спамил лог/Telegram/GitHub десятками сообщений в минуту.
+    # opt_state["best"]/top20 обновляются как и раньше СРАЗУ (UI всегда
+    # видит актуальный best) — тротлится только "объявление" наружу.
+    ANNOUNCE_THROTTLE_SEC = 60.0
+    _last_announce_ts = 0.0
+    _pending_announce = None   # (params, result) — найден, но ещё не объявлен
+
+    def _do_announce(nb_p, nb_r):
+        olog(f"🏆 Цикл {cycle} | "
+             f"WR={nb_r['winrate']}% PF={nb_r['profit_factor']} "
+             f"DD={nb_r['max_dd']}% T={nb_r['trades']} "
+             f"fit={nb_r['fitness']:.4f} | "
+             f"SL={nb_p['sl_pct']}% TP={nb_p['tp_pct']}% "
+             f"swing={nb_p['swing_len']}")
+        threading.Thread(target=_gh_save_best,
+            args=({"params": nb_p, "result": nb_r},), daemon=True).start()
+        if cycle >= 50:
+            _send_alert(
+                f"🏆 SMC {sym} {tf} — новый лучший\n"
+                f"WR={nb_r['winrate']}% PF={nb_r['profit_factor']} "
+                f"DD={nb_r['max_dd']}% Trades={nb_r['trades']}\n"
+                f"SL={nb_p['sl_pct']}% TP={nb_p['tp_pct']}% "
+                f"swing={nb_p['swing_len']}"
+            )
 
     with opt_lock:
         opt_state["top20"] = top20
@@ -1979,22 +2015,12 @@ def run_optimizer():
                             no_improve  = 0
                             with opt_lock:
                                 opt_state["best"] = {"params": nb_p, "result": nb_r}
-                            olog(f"🏆 Цикл {cycle} шаг {steps_done} | "
-                                 f"WR={nb_r['winrate']}% PF={nb_r['profit_factor']} "
-                                 f"DD={nb_r['max_dd']}% T={nb_r['trades']} "
-                                 f"fit={nfit:.4f} | "
-                                 f"SL={nb_p['sl_pct']}% TP={nb_p['tp_pct']}% "
-                                 f"swing={nb_p['swing_len']}")
-                            threading.Thread(target=_gh_save_best,
-                                args=({"params": nb_p, "result": nb_r},), daemon=True).start()
-                            if cycle >= 50:
-                                _send_alert(
-                                    f"🏆 SMC {sym} {tf} — новый лучший\n"
-                                    f"WR={nb_r['winrate']}% PF={nb_r['profit_factor']} "
-                                    f"DD={nb_r['max_dd']}% Trades={nb_r['trades']}\n"
-                                    f"SL={nb_p['sl_pct']}% TP={nb_p['tp_pct']}% "
-                                    f"swing={nb_p['swing_len']}"
-                                )
+                            _pending_announce = (nb_p, nb_r)
+                            _now_ts = time.time()
+                            if _now_ts - _last_announce_ts >= ANNOUNCE_THROTTLE_SEC:
+                                _last_announce_ts = _now_ts
+                                _do_announce(nb_p, nb_r)
+                                _pending_announce = None
 
                             # Опционально подкидываем новые параметры живой авто-торговле
                             # того же символа/ТФ, если включён чекбокс синхронизации.
@@ -2022,6 +2048,13 @@ def run_optimizer():
                 _stop_flag.wait(timeout=ECO_CYCLE_PAUSE)
 
     finally:
+        if _pending_announce is not None:
+            # Накопленный за время тротлинга best — досылаем при остановке,
+            # чтобы не потерять последнее улучшение молча.
+            try:
+                _do_announce(*_pending_announce)
+            except Exception as e:
+                olog(f"⚠ Не удалось отправить отложенный best: {e}")
         try:
             pool.shutdown(wait=False)
         except Exception:
