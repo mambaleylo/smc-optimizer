@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.48.2
+- v3.48.2: два критических фикса авто-торговли.
+  (1) _gate_cancel_orders теперь отменяет ОБА типа ордеров: /futures/usdt/orders
+  (лимитные/рыночные) И /futures/usdt/price_orders (триггерные TP/SL). Раньше
+  при смене направления старые TP/SL зависали на бирже и могли сработать уже
+  на новую позицию в противоположную сторону — двойной убыток.
+  (2) _gate_close_position нормализует символ через .replace("/","_").upper()
+  перед запросами к Gate API (как _gate_open_position). Убрана мёртвая
+  переменная side. Теперь оба вызова гарантированно получают корректный
+  contract-формат независимо от того, в каком виде пришёл символ.
 SMC Optimizer v3.48.1
 - v3.48.1: хотфикс сломанного JS — закрывающая скобка wtPoll() слипалась
   с текстом комментария (} ──), что роняло весь <script> и делало все кнопки
@@ -299,7 +309,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.48.1"
+APP_VERSION  = "3.48.2"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -489,30 +499,38 @@ def _gate_get_balance():
         return 0.0
 
 def _gate_cancel_orders(symbol):
-    """Отменить все открытые ордера по символу."""
+    """Отменить все открытые ордера по символу — и лимитные/рыночные,
+    и триггерные price_orders (TP/SL). Оба эндпоинта нужно чистить,
+    иначе старые TP/SL зависают и могут сработать на новую позицию."""
+    contract = symbol.replace("/", "_").upper()
     try:
-        _gate_req("DELETE", "/futures/usdt/orders", params={"contract": symbol, "status": "open"})
+        _gate_req("DELETE", "/futures/usdt/orders",
+                  params={"contract": contract, "status": "open"})
     except Exception as e:
-        olog(f"⚠ gate_cancel_orders {symbol}: {e}")
+        olog(f"⚠ gate_cancel_orders (orders) {contract}: {e}")
+    try:
+        _gate_req("DELETE", "/futures/usdt/price_orders",
+                  params={"contract": contract, "status": "open"})
+    except Exception as e:
+        olog(f"⚠ gate_cancel_orders (price_orders) {contract}: {e}")
 
 def _gate_close_position(symbol):
     """Закрыть позицию рыночным ордером."""
     try:
-        pos = _gate_get_position(symbol)
+        contract = symbol.replace("/", "_").upper()
+        pos = _gate_get_position(contract)
         if not pos: return
-        _gate_cancel_orders(symbol)
-        size  = pos["size"]
-        side  = "ask" if pos["dir"] == "long" else "bid"  # закрываем обратной стороной
-        close_size = -size if pos["dir"] == "long" else size
+        _gate_cancel_orders(contract)  # снимает и orders, и price_orders (TP/SL)
+        close_size = -int(pos["size"]) if pos["dir"] == "long" else int(pos["size"])
         _gate_req("POST", "/futures/usdt/orders", body={
-            "contract":    symbol,
-            "size":        int(close_size),
+            "contract":    contract,
+            "size":        close_size,
             "price":       "0",
             "tif":         "ioc",
             "reduce_only": True,
             "text":        "t-smc-close",
         })
-        olog(f"📤 Позиция закрыта: {symbol} {pos['dir']}")
+        olog(f"📤 Позиция закрыта: {contract} {pos['dir']}")
     except Exception as e:
         olog(f"⚠ gate_close_position {symbol}: {e}")
 
