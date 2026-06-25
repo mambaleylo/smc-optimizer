@@ -331,7 +331,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.48.6"
+APP_VERSION  = "3.48.7"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -1051,48 +1051,54 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
 
         # Update swing highs/lows
         if ph[i] is not None:
-            # New swing high
+            # New swing high → Бычий OB = последняя медвежья свеча перед импульсом вверх
             if last_sh is None or ph[i] > last_sh[1]:
-                if last_sh is not None and sw_trend == -1:
-                    # CHoCH вверх или BOS вверх
-                    pass
                 last_sh = (i, ph[i])
-            # Медвежий OB перед этим высоким: ищем последнюю бычью свечу до i
             ob_hi_bar = i - 1
             while ob_hi_bar > max(0, i-swing_len):
                 ci = candles[ob_hi_bar]
-                is_bullish = ci["close"] > ci["open"]
+                is_bearish = ci["close"] < ci["open"]
                 size_ok = (ci["high"] - ci["low"]) >= min_ob_size * (atr_arr[i] or 0.001)
-                if is_bullish and size_ok:
-                    bear_obs.append({"dir":-1,"hi":ci["high"],"lo":ci["low"],"i":ob_hi_bar})
-                    if len(bear_obs) > 10: bear_obs.pop(0)
+                if is_bearish and size_ok:
+                    bull_obs.append({"dir":+1,"hi":ci["high"],"lo":ci["low"],"i":ob_hi_bar})
+                    if len(bull_obs) > 10: bull_obs.pop(0)
                     if _collect:
-                        coll_bear_obs.append({"hi":ci["high"],"lo":ci["low"],"i":ob_hi_bar})
+                        coll_bull_obs.append({"hi":ci["high"],"lo":ci["low"],"i":ob_hi_bar})
                     break
                 ob_hi_bar -= 1
 
         if pl[i] is not None:
+            # New swing low → Медвежий OB = последняя бычья свеча перед импульсом вниз
             if last_sl_sw is None or pl[i] < last_sl_sw[1]:
                 last_sl_sw = (i, pl[i])
-            # Бычий OB перед этим низким: последняя медвежья свеча до i
             ob_lo_bar = i - 1
             while ob_lo_bar > max(0, i-swing_len):
                 ci = candles[ob_lo_bar]
-                is_bearish = ci["close"] < ci["open"]
+                is_bullish = ci["close"] > ci["open"]
                 size_ok = (ci["high"] - ci["low"]) >= min_ob_size * (atr_arr[i] or 0.001)
-                if is_bearish and size_ok:
-                    bull_obs.append({"dir":+1,"hi":ci["high"],"lo":ci["low"],"i":ob_lo_bar})
-                    if len(bull_obs) > 10: bull_obs.pop(0)
+                if is_bullish and size_ok:
+                    bear_obs.append({"dir":-1,"hi":ci["high"],"lo":ci["low"],"i":ob_lo_bar})
+                    if len(bear_obs) > 10: bear_obs.pop(0)
                     if _collect:
-                        coll_bull_obs.append({"hi":ci["high"],"lo":ci["low"],"i":ob_lo_bar})
+                        coll_bear_obs.append({"hi":ci["high"],"lo":ci["low"],"i":ob_lo_bar})
                     break
                 ob_lo_bar -= 1
 
-        # Swing trend update: BOS/CHoCH
+        # OB митигация: удаляем пробитые OB
+        if ob_mit == "close":
+            bull_obs = [ob for ob in bull_obs if close_i >= ob["lo"]]
+            bear_obs = [ob for ob in bear_obs if close_i <= ob["hi"]]
+        else:  # highlow
+            bull_obs = [ob for ob in bull_obs if low_i >= ob["lo"]]
+            bear_obs = [ob for ob in bear_obs if high_i <= ob["hi"]]
+
+        # Swing trend update: BOS/CHoCH по close
         if last_sh is not None and close_i > last_sh[1]:
             sw_trend = +1
+            last_sh = (i, close_i)  # обновляем уровень после пробоя
         if last_sl_sw is not None and close_i < last_sl_sw[1]:
             sw_trend = -1
+            last_sl_sw = (i, close_i)  # обновляем уровень после пробоя
 
         # Управление открытой позицией
         if in_trade:
