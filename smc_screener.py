@@ -331,7 +331,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.48.7"
+APP_VERSION  = "3.48.8"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -992,11 +992,7 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
     # Пивоты
     ph = _pivot_high(candles, swing_len)
     pl = _pivot_low(candles, swing_len)
-    if use_internal:
-        iph = _pivot_high(candles, internal_len)
-        ipl = _pivot_low(candles, internal_len)
-    else:
-        iph = [None]*n; ipl = [None]*n
+    # internal_len/use_internal зарезервированы для будущей internal structure логики
 
     # Order blocks: ищем последний бычий/медвежий OB
     # Бычий OB = последняя медвежья свеча перед пробитием вверх swing high
@@ -1093,12 +1089,11 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
             bear_obs = [ob for ob in bear_obs if high_i <= ob["hi"]]
 
         # Swing trend update: BOS/CHoCH по close
+        # Уровни last_sh/last_sl_sw обновляются только через pivot detection выше
         if last_sh is not None and close_i > last_sh[1]:
             sw_trend = +1
-            last_sh = (i, close_i)  # обновляем уровень после пробоя
         if last_sl_sw is not None and close_i < last_sl_sw[1]:
             sw_trend = -1
-            last_sl_sw = (i, close_i)  # обновляем уровень после пробоя
 
         # Управление открытой позицией
         if in_trade:
@@ -1167,6 +1162,10 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
         # Сигнал входа — ищем возврат цены в OB
         sig_dir = None
         entry_candidate = None
+
+        # Нет сигналов пока тренд не установлен (sw_trend==0 — до первого BOS)
+        if sw_trend == 0:
+            continue
 
         # Бычий сигнал: цена возвращается в бычий OB снизу при бычьем тренде (или CHoCH)
         for ob in reversed(bull_obs):
