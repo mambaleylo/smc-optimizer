@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.51
+- v3.51: Trendline filter (LuxAlgo-style).
+  Новые параметры оптимизатора: tl_mult (slope multiplier, 0.5–3.0),
+  tl_method (atr/stdev/linreg), tl_filter (bool).
+  При tl_filter=True вход в бычий OB разрешён только если цена пробила
+  нижнюю трендлайн снизу вверх (tl_upos==1); вход в медвежий OB — только
+  при пробое верхней трендлайн сверху вниз (tl_dnos==1). Логика slope и
+  upos/dnos портирована 1-в-1 из LuxAlgo «Trendlines with Breaks».
+  Трендлайны precompute перед основным бэктест-циклом (O(n) за проход).
+  При tl_filter=False поведение идентично v3.50 — обратная совместимость.
 SMC Optimizer v3.50.2
 - v3.50.2: SL% и TP% из UI теперь минимальные границы для оптимизатора.
   Оптимизатор не опустится ниже введённых значений — пользователь контролирует
@@ -414,6 +424,13 @@ PARAM_SPACE = {
     "choch_only":    {"values":[False, True],               "type":"bool"},
     "min_ob_size":   {"min":0.5,  "max":3.0,  "step":0.1,  "type":"float"},
     "require_fvg_confirm": {"values":[False,True],          "type":"bool"},
+    # ── Trendline filter (LuxAlgo-style) ───────────────────────────────────
+    # tl_mult: наклон трендлайна (slope multiplier, как в LuxAlgo)
+    # tl_method: способ расчёта slope — atr / stdev / linreg
+    # tl_filter: требовать пробой трендлайна перед входом в OB
+    "tl_mult":   {"min":0.5,  "max":3.0,  "step":0.1, "type":"float"},
+    "tl_method": {"values":["atr","stdev","linreg"],        "type":"cat"},
+    "tl_filter": {"values":[False, True],                   "type":"bool"},
 }
 
 # ─── Глобальное состояние ───────────────────────────────────────────────────
@@ -1018,6 +1035,9 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
     use_internal  = p.get("use_internal", True)
     min_ob_size   = p.get("min_ob_size", 1.0)
     req_fvg       = p.get("require_fvg_confirm", False)
+    tl_mult       = float(p.get("tl_mult", 1.0))
+    tl_method     = p.get("tl_method", "atr")
+    tl_filter     = p.get("tl_filter", False)
 
     n = len(candles)
     min_bars = swing_len*2 + 20
@@ -1035,6 +1055,73 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
     ph = _pivot_high(candles, swing_len)
     pl = _pivot_low(candles, swing_len)
     # internal_len/use_internal зарезервированы для будущей internal structure логики
+
+    # ── Trendlines (LuxAlgo-style) ──────────────────────────────────────────
+    # Slope = ATR/stdev/linreg * tl_mult / swing_len (как в LuxAlgo)
+    # upper трендлайн: строится через ph, убывает с наклоном slope_ph
+    # lower трендлайн: строится через pl, возрастает с наклоном slope_pl
+    # tl_upper[i] / tl_lower[i] — значение линии в баре i
+    # upos[i] = 1 если close > upper (breakout вверх), dnos[i] = 1 если close < lower
+    tl_upper = [0.0] * n
+    tl_lower = [0.0] * n
+    tl_slope_ph = [0.0] * n   # текущий наклон верхней линии
+    tl_slope_pl = [0.0] * n   # текущий наклон нижней линии
+    tl_upos  = [0] * n        # 1 = цена пробила верхнюю линию снизу вверх
+    tl_dnos  = [0] * n        # 1 = цена пробила нижнюю линию сверху вниз
+    _upper = 0.0; _lower = 0.0
+    _sph   = 0.0; _spl   = 0.0
+    _upos  = 0;   _dnos  = 0
+    for i in range(n):
+        c = candles[i]
+        atr_i = atr_arr[i] if atr_arr[i] > 0 else 0.001
+        closes_slice = [candles[j]["close"] for j in range(max(0,i-swing_len+1), i+1)]
+        ns = len(closes_slice)
+        # slope calculation — точно как LuxAlgo
+        if tl_method == "stdev":
+            mean_c = sum(closes_slice)/ns if ns else c["close"]
+            var_c  = sum((x-mean_c)**2 for x in closes_slice)/ns if ns > 1 else 0
+            slope_i = (var_c**0.5) / swing_len * tl_mult
+        elif tl_method == "linreg":
+            # |sma(close*n, L) - sma(close,L)*sma(n,L)| / variance(n,L) / 2
+            if ns > 1:
+                idx_slice = list(range(i-ns+1, i+1))
+                sma_cn = sum(closes_slice[j]*idx_slice[j] for j in range(ns)) / ns
+                sma_c  = sum(closes_slice) / ns
+                sma_n  = sum(idx_slice) / ns
+                var_n  = sum((x-sma_n)**2 for x in idx_slice) / ns
+                slope_i = abs(sma_cn - sma_c*sma_n) / max(var_n, 1e-9) / 2 * tl_mult
+            else:
+                slope_i = atr_i / swing_len * tl_mult
+        else:  # atr (default)
+            slope_i = atr_i / swing_len * tl_mult
+        # обновляем slope при новом пивоте (confirmed_i смещение учтено ниже в основном цикле;
+        # здесь строим массив просто последовательно на каждом баре)
+        if ph[i] is not None:
+            _sph   = slope_i
+            _upper = ph[i]
+        else:
+            _upper -= _sph
+        if pl[i] is not None:
+            _spl   = slope_i
+            _lower = pl[i]
+        else:
+            _lower += _spl
+        tl_upper[i] = _upper - _sph * swing_len  # значение без backpaint смещения
+        tl_lower[i] = _lower + _spl * swing_len
+        tl_slope_ph[i] = _sph
+        tl_slope_pl[i] = _spl
+        # upos/dnos — накопительные флаги breakout
+        if ph[i] is not None:
+            _upos = 0
+        elif c["close"] > tl_upper[i]:
+            _upos = 1
+        if pl[i] is not None:
+            _dnos = 0
+        elif c["close"] < tl_lower[i]:
+            _dnos = 1
+        tl_upos[i] = _upos
+        tl_dnos[i] = _dnos
+    # ── конец trendline precompute ───────────────────────────────────────────
 
     # Order blocks: ищем последний бычий/медвежий OB
     # Бычий OB = последняя медвежья свеча перед пробитием вверх swing high
@@ -1237,6 +1324,19 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
         if sw_trend == 0:
             continue
 
+        # ── Trendline filter ─────────────────────────────────────────────────
+        # Если tl_filter=True: бычий вход разрешён только если цена недавно
+        # пробила нижнюю трендлайн (tl_upos==1 в текущем или предыдущих барах),
+        # шортовый вход — только если пробила верхнюю трендлайн вниз (tl_dnos==1).
+        # Логика идентична LuxAlgo: upos/dnos сбрасываются при новом пивоте
+        # и остаются 1 до следующего пивота — т.е. «breakout в последней волне».
+        if tl_filter:
+            tl_bull_ok = (tl_upos[i] == 1)   # close > upper trendline (пробой вверх)
+            tl_bear_ok = (tl_dnos[i] == 1)   # close < lower trendline (пробой вниз)
+        else:
+            tl_bull_ok = True
+            tl_bear_ok = True
+
         # Бычий сигнал: цена возвращается в бычий OB
         # choch_only=False: торгуем и BOS и CHoCH OBs
         # choch_only=True: торгуем только OB которые были активированы через CHoCH
@@ -1246,7 +1346,7 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
                 trend_ok = (ob.get("type") == "choch")
             else:
                 trend_ok = True
-            if in_ob and trend_ok:
+            if in_ob and trend_ok and tl_bull_ok:
                 fvg_ok = True
                 if req_fvg and fvg_enabled:
                     fvg_ok = any(f[0] > ob["i"] and f[0] <= i and
@@ -1264,7 +1364,7 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
                     trend_ok = (ob.get("type") == "choch")
                 else:
                     trend_ok = True
-                if in_ob and trend_ok:
+                if in_ob and trend_ok and tl_bear_ok:
                     fvg_ok = True
                     if req_fvg and fvg_enabled:
                         fvg_ok = any(f[0] > ob["i"] and f[0] <= i and
@@ -4013,5 +4113,6 @@ if __name__ == "__main__":
     except RuntimeError:
         pass
     main()
+
 
 
