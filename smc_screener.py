@@ -331,7 +331,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.48.9"
+APP_VERSION  = "3.49.0"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -1180,10 +1180,15 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
         if sw_trend == 0:
             continue
 
-        # Бычий сигнал: цена возвращается в бычий OB снизу при бычьем тренде (или CHoCH)
+        # Бычий сигнал: цена возвращается в бычий OB
+        # choch_only=False: торгуем и BOS (sw_trend==+1) и CHoCH (sw_trend==-1)
+        # choch_only=True: торгуем только CHoCH — разворот из даунтренда (sw_trend==-1)
         for ob in reversed(bull_obs):
             in_ob = low_i <= ob["hi"] and high_i >= ob["lo"]
-            trend_ok = (sw_trend == +1) or (not choch_only)
+            if choch_only:
+                trend_ok = (sw_trend == -1)  # CHoCH: разворот из даунтренда вверх
+            else:
+                trend_ok = True  # BOS + CHoCH: любой тренд
             if in_ob and trend_ok:
                 # FVG подтверждение
                 fvg_ok = True
@@ -1199,7 +1204,10 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
         if sig_dir is None:
             for ob in reversed(bear_obs):
                 in_ob = high_i >= ob["lo"] and low_i <= ob["hi"]
-                trend_ok = (sw_trend == -1) or (not choch_only)
+                if choch_only:
+                    trend_ok = (sw_trend == +1)  # CHoCH: разворот из аптренда вниз
+                else:
+                    trend_ok = True  # BOS + CHoCH: любой тренд
                 if in_ob and trend_ok:
                     fvg_ok = True
                     if req_fvg and fvg_enabled:
