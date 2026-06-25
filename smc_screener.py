@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.48.4
+- v3.48.4: минимум сетки для веса Просадки в автотюнинге = 1.0 (было 0.5).
+  Тюнер больше не может выбрать dd=0.5 и фактически отключить штраф за
+  просадку — это приводило к конфигам с DD 40%+. Теперь для dd сетка
+  [1.0, 1.5, 2.0, 3.0]: штраф за просадку всегда как минимум на базовом
+  уровне. Остальные веса (wr, pf, trades, rr) сетка прежняя [0.5..3.0].
 SMC Optimizer v3.48.3
 - v3.48.3: фикс двух оставшихся багов.
   (1) _wt_bh_on_slice (автотюнинг весов): sl_pct/tp_pct теперь явно
@@ -321,7 +327,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.48.3"
+APP_VERSION  = "3.48.4"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -1564,7 +1570,16 @@ def _run_weight_tune():
         with fitness_w_lock:
             current_fw = dict(FITNESS_WEIGHTS)
 
-        GRID = [0.5, 1.0, 1.5, 2.0, 3.0]
+        # Для просадки минимум сетки = 1.0 — запрещаем тюнеру снижать штраф
+        # за DD ниже базового уровня. Иначе тюнер выбирает dd=0.5 (минимум)
+        # и оптимизатор практически игнорирует просадку → DD 40%+ на реальных конфигах.
+        GRIDS = {
+            "wr":     [0.5, 1.0, 1.5, 2.0, 3.0],
+            "pf":     [0.5, 1.0, 1.5, 2.0, 3.0],
+            "trades": [0.5, 1.0, 1.5, 2.0, 3.0],
+            "rr":     [0.5, 1.0, 1.5, 2.0, 3.0],
+            "dd":     [1.0, 1.5, 2.0, 3.0],   # минимум 1.0 — штраф за DD обязателен
+        }
         WR_KEYS = ["wr", "pf", "trades", "rr", "dd"]
         WR_NAMES = {"wr": "WinRate", "pf": "ProfitFactor", "trades": "Кол-во сделок",
                     "rr": "RR", "dd": "Просадка"}
@@ -1574,15 +1589,16 @@ def _run_weight_tune():
             _wtlog(f"━━ Проход {pass_i}/{passes} ━━")
             for key in WR_KEYS:
                 if _weight_tune_stop.is_set(): break
+                grid = GRIDS[key]
                 _wtlog(f"  🔍 {WR_NAMES[key]} (текущий={current_fw[key]:.2f}): "
-                       f"перебираем {GRID}...")
+                       f"перебираем {grid}...")
                 with weight_tune_lock:
                     weight_tune_state["stage"] = f"Проход {pass_i}: {WR_NAMES[key]}"
 
                 best_val  = current_fw[key]
                 best_oos  = None
 
-                for val in GRID:
+                for val in grid:
                     if _weight_tune_stop.is_set(): break
                     _wtlog(f"    {WR_NAMES[key]}={val}: оцениваем OOS...")
                     oos = _wt_eval_weight(key, val, current_fw, windows,
