@@ -799,7 +799,25 @@ def _auto_trade_loop():
                             tp_px         = sig["tp"]
 
                             existing = _gate_get_position(sym)
-                            if existing and existing["dir"] == direction:
+
+                            # ── Защита от чужой позиции ────────────────────
+                            # Если на бирже уже есть позиция, но мы её не открывали
+                            # (auto_trade_state["position"] is None) → чужой тикет,
+                            # пропускаем сигнал и чистим зависшие TP/SL-алерты.
+                            with auto_trade_lock:
+                                our_pos = auto_trade_state.get("position")
+                            if existing and our_pos is None:
+                                olog(f"🚫 Пропуск сигнала {direction.upper()} — "
+                                     f"на бирже уже открыта позиция {existing['dir'].upper()} "
+                                     f"с чужим тикетом (не наша). Не трогаем.")
+                                _send_alert(
+                                    f"⚠️ <b>{sym}</b> — сигнал {direction.upper()} пропущен\\n"
+                                    f"На бирже уже открыта {existing['dir'].upper()} позиция "
+                                    f"с чужим тикетом — авто-трейд её не закрывает."
+                                )
+                                with auto_trade_lock:
+                                    auto_trade_state["last_entry_ts"] = entry_ts
+                            elif existing and existing["dir"] == direction:
                                 # entry_ts сменился (структура OB/swing
                                 # переразметилась на новой свече), но
                                 # направление совпадает с уже открытой на
@@ -840,6 +858,41 @@ def _auto_trade_loop():
                             with auto_trade_lock:
                                 auto_trade_state["last_check"] = time.time()
                                 auto_trade_state["last_error"] = ""
+                    else:
+                        # ── Сигнал исчез (sigs пустой) ─────────────────────
+                        # Если были вооружены — значит сигнал, который мы
+                        # видели, пропал (переразметка OB/swing убрала его).
+                        # Если на бирже висят TP/SL без позиции — чистим.
+                        if armed:
+                            olog(f"⚠ Авто-трейд: сигнал исчез (нет активных сигналов на {sym} {tf})")
+                            _send_alert(
+                                f"⚠️ <b>{sym} {tf}</b> — сигнал пропал\\n"
+                                f"Нет активных сигналов. Проверяю зависшие TP/SL-ордера."
+                            )
+                            # Если позиции нет — отменяем зависшие price_orders
+                            existing = _gate_get_position(sym)
+                            if not existing:
+                                try:
+                                    contract = sym.replace("/", "_").upper()
+                                    r = _gate_req("GET", "/futures/usdt/price_orders",
+                                                  params={"contract": contract, "status": "open"})
+                                    stale = r if isinstance(r, list) else []
+                                    if stale:
+                                        olog(f"🧹 Найдено {len(stale)} зависших price_orders "
+                                             f"без позиции — отменяем")
+                                        _gate_cancel_orders(sym)
+                                        _send_alert(
+                                            f"🧹 <b>{sym}</b> — отменено {len(stale)} зависших "
+                                            f"TP/SL ордеров (позиция уже закрыта, сигнал пропал)"
+                                        )
+                                    else:
+                                        olog(f"✓ Зависших price_orders нет — всё чисто")
+                                except Exception as _e:
+                                    olog(f"⚠ Проверка зависших ордеров: {_e}")
+                            with auto_trade_lock:
+                                auto_trade_state["position"] = None
+                            armed = False
+                            last_entry_ts = None
 
         except Exception as e:
             olog(f"⚠ Авто-трейд ошибка: {e}")
@@ -1822,9 +1875,11 @@ def _chart_monitor_loop(sym, tf, days, p):
                                 chart_mon_state["armed"]         = True
                                 chart_mon_state["last_entry_ts"] = entry_ts
                                 chart_mon_state["last_dir"]      = sig["dir"]
+                                chart_mon_state["signal_gone_notified"] = False
                             elif entry_ts != chart_mon_state["last_entry_ts"]:
                                 chart_mon_state["last_entry_ts"] = entry_ts
                                 chart_mon_state["last_dir"]      = sig["dir"]
+                                chart_mon_state["signal_gone_notified"] = False
                                 new_sig = sig
                         if new_sig:
                             emoji = "🟢" if new_sig["dir"] == "long" else "🔴"
@@ -1837,6 +1892,24 @@ def _chart_monitor_loop(sym, tf, days, p):
                             )
                             olog(f"🔔 Новый сигнал {sym} {tf} {dirru} "
                                  f"entry={_fmt_px(new_sig['entry'])}")
+                    else:
+                        # ── Сигнал исчез ────────────────────────────────────
+                        # sigs стал пустым после того как мы были вооружены →
+                        # переразметка убрала последний сигнал, шлём алерт
+                        # один раз (флаг signal_gone_notified защищает от спама)
+                        with chart_mon_lock:
+                            was_armed   = chart_mon_state["armed"]
+                            gone_notif  = chart_mon_state.get("signal_gone_notified", False)
+                        if was_armed and not gone_notif:
+                            with chart_mon_lock:
+                                chart_mon_state["signal_gone_notified"] = True
+                                last_dir_was = chart_mon_state.get("last_dir") or "?"
+                            olog(f"⚠ Монитор: сигнал исчез ({sym} {tf}, был {last_dir_was.upper()})")
+                            _send_alert(
+                                f"⚠️ <b>{sym} {tf}</b> — сигнал пропал\n"
+                                f"Последний сигнал ({last_dir_was.upper()}) исчез после переразметки. "
+                                f"Открытых позиций по нему нет или TP/SL уже сработал — проверь вручную."
+                            )
         except Exception as e:
             olog(f"⚠ Монитор графика: {e}")
         # Спим до следующего закрытия бара (+небольшой запас)
