@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.50.2
+- v3.50.2: SL% и TP% из UI теперь минимальные границы для оптимизатора.
+  Оптимизатор не опустится ниже введённых значений — пользователь контролирует
+  минимальный риск/тейк. PARAM_SPACE["sl_pct"]["min"] и ["tp_pct"]["min"]
+  динамически выставляются из sl_p/tp_p перед стартом каждого прогона.
 SMC Optimizer v3.50.1
 - v3.50.1: тротлинг объявлений нового best (лог 🏆 + GitHub push + Telegram)
   — не чаще раза в минуту (ANNOUNCE_THROTTLE_SEC=60), иначе при быстром
@@ -1866,6 +1871,15 @@ def run_optimizer():
         initargs=(candles, risk)
     )
 
+    # v3.50.2: SL/TP из UI — минимальные границы оптимизатора
+    PARAM_SPACE["sl_pct"]["min"] = sl_p
+    PARAM_SPACE["tp_pct"]["min"] = tp_p
+    # max не должен быть меньше min
+    if PARAM_SPACE["sl_pct"]["max"] < sl_p:
+        PARAM_SPACE["sl_pct"]["max"] = sl_p
+    if PARAM_SPACE["tp_pct"]["max"] < tp_p:
+        PARAM_SPACE["tp_pct"]["max"] = tp_p
+
     best_params  = _random_params()
     best_params["sl_pct"] = sl_p; best_params["tp_pct"] = tp_p
     best_result  = _simulate(candles, best_params, sl_pct=sl_p, tp_pct=tp_p, risk_pct=risk)
@@ -2064,6 +2078,11 @@ def run_optimizer():
 def _run_one_sym_screener(sym, tf, days, sl_p, tp_p, risk, max_cycles=100, on_cycle=None):
     candles = _fetch_candles(sym, tf, days, _stop_event=_screener_stop)
     if not candles or len(candles) < 100: return None
+    # v3.50.2: sl_p/tp_p — минимальные границы
+    PARAM_SPACE["sl_pct"]["min"] = sl_p
+    PARAM_SPACE["tp_pct"]["min"] = tp_p
+    if PARAM_SPACE["sl_pct"]["max"] < sl_p: PARAM_SPACE["sl_pct"]["max"] = sl_p
+    if PARAM_SPACE["tp_pct"]["max"] < tp_p: PARAM_SPACE["tp_pct"]["max"] = tp_p
     best_params = _random_params()
     best_params["sl_pct"] = sl_p; best_params["tp_pct"] = tp_p
     best_result = _simulate(candles, best_params, sl_pct=sl_p, tp_pct=tp_p, risk_pct=risk)
