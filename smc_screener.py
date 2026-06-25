@@ -1897,8 +1897,6 @@ def run_optimizer():
     # новый best спамил лог/Telegram/GitHub десятками сообщений в минуту.
     # opt_state["best"]/top20 обновляются как и раньше СРАЗУ (UI всегда
     # видит актуальный best) — тротлится только "объявление" наружу.
-    ANNOUNCE_THROTTLE_SEC = 60.0
-    _last_announce_ts = 0.0
     _pending_announce = None   # (params, result) — найден, но ещё не объявлен
 
     def _do_announce(nb_p, nb_r):
@@ -1910,8 +1908,7 @@ def run_optimizer():
              f"swing={nb_p['swing_len']}")
         threading.Thread(target=_gh_save_best,
             args=({"params": nb_p, "result": nb_r},), daemon=True).start()
-        if cycle >= 50:
-            _send_alert(
+        _send_alert(
                 f"🏆 SMC {sym} {tf} — новый лучший\n"
                 f"WR={nb_r['winrate']}% PF={nb_r['profit_factor']} "
                 f"DD={nb_r['max_dd']}% Trades={nb_r['trades']}\n"
@@ -1942,6 +1939,13 @@ def run_optimizer():
             # ── Защита от тупиков ──────────────────────────────────────────
             if no_improve >= RESTART_AFTER:
                 olog(f"🔄 Цикл {cycle}: {no_improve} циклов без улучшения — полный рестарт")
+                # Алерт при рестарте — шлём актуальный лучший конфиг
+                if _pending_announce is not None:
+                    try:
+                        _do_announce(*_pending_announce)
+                    except Exception as e:
+                        olog(f"⚠ Не удалось отправить best при рестарте: {e}")
+                    _pending_announce = None
                 best_params = _random_params()
                 best_params["sl_pct"] = sl_p; best_params["tp_pct"] = tp_p
                 no_improve  = 0
@@ -2016,11 +2020,6 @@ def run_optimizer():
                             with opt_lock:
                                 opt_state["best"] = {"params": nb_p, "result": nb_r}
                             _pending_announce = (nb_p, nb_r)
-                            _now_ts = time.time()
-                            if _now_ts - _last_announce_ts >= ANNOUNCE_THROTTLE_SEC:
-                                _last_announce_ts = _now_ts
-                                _do_announce(nb_p, nb_r)
-                                _pending_announce = None
 
                             # Опционально подкидываем новые параметры живой авто-торговле
                             # того же символа/ТФ, если включён чекбокс синхронизации.
@@ -2049,8 +2048,7 @@ def run_optimizer():
 
     finally:
         if _pending_announce is not None:
-            # Накопленный за время тротлинга best — досылаем при остановке,
-            # чтобы не потерять последнее улучшение молча.
+            # Досылаем при остановке, чтобы не потерять последний best молча.
             try:
                 _do_announce(*_pending_announce)
             except Exception as e:
