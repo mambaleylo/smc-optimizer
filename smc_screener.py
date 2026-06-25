@@ -1,5 +1,28 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.50
+- v3.50: код-ревью по логике автора индикатора LuxAlgo SMC — 4 фикса.
+  (1) КРИТИЧНО: lookahead-bias в свинг-пивотах. _pivot_high/_pivot_low —
+  центрированный пивот (нужно swing_len баров ВПЕРЁД для подтверждения).
+  Бэктест брал ph[i]/pl[i] прямо в баре i — "узнавал" о пивоте на swing_len
+  баров раньше, чем это возможно в реальности (в live сигнал объективно
+  приходит позже, т.к. будущих баров ещё нет). Теперь используется
+  confirmed_i = i - swing_len — пивот учитывается только когда подтверждение
+  уже физически могло случиться. Раньше validated_fitness систематически
+  был оптимистичнее, чем то, что реально получилось бы в живой торговле.
+  (2) Убраны 3 мёртвых параметра оптимизатора: internal_len, ob_filter,
+  use_internal — читались в _simulate, но ни на что не влияли (internal-
+  структура не реализована, ob_filter не имел ни одного if-branch). Это
+  было ~25% пространства поиска (3 из 12 параметров) — чистый шум для
+  Basin Hopping/Metropolis. Старые сохранённые конфиги с этими ключами не
+  ломаются (default через p.get), просто больше не генерируются/не тюнятся.
+  (3) Эко-режим теперь не включается раньше 100-го цикла, даже если
+  стагнация (no_improve >= 10) набралась на самом старте — логика по
+  стагнации сохранена, просто добавлен нижний порог ECO_MIN_CYCLE=100.
+  (4) Последняя прогоняемая пара теперь запоминается в
+  ~/.smc_last_symbol.json при каждом старте /scan и подхватывается при
+  следующем запуске сервера + подставляется в поля #sym/#cSym при загрузке
+  страницы.
 SMC Optimizer v3.48.5
 - v3.48.5: автотюнинг стартует с дефолтных весов {все: 1.0}, а не с
   текущего состояния эквалайзера. Иначе повторные запуски давали разные
@@ -331,7 +354,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.49.1"
+APP_VERSION  = "3.50"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -347,6 +370,7 @@ NTFY_URL     = os.environ.get("NTFY_URL", "")
 ALERT_CFG_PATH   = os.path.expanduser("~/.smc_alert_cfg.json")
 FITNESS_W_PATH   = os.path.expanduser("~/.smc_fitness_weights.json")
 GATE_CFG_PATH    = os.path.expanduser("~/.smc_gate_cfg.json")
+LAST_SYMBOL_PATH = os.path.expanduser("~/.smc_last_symbol.json")
 GATE_KEY         = os.environ.get("GATE_KEY", "")
 GATE_SECRET      = os.environ.get("GATE_SECRET", "")
 
@@ -359,17 +383,21 @@ TF_SECONDS = {
 }
 
 # ─── Пространство параметров ────────────────────────────────────────────────
+# v3.50: убраны internal_len/ob_filter/use_internal — они читались в _simulate
+# (p.get(...)), но ни на что не влияли (internal-структура не реализована,
+# ob_filter не имел ни одного if-branch). Optimizer тратил ~25% измерений
+# поиска (3 из 12) на параметры без эффекта на fitness. Значения по умолчанию
+# для них всё ещё подставляются внутри _simulate через p.get(...,default) —
+# старые сохранённые конфиги (best.json/top20 с этими ключами) не ломаются,
+# просто эти ключи больше не тюнятся и не генерируются заново.
 PARAM_SPACE = {
     "sl_pct":        {"min":0.3,  "max":2.0,  "step":0.05, "type":"float"},
     "tp_pct":        {"min":0.5,  "max":4.0,  "step":0.05, "type":"float"},
     "swing_len":     {"min":10,   "max":100,  "step":5,    "type":"int"},
-    "internal_len":  {"min":3,    "max":15,   "step":1,    "type":"int"},
-    "ob_filter":     {"values":["atr","range"],             "type":"cat"},
     "ob_mitigation": {"values":["close","highlow"],         "type":"cat"},
     "fvg_enabled":   {"values":[True, False],               "type":"bool"},
     "fvg_threshold": {"min":0.0,  "max":0.5,  "step":0.05, "type":"float"},
     "choch_only":    {"values":[False, True],               "type":"bool"},
-    "use_internal":  {"values":[True, False],               "type":"bool"},
     "min_ob_size":   {"min":0.5,  "max":3.0,  "step":0.1,  "type":"float"},
     "require_fvg_confirm": {"values":[False,True],          "type":"bool"},
 }
@@ -1056,29 +1084,38 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
         close_i = c["close"]; open_i = c["open"]
 
         # Update swing highs/lows + подготовка pending OB кандидатов
-        if ph[i] is not None:
+        # v3.50: фикс lookahead-bias. _pivot_high/_pivot_low — центрированный
+        # пивот: чтобы подтвердить бар j как пивот, нужно видеть swing_len
+        # баров ВПЕРЁД от j. Раньше брали ph[i] прямо в баре i — бэктест
+        # "узнавал" о пивоте на swing_len баров раньше, чем это физически
+        # возможно (в live этих будущих баров просто ещё нет, сигнал придёт
+        # позже — отсюда расхождение между бэктестом/walk-forward и реальной
+        # торговлей). Теперь на шаге i используем пивот, который ровно
+        # сейчас стал подтверждён: confirmed_i = i - swing_len.
+        confirmed_i = i - swing_len
+        if confirmed_i >= 0 and ph[confirmed_i] is not None:
             # New swing high → готовим pending bull OB (последняя медвежья свеча перед импульсом)
-            last_sh = (i, ph[i])
-            ob_hi_bar = i - 1
-            while ob_hi_bar > max(0, i-swing_len):
+            last_sh = (confirmed_i, ph[confirmed_i])
+            ob_hi_bar = confirmed_i - 1
+            while ob_hi_bar > max(0, confirmed_i - swing_len):
                 ci = candles[ob_hi_bar]
                 is_bearish = ci["close"] < ci["open"]
-                size_ok = (ci["high"] - ci["low"]) >= min_ob_size * (atr_arr[i] or 0.001)
+                size_ok = (ci["high"] - ci["low"]) >= min_ob_size * (atr_arr[confirmed_i] or 0.001)
                 if is_bearish and size_ok:
-                    pending_bull_ob = {"hi": ci["high"], "lo": ci["low"], "i": ob_hi_bar, "level": ph[i]}
+                    pending_bull_ob = {"hi": ci["high"], "lo": ci["low"], "i": ob_hi_bar, "level": ph[confirmed_i]}
                     break
                 ob_hi_bar -= 1
 
-        if pl[i] is not None:
+        if confirmed_i >= 0 and pl[confirmed_i] is not None:
             # New swing low → готовим pending bear OB (последняя бычья свеча перед импульсом)
-            last_sl_sw = (i, pl[i])
-            ob_lo_bar = i - 1
-            while ob_lo_bar > max(0, i-swing_len):
+            last_sl_sw = (confirmed_i, pl[confirmed_i])
+            ob_lo_bar = confirmed_i - 1
+            while ob_lo_bar > max(0, confirmed_i - swing_len):
                 ci = candles[ob_lo_bar]
                 is_bullish = ci["close"] > ci["open"]
-                size_ok = (ci["high"] - ci["low"]) >= min_ob_size * (atr_arr[i] or 0.001)
+                size_ok = (ci["high"] - ci["low"]) >= min_ob_size * (atr_arr[confirmed_i] or 0.001)
                 if is_bullish and size_ok:
-                    pending_bear_ob = {"hi": ci["high"], "lo": ci["low"], "i": ob_lo_bar, "level": pl[i]}
+                    pending_bear_ob = {"hi": ci["high"], "lo": ci["low"], "i": ob_lo_bar, "level": pl[confirmed_i]}
                     break
                 ob_lo_bar -= 1
 
@@ -1453,6 +1490,26 @@ def _save_alert_cfg():
     except Exception as e:
         olog(f"⚠ Не удалось сохранить {ALERT_CFG_PATH}: {e}")
 
+def _load_last_symbol():
+    """v3.50: подхватывает последнюю прогоняемую пару при старте сервера."""
+    try:
+        with open(LAST_SYMBOL_PATH, "r") as f:
+            cfg = json.load(f)
+        sym = cfg.get("symbol")
+        if sym:
+            opt_state["symbol"] = sym
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        olog(f"⚠ Не удалось прочитать {LAST_SYMBOL_PATH}: {e}")
+
+def _save_last_symbol(sym):
+    try:
+        with open(LAST_SYMBOL_PATH, "w") as f:
+            json.dump({"symbol": sym}, f)
+    except Exception as e:
+        olog(f"⚠ Не удалось сохранить {LAST_SYMBOL_PATH}: {e}")
+
 def _load_fitness_weights():
     """Подхватывает сохранённые веса эквалайзера fitness из файла."""
     try:
@@ -1817,6 +1874,10 @@ def run_optimizer():
     # батче за раз — CPU/NPU меньше греется) и добавляем паузы между батчами
     # и между циклами — цикл становится длиннее и менее "жадным" к ресурсам.
     ECO_AFTER_STAGNATION = 10   # циклов без улучшения → включить эко
+    ECO_MIN_CYCLE   = 100       # v3.50: эко не включается раньше этого цикла —
+                                # даже если стагнация набралась рано (например
+                                # на старте, пока поиск ещё не "разогрелся"),
+                                # просадка по скорости в первых циклах не нужна
     ECO_WORKERS_DIV = 2         # урезаем параллелизм в эко-режиме в N раз
     ECO_BATCH_PAUSE = 0.4       # сек, пауза между пачками внутри цикла
     ECO_CYCLE_PAUSE = 8.0       # сек, пауза между циклами
@@ -1830,7 +1891,7 @@ def run_optimizer():
         while not _stop_flag.is_set():
             cycle += 1
             temp = TEMP_START * math.exp(-0.05 * cycle)
-            eco_mode = no_improve >= ECO_AFTER_STAGNATION
+            eco_mode = (cycle >= ECO_MIN_CYCLE) and (no_improve >= ECO_AFTER_STAGNATION)
             with opt_lock:
                 opt_state["cycle"] = cycle
                 opt_state["eco_mode"] = eco_mode
@@ -2883,8 +2944,6 @@ function poll(){
         '<hr style="border-color:#222;margin:5px 0">'+
         '<div class="stat-row"><span class="stat-label">SL / TP</span><span class="stat-val">'+p.sl_pct+'% / '+p.tp_pct+'%</span></div>'+
         '<div class="stat-row"><span class="stat-label">Swing len</span><span class="stat-val">'+p.swing_len+'</span></div>'+
-        '<div class="stat-row"><span class="stat-label">Internal len</span><span class="stat-val">'+p.internal_len+'</span></div>'+
-        '<div class="stat-row"><span class="stat-label">OB filter</span><span class="stat-val">'+p.ob_filter+'</span></div>'+
         '<div class="stat-row"><span class="stat-label">OB mitigation</span><span class="stat-val">'+p.ob_mitigation+'</span></div>'+
         '<div class="stat-row"><span class="stat-label">FVG</span><span class="stat-val">'+(p.fvg_enabled?'вкл':'выкл')+'</span></div>'+
         '<div class="stat-row"><span class="stat-label">CHoCH only</span><span class="stat-val">'+(p.choch_only?'да':'нет')+'</span></div>';
@@ -2913,6 +2972,12 @@ function poll(){
   }).catch(function(){scheduleNext();});
 }
 fetch('/opt_status').then(function(r){return r.json();}).then(function(d){
+  // v3.50: подставляем последнюю прогоняемую пару в поля ввода при загрузке страницы
+  if(d.symbol){
+    var symEl = document.getElementById('sym'), cSymEl = document.getElementById('cSym');
+    if(symEl)  symEl.value  = d.symbol;
+    if(cSymEl) cSymEl.value = d.symbol;
+  }
   if(d.running){
     document.getElementById('btnStart').style.display='none';
     document.getElementById('btnStop').style.display='';
@@ -3673,18 +3738,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if _opt_thread and _opt_thread.is_alive():
                 self._json({"ok":False,"msg":"уже работает"}); return
             _stop_flag.clear()
+            _scan_symbol = body.get("symbol","BTC_USDT")
             with opt_lock:
                 opt_state.update({
                     "running":True,"logs":[],"logs_dropped":0,
                     "best":None,"top20":[],"cycle":0,"trials":0,"progress":0,
                     "eco_mode": False,
-                    "symbol": body.get("symbol","BTC_USDT"),
+                    "symbol": _scan_symbol,
                     "tf":     body.get("tf","15m"),
                     "days":   body.get("days",30),
                     "sl_pct": body.get("sl_pct",0.6),
                     "tp_pct": body.get("tp_pct",1.2),
                     "risk_pct": body.get("risk_pct",10.0),
                 })
+            _save_last_symbol(_scan_symbol)  # v3.50: запоминаем последнюю прогоняемую пару
             _opt_thread = threading.Thread(target=run_optimizer, daemon=True)
             _opt_thread.start()
             self._json({"ok":True})
@@ -3880,6 +3947,7 @@ def main():
     _load_alert_cfg()
     _load_gate_cfg()
     _load_fitness_weights()
+    _load_last_symbol()
 
     server = http.server.ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print(f"{_C_GRN}SMC Optimizer v{APP_VERSION} — http://0.0.0.0:{PORT}{_C_RST}", flush=True)
