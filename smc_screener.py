@@ -1048,8 +1048,7 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
         # Update swing highs/lows
         if ph[i] is not None:
             # New swing high → Бычий OB = последняя медвежья свеча перед импульсом вверх
-            if last_sh is None or ph[i] > last_sh[1]:
-                last_sh = (i, ph[i])
+            last_sh = (i, ph[i])  # всегда обновляем — нужен актуальный уровень для BOS
             ob_hi_bar = i - 1
             while ob_hi_bar > max(0, i-swing_len):
                 ci = candles[ob_hi_bar]
@@ -1065,8 +1064,7 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
 
         if pl[i] is not None:
             # New swing low → Медвежий OB = последняя бычья свеча перед импульсом вниз
-            if last_sl_sw is None or pl[i] < last_sl_sw[1]:
-                last_sl_sw = (i, pl[i])
+            last_sl_sw = (i, pl[i])  # всегда обновляем — нужен актуальный уровень для BOS
             ob_lo_bar = i - 1
             while ob_lo_bar > max(0, i-swing_len):
                 ci = candles[ob_lo_bar]
@@ -1280,10 +1278,16 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
                 oi, hi, lo = ob["i"], ob["hi"], ob["lo"]
                 end_i = n - 1
                 for j in range(oi+1, n):
-                    cj = candles[j]["close"]
-                    if kind == "bull" and cj < lo:
-                        end_i = j; break
-                    if kind == "bear" and cj > hi:
+                    cj_close = candles[j]["close"]
+                    cj_low   = candles[j]["low"]
+                    cj_high  = candles[j]["high"]
+                    if ob_mit == "close":
+                        broken = (kind == "bull" and cj_close < lo) or \
+                                 (kind == "bear" and cj_close > hi)
+                    else:
+                        broken = (kind == "bull" and cj_low < lo) or \
+                                 (kind == "bear" and cj_high > hi)
+                    if broken:
                         end_i = j; break
                 out.append({"i": oi, "hi": hi, "lo": lo, "end_i": end_i})
             return out
