@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.48.3
+- v3.48.3: фикс двух оставшихся багов.
+  (1) _wt_bh_on_slice (автотюнинг весов): sl_pct/tp_pct теперь явно
+  передаются в _simulate на каждом шаге (_neighbour/_shake/_random_params
+  не генерируют их — они вне PARAM_SPACE). Раньше в цикле sl_pct/tp_pct
+  брались из p["sl_pct"] которого там не было → simulate получал None →
+  бэктест считался по дефолтам или падал. Убрана мёртвая проверка
+  "if best_p else _random_params()" — best_p после инициализации всегда dict.
+  (2) /auto_trade_start: добавлена валидация sl_pct/tp_pct перед стартом
+  потока. Если значения отсутствуют или вне диапазона [0.1–5%/10%] —
+  возвращаем {"ok":false} с описанием ошибки вместо молчаливого старта
+  бота с некорректными параметрами и открытия реальной позиции.
 SMC Optimizer v3.48.2
 - v3.48.2: два критических фикса авто-торговли.
   (1) _gate_cancel_orders теперь отменяет ОБА типа ордеров: /futures/usdt/orders
@@ -309,7 +321,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.48.2"
+APP_VERSION  = "3.48.3"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -1429,7 +1441,9 @@ def _wtlog(msg):
 
 def _wt_bh_on_slice(candles_slice, sl_p, tp_p, risk, fw, cycles=20):
     """Мини-BH на одном куске свечей с заданными весами fw.
-    Возвращает лучший params + result."""
+    Возвращает лучший params + result.
+    sl_p/tp_p всегда передаются явно в _simulate — они не входят в PARAM_SPACE
+    и не генерируются _random_params/_neighbour/_shake."""
     best_p = _random_params()
     best_p["sl_pct"] = sl_p; best_p["tp_pct"] = tp_p
     best_r = _simulate(candles_slice, best_p, sl_pct=sl_p, tp_pct=tp_p,
@@ -1439,15 +1453,18 @@ def _wt_bh_on_slice(candles_slice, sl_p, tp_p, risk, fw, cycles=20):
         if _weight_tune_stop.is_set():
             break
         temp = 1.0 * math.exp(-0.05 * cyc)
-        for start_p in [_shake(best_p, 0.4) if best_p else _random_params(),
-                         _random_params()]:
-            cur_p, cur_r = start_p, _simulate(candles_slice, start_p, risk_pct=risk,
-                                               fitness_weights=fw)
+        for start_p in [_shake(best_p, 0.4), _random_params()]:
+            start_p["sl_pct"] = sl_p; start_p["tp_pct"] = tp_p
+            cur_r = _simulate(candles_slice, start_p, sl_pct=sl_p, tp_pct=tp_p,
+                              risk_pct=risk, fitness_weights=fw)
+            cur_p = start_p
             cur_f = cur_r["fitness"] if cur_r else 0.0
             for _ in range(30):
                 if _weight_tune_stop.is_set(): break
                 nb_p = _neighbour(cur_p)
-                nb_r = _simulate(candles_slice, nb_p, risk_pct=risk, fitness_weights=fw)
+                nb_p["sl_pct"] = sl_p; nb_p["tp_pct"] = tp_p
+                nb_r = _simulate(candles_slice, nb_p, sl_pct=sl_p, tp_pct=tp_p,
+                                 risk_pct=risk, fitness_weights=fw)
                 if not nb_r: continue
                 nfit = nb_r["fitness"]
                 delta = nfit - cur_f
@@ -3742,6 +3759,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if "sl_pct"    not in p: p["sl_pct"]    = body.get("sl", 0.8)
             if "tp_pct"    not in p: p["tp_pct"]    = body.get("tp", 1.6)
             if "swing_len" not in p: p["swing_len"] = 10
+            # Защита: без корректных sl/tp открывать реальные позиции нельзя
+            try:
+                sl_val = float(p["sl_pct"]); tp_val = float(p["tp_pct"])
+                assert 0.1 <= sl_val <= 5.0, f"sl_pct вне диапазона: {sl_val}"
+                assert 0.1 <= tp_val <= 10.0, f"tp_pct вне диапазона: {tp_val}"
+            except Exception as e:
+                self._json({"ok": False, "msg": f"Некорректные параметры SL/TP: {e}"}); return
             if not GATE_KEY or not GATE_SECRET:
                 self._json({"ok": False, "msg": "Не настроены Gate.io ключи"}); return
             _auto_trade_stop.set()
