@@ -331,7 +331,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.48.8"
+APP_VERSION  = "3.48.9"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -1040,43 +1040,58 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
     coll_bull_obs = []
     coll_bear_obs = []
 
+    # Pending OB кандидаты — ждут подтверждения BOS
+    # При появлении pivot high → ищем медвежью свечу перед ним → кладём в pending_bull_ob
+    # OB становится активным только когда close пробивает last_sh (BOS подтверждён)
+    pending_bull_ob = None  # {"hi":, "lo":, "i":, "level": pivot_price}
+    pending_bear_ob = None  # {"hi":, "lo":, "i":, "level": pivot_price}
+
     for i in range(swing_len*2, n):
         c = candles[i]
         high_i = c["high"]; low_i = c["low"]
         close_i = c["close"]; open_i = c["open"]
 
-        # Update swing highs/lows
+        # Update swing highs/lows + подготовка pending OB кандидатов
         if ph[i] is not None:
-            # New swing high → Бычий OB = последняя медвежья свеча перед импульсом вверх
-            last_sh = (i, ph[i])  # всегда обновляем — нужен актуальный уровень для BOS
+            # New swing high → готовим pending bull OB (последняя медвежья свеча перед импульсом)
+            last_sh = (i, ph[i])
             ob_hi_bar = i - 1
             while ob_hi_bar > max(0, i-swing_len):
                 ci = candles[ob_hi_bar]
                 is_bearish = ci["close"] < ci["open"]
                 size_ok = (ci["high"] - ci["low"]) >= min_ob_size * (atr_arr[i] or 0.001)
                 if is_bearish and size_ok:
-                    bull_obs.append({"dir":+1,"hi":ci["high"],"lo":ci["low"],"i":ob_hi_bar})
-                    if len(bull_obs) > 10: bull_obs.pop(0)
-                    if _collect:
-                        coll_bull_obs.append({"hi":ci["high"],"lo":ci["low"],"i":ob_hi_bar})
+                    pending_bull_ob = {"hi": ci["high"], "lo": ci["low"], "i": ob_hi_bar, "level": ph[i]}
                     break
                 ob_hi_bar -= 1
 
         if pl[i] is not None:
-            # New swing low → Медвежий OB = последняя бычья свеча перед импульсом вниз
-            last_sl_sw = (i, pl[i])  # всегда обновляем — нужен актуальный уровень для BOS
+            # New swing low → готовим pending bear OB (последняя бычья свеча перед импульсом)
+            last_sl_sw = (i, pl[i])
             ob_lo_bar = i - 1
             while ob_lo_bar > max(0, i-swing_len):
                 ci = candles[ob_lo_bar]
                 is_bullish = ci["close"] > ci["open"]
                 size_ok = (ci["high"] - ci["low"]) >= min_ob_size * (atr_arr[i] or 0.001)
                 if is_bullish and size_ok:
-                    bear_obs.append({"dir":-1,"hi":ci["high"],"lo":ci["low"],"i":ob_lo_bar})
-                    if len(bear_obs) > 10: bear_obs.pop(0)
-                    if _collect:
-                        coll_bear_obs.append({"hi":ci["high"],"lo":ci["low"],"i":ob_lo_bar})
+                    pending_bear_ob = {"hi": ci["high"], "lo": ci["low"], "i": ob_lo_bar, "level": pl[i]}
                     break
                 ob_lo_bar -= 1
+
+        # BOS подтверждение → активируем pending OB
+        if pending_bull_ob is not None and close_i > pending_bull_ob["level"]:
+            bull_obs.append({"dir": +1, "hi": pending_bull_ob["hi"], "lo": pending_bull_ob["lo"], "i": pending_bull_ob["i"]})
+            if len(bull_obs) > 10: bull_obs.pop(0)
+            if _collect:
+                coll_bull_obs.append({"hi": pending_bull_ob["hi"], "lo": pending_bull_ob["lo"], "i": pending_bull_ob["i"]})
+            pending_bull_ob = None
+
+        if pending_bear_ob is not None and close_i < pending_bear_ob["level"]:
+            bear_obs.append({"dir": -1, "hi": pending_bear_ob["hi"], "lo": pending_bear_ob["lo"], "i": pending_bear_ob["i"]})
+            if len(bear_obs) > 10: bear_obs.pop(0)
+            if _collect:
+                coll_bear_obs.append({"hi": pending_bear_ob["hi"], "lo": pending_bear_ob["lo"], "i": pending_bear_ob["i"]})
+            pending_bear_ob = None
 
         # OB митигация: удаляем пробитые OB
         if ob_mit == "close":
