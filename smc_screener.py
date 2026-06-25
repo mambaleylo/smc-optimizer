@@ -331,7 +331,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.49.0"
+APP_VERSION  = "3.49.1"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -1041,10 +1041,14 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
     coll_bear_obs = []
 
     # Pending OB кандидаты — ждут подтверждения BOS
-    # При появлении pivot high → ищем медвежью свечу перед ним → кладём в pending_bull_ob
-    # OB становится активным только когда close пробивает last_sh (BOS подтверждён)
     pending_bull_ob = None  # {"hi":, "lo":, "i":, "level": pivot_price}
     pending_bear_ob = None  # {"hi":, "lo":, "i":, "level": pivot_price}
+
+    # Тип последнего активированного OB: "bos" или "choch"
+    # BOS = пробой в направлении текущего тренда (продолжение)
+    # CHoCH = пробой против текущего тренда (разворот)
+    last_bull_ob_type = "bos"  # тип последнего bull OB
+    last_bear_ob_type = "bos"  # тип последнего bear OB
 
     for i in range(swing_len*2, n):
         c = candles[i]
@@ -1078,16 +1082,18 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
                     break
                 ob_lo_bar -= 1
 
-        # BOS подтверждение → активируем pending OB
+        # BOS подтверждение → активируем pending OB + запоминаем тип (CHoCH или BOS)
         if pending_bull_ob is not None and close_i > pending_bull_ob["level"]:
-            bull_obs.append({"dir": +1, "hi": pending_bull_ob["hi"], "lo": pending_bull_ob["lo"], "i": pending_bull_ob["i"]})
+            last_bull_ob_type = "choch" if sw_trend == -1 else "bos"
+            bull_obs.append({"dir": +1, "hi": pending_bull_ob["hi"], "lo": pending_bull_ob["lo"], "i": pending_bull_ob["i"], "type": last_bull_ob_type})
             if len(bull_obs) > 10: bull_obs.pop(0)
             if _collect:
                 coll_bull_obs.append({"hi": pending_bull_ob["hi"], "lo": pending_bull_ob["lo"], "i": pending_bull_ob["i"]})
             pending_bull_ob = None
 
         if pending_bear_ob is not None and close_i < pending_bear_ob["level"]:
-            bear_obs.append({"dir": -1, "hi": pending_bear_ob["hi"], "lo": pending_bear_ob["lo"], "i": pending_bear_ob["i"]})
+            last_bear_ob_type = "choch" if sw_trend == +1 else "bos"
+            bear_obs.append({"dir": -1, "hi": pending_bear_ob["hi"], "lo": pending_bear_ob["lo"], "i": pending_bear_ob["i"], "type": last_bear_ob_type})
             if len(bear_obs) > 10: bear_obs.pop(0)
             if _collect:
                 coll_bear_obs.append({"hi": pending_bear_ob["hi"], "lo": pending_bear_ob["lo"], "i": pending_bear_ob["i"]})
@@ -1181,16 +1187,15 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
             continue
 
         # Бычий сигнал: цена возвращается в бычий OB
-        # choch_only=False: торгуем и BOS (sw_trend==+1) и CHoCH (sw_trend==-1)
-        # choch_only=True: торгуем только CHoCH — разворот из даунтренда (sw_trend==-1)
+        # choch_only=False: торгуем и BOS и CHoCH OBs
+        # choch_only=True: торгуем только OB которые были активированы через CHoCH
         for ob in reversed(bull_obs):
             in_ob = low_i <= ob["hi"] and high_i >= ob["lo"]
             if choch_only:
-                trend_ok = (sw_trend == -1)  # CHoCH: разворот из даунтренда вверх
+                trend_ok = (ob.get("type") == "choch")
             else:
-                trend_ok = True  # BOS + CHoCH: любой тренд
+                trend_ok = True
             if in_ob and trend_ok:
-                # FVG подтверждение
                 fvg_ok = True
                 if req_fvg and fvg_enabled:
                     fvg_ok = any(f[0] > ob["i"] and f[0] <= i and
@@ -1205,9 +1210,9 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
             for ob in reversed(bear_obs):
                 in_ob = high_i >= ob["lo"] and low_i <= ob["hi"]
                 if choch_only:
-                    trend_ok = (sw_trend == +1)  # CHoCH: разворот из аптренда вниз
+                    trend_ok = (ob.get("type") == "choch")
                 else:
-                    trend_ok = True  # BOS + CHoCH: любой тренд
+                    trend_ok = True
                 if in_ob and trend_ok:
                     fvg_ok = True
                     if req_fvg and fvg_enabled:
