@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.50.6
+- v3.50.6: найдено и исправлено 4 бага в авто-трейде и мониторе.
+  1) КРИТИЧЕСКИЙ: our_pos не был объявлен перед использованием →
+     NameError при каждом новом сигнале → авто-трейд никогда не
+     открывал сделки после первого срабатывания.
+  2) Экранированный \\n в Telegram-алерте «сигнал пропал» → текст
+     приходил одной строкой с буквальным \n.
+  3) Лишний вызов _gate_get_price() в ветке «тот же сигнал» — результат
+     нигде не использовался.
+  4) Монитор графика: алерт при первом запуске теперь отправляется только
+     если entry_ts сигнала > start_ts монитора (сигнал появился после
+     старта), чтобы не спамить о старых уже открытых сделках.
 SMC Optimizer v3.50.5
 - v3.50.5: критический фикс _gate_open_position — TP/SL вынесены в отдельный
   try/except с retry (2 попытки). Раньше исключение на шаге TP/SL поглощалось
@@ -389,7 +401,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.50.5"
+APP_VERSION  = "3.50.6"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -488,6 +500,7 @@ chart_mon_state = {
     "active": False, "symbol": None, "tf": None, "days": 30,
     "params": None, "armed": False,
     "last_entry_ts": None, "last_dir": None, "last_check": 0,
+    "start_ts": 0,   # время запуска монитора — сигналы старше не считаются новыми
 }
 _chart_mon_stop   = threading.Event()
 _chart_mon_thread = None
@@ -848,6 +861,9 @@ def _auto_trade_loop():
 
                             existing = _gate_get_position(sym)
 
+                            with auto_trade_lock:
+                                our_pos = auto_trade_state.get("position")
+
                             # ── Чужая / неизвестная позиция ───────────────
                             # На бирже есть позиция, но мы её не открывали
                             # (auto_trade_state["position"] is None).
@@ -968,8 +984,7 @@ def _auto_trade_loop():
                                     auto_trade_state["position"] = pos_info
                                     auto_trade_state["last_entry_ts"] = entry_ts
                         else:
-                            # Тот же сигнал — просто логируем статус позиции
-                            cur_price = _gate_get_price(sym)
+                            # Тот же сигнал — обновляем время последней проверки
                             with auto_trade_lock:
                                 auto_trade_state["last_check"] = time.time()
                                 auto_trade_state["last_error"] = ""
@@ -981,7 +996,7 @@ def _auto_trade_loop():
                         if armed:
                             olog(f"⚠ Авто-трейд: сигнал исчез (нет активных сигналов на {sym} {tf})")
                             _send_alert(
-                                f"⚠️ <b>{sym} {tf}</b> — сигнал пропал\\n"
+                                f"⚠️ <b>{sym} {tf}</b> — сигнал пропал\n"
                                 f"Нет активных сигналов. Проверяю зависшие TP/SL-ордера."
                             )
                             # Если позиции нет — отменяем зависшие price_orders
@@ -1984,14 +1999,15 @@ def _chart_monitor_loop(sym, tf, days, p):
                         new_sig = None
                         with chart_mon_lock:
                             if not chart_mon_state["armed"]:
-                                # Первый запуск — всегда шлём алерт, чтобы не
-                                # потерять сигнал который уже был когда монитор
-                                # только стартовал
                                 chart_mon_state["armed"]         = True
                                 chart_mon_state["last_entry_ts"] = entry_ts
                                 chart_mon_state["last_dir"]      = sig["dir"]
                                 chart_mon_state["signal_gone_notified"] = False
-                                new_sig = sig
+                                # Шлём алерт только если сигнал появился ПОСЛЕ
+                                # запуска монитора — иначе это старый сигнал
+                                # (уже открытая сделка) и алерт не нужен
+                                start_ts_mon = chart_mon_state.get("start_ts", 0)
+                                new_sig = sig if entry_ts > start_ts_mon else None
                             elif entry_ts != chart_mon_state["last_entry_ts"]:
                                 chart_mon_state["last_entry_ts"] = entry_ts
                                 chart_mon_state["last_dir"]      = sig["dir"]
@@ -4038,6 +4054,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "active": True, "symbol": sym, "tf": tf, "days": days,
                     "params": p, "armed": False,
                     "last_entry_ts": None, "last_dir": None, "last_check": 0,
+                    "start_ts": time.time(),
                 })
             _chart_mon_thread = threading.Thread(
                 target=_chart_monitor_loop, args=(sym, tf, days, p), daemon=True)
