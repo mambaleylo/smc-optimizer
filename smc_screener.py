@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.50.8
+- v3.50.8: дефолтные значения SL/TP изменены: SL 0.6%→0.3%, TP 1.2%→0.6%
+  во всех местах (opt_state, screener_state, HTML-инпуты оптимизатора
+  и монитора графика, JS-фоллбэки).
 SMC Optimizer v3.50.7
 - v3.50.7: ещё 3 бага авто-трейда. 1) В ветке «тот же сигнал» добавлена
   проверка _gate_get_position — если позиция закрылась по TP/SL или
@@ -410,7 +414,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.50.7"
+APP_VERSION  = "3.50.8"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -483,7 +487,7 @@ opt_state  = {
     "running": False, "logs": [], "best": None, "top20": [],
     "cycle": 0, "trials": 0, "progress": 0,
     "symbol": "BTC_USDT", "tf": "15m", "days": 30,
-    "sl_pct": 0.6, "tp_pct": 1.2, "risk_pct": 10.0,
+    "sl_pct": 0.3, "tp_pct": 0.6, "risk_pct": 10.0,
     "chart": None, "fetch_pct": 0, "logs_dropped": 0,
     "eco_mode": False,
 }
@@ -496,7 +500,7 @@ screener_state = {
     "current_sym": "", "sym_index": 0, "sym_total": 0,
     "current_cycle": 0, "max_cycles": 100,
     "results": [], "tf":"15m", "days":30,
-    "sl_pct":0.6, "tp_pct":1.2, "risk_pct":10.0,
+    "sl_pct":0.3, "tp_pct":0.6, "risk_pct":10.0,
     "active_workers": {},  # sym -> {"cycle": N, "max_cycles": 100, "phase": "fetch"|"opt"}
 }
 _screener_stop   = threading.Event()
@@ -2558,8 +2562,8 @@ input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;p
       <option>30m</option><option>1h</option><option>4h</option><option>1d</option>
     </select>
     <label>Дней истории</label><input id="days" type="number" value="30" min="7" max="365">
-    <label>SL %</label><input id="sl_pct" type="number" value="0.6" step="0.05">
-    <label>TP %</label><input id="tp_pct" type="number" value="1.2" step="0.05">
+    <label>SL %</label><input id="sl_pct" type="number" value="0.3" step="0.05">
+    <label>TP %</label><input id="tp_pct" type="number" value="0.6" step="0.05">
     <label>Риск на сделку %</label><input id="risk_pct" type="number" value="10" step="1">
   </div>
   <div class="card">
@@ -2642,8 +2646,8 @@ input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;p
     </select></label>
     <label>Дней<input id="cDays" type="number" value="7" min="1" max="60" style="width:60px"></label>
     <label>Swing<input id="cSwing" type="number" value="10" min="3" max="50" style="width:60px"></label>
-    <label>SL%<input id="cSl" type="number" value="0.8" step="0.1" style="width:60px"></label>
-    <label>TP%<input id="cTp" type="number" value="1.6" step="0.1" style="width:60px"></label>
+    <label>SL%<input id="cSl" type="number" value="0.3" step="0.1" style="width:60px"></label>
+    <label>TP%<input id="cTp" type="number" value="0.6" step="0.1" style="width:60px"></label>
     <button class="btn btn-go" onclick="loadChart()" style="align-self:flex-end">Загрузить</button>
     <button class="btn" id="monBtn" onclick="toggleChartMonitor()" style="align-self:flex-end">🔔 Алерты</button>
     <button class="btn" id="atBtn" onclick="toggleAutoTrade()" style="align-self:flex-end;background:#1a3a5c">🤖 Авто</button>
@@ -2724,8 +2728,8 @@ function applyBestToChart(){
   }
   document.getElementById('cDays').value  = document.getElementById('days').value;
   document.getElementById('cSwing').value = p.swing_len  != null ? p.swing_len  : 10;
-  document.getElementById('cSl').value    = p.sl_pct     != null ? p.sl_pct     : 0.8;
-  document.getElementById('cTp').value    = p.tp_pct     != null ? p.tp_pct     : 1.6;
+  document.getElementById('cSl').value    = p.sl_pct     != null ? p.sl_pct     : 0.3;
+  document.getElementById('cTp').value    = p.tp_pct     != null ? p.tp_pct     : 0.6;
   _chartExtra = {
     internal_len:       p.internal_len       != null ? p.internal_len       : 5,
     ob_filter:          p.ob_filter          != null ? p.ob_filter          : 'atr',
