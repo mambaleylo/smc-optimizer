@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.51.2
+- v3.51.2: переделан AMOLED скринсейвер. Блок теперь гуляет по ВСЕМУ
+  экрану (был только центр 28-72% по X, 32-68% по Y). Позиция вычисляется
+  через реальный offsetWidth/offsetHeight после рендера — блок никогда не
+  вылезет за края (отступ 24px). Убран white-space:nowrap, добавлен
+  max-width:min(300px,82vw) — статус не обрезается и не растягивает экран.
+  Переход плавный через requestAnimationFrame.
 SMC Optimizer v3.51.1
 - v3.51.1: убрано принудительное переключение вкладки на «График» при
   нахождении нового лучшего конфига. Конфиг по-прежнему применяется к
@@ -433,7 +440,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.51.1"
+APP_VERSION  = "3.51.2"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -2567,9 +2574,10 @@ input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;p
   position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);
   text-align:center;font-family:'JetBrains Mono',monospace,sans-serif;
   color:rgba(255,255,255,.92);
-  transition:opacity 1.1s ease,color 1.1s ease,top 1.1s ease,left 1.1s ease;
-  user-select:none;pointer-events:none;white-space:nowrap;
-  min-width:260px;
+  transition:opacity .35s ease,top 1.0s ease,left 1.0s ease;
+  user-select:none;pointer-events:none;
+  max-width:min(300px,82vw);
+  width:max-content;
 }
 #amoledContent .as-time{font-size:4.2rem;font-weight:500;letter-spacing:.04em;line-height:1;color:#f0b800}
 #amoledContent .as-date{font-size:1rem;margin-top:8px;opacity:.7;text-transform:capitalize}
@@ -3850,13 +3858,22 @@ function _amoledShift(){
   const night=_amoledIsNight();
   content.style.opacity='0';
   setTimeout(()=>{
-    if(ov.style.display!=='block') return; // уже разбудили — не дорисовываем
+    if(ov.style.display!=='block') return;
     content.classList.toggle('night',night);
     content.innerHTML=_amoledPanel(night);
-    // случайное смещение в пределах центральной зоны — защита от выгорания
-    content.style.top=(32+Math.random()*36)+'%';
-    content.style.left=(28+Math.random()*44)+'%';
-    content.style.opacity='1';
+    // После рендера — вычисляем реальный размер блока и гуляем по всему экрану
+    requestAnimationFrame(()=>{
+      const W=window.innerWidth, H=window.innerHeight;
+      const bw=content.offsetWidth||220, bh=content.offsetHeight||140;
+      const pad=24; // отступ от краёв
+      const minX=pad+bw/2, maxX=W-pad-bw/2;
+      const minY=pad+bh/2, maxY=H-pad-bh/2;
+      const x=minX+Math.random()*(maxX-minX);
+      const y=minY+Math.random()*(maxY-minY);
+      content.style.left=Math.round(x)+'px';
+      content.style.top=Math.round(y)+'px';
+      content.style.opacity='1';
+    });
     _amoledExitBtnShift();
   },350);
 }
