@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.50.5
+- v3.50.5: критический фикс _gate_open_position — TP/SL вынесены в отдельный
+  try/except с retry (2 попытки). Раньше исключение на шаге TP/SL поглощалось
+  общим except и функция возвращала None → position оставался None → на графике
+  позиция не отображалась, Telegram-алерт не отправлялся. Теперь позиция всегда
+  регистрируется и алерт всегда приходит; при сбое TP/SL — отдельное критическое
+  уведомление с просьбой выставить стоп вручную.
 SMC Optimizer v3.50.4
 - v3.50.4: три критических фикса. 1) Монитор графика теперь шлёт алерт о
   новом сигнале сразу при старте (раньше первый сигнал молча проглатывался).
@@ -382,7 +389,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.50.4"
+APP_VERSION  = "3.50.5"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -688,56 +695,83 @@ def _gate_open_position(symbol, direction, entry_px, sl_px, tp_px, risk_pct, **k
         })
         time.sleep(1.0)
 
+        # Позиция открыта — дальше TP/SL в отдельном блоке,
+        # чтобы исключение не съело алерт и return
         close_size = -size if is_long else size
+        pos_info   = {"dir": direction, "entry": entry_px, "sl": sl_px, "tp": tp_px,
+                      "size": size, "leverage": applied_leverage, "notional": round(notional, 2)}
+        tp_sl_ok   = False
 
-        # 7. TP триггерный маркет (как в WickFill: price="0", ioc)
-        _gate_req("POST", "/futures/usdt/price_orders", body={
-            "initial": {
-                "contract":    contract,
-                "size":        close_size,
-                "price":       "0",
-                "tif":         "ioc",
-                "reduce_only": True,
-                "text":        "t-smc-tp",
-            },
-            "trigger": {
-                "strategy_type": 0,
-                "price_type":    0,
-                "price":         _gate_round_price(tp_px, contract),
-                "rule":          1 if is_long else 2,
-                "expiration":    86400,
-            },
-        })
+        def _place_tp_sl():
+            # 7. TP
+            _gate_req("POST", "/futures/usdt/price_orders", body={
+                "initial": {
+                    "contract":    contract,
+                    "size":        close_size,
+                    "price":       "0",
+                    "tif":         "ioc",
+                    "reduce_only": True,
+                    "text":        "t-smc-tp",
+                },
+                "trigger": {
+                    "strategy_type": 0,
+                    "price_type":    0,
+                    "price":         _gate_round_price(tp_px, contract),
+                    "rule":          1 if is_long else 2,
+                    "expiration":    86400,
+                },
+            })
+            # 8. SL
+            _gate_req("POST", "/futures/usdt/price_orders", body={
+                "initial": {
+                    "contract":    contract,
+                    "size":        close_size,
+                    "price":       "0",
+                    "tif":         "ioc",
+                    "reduce_only": True,
+                    "text":        "t-smc-sl",
+                },
+                "trigger": {
+                    "strategy_type": 0,
+                    "price_type":    0,
+                    "price":         _gate_round_price(sl_px, contract),
+                    "rule":          2 if is_long else 1,
+                    "expiration":    86400,
+                },
+            })
 
-        # 8. SL триггерный маркет
-        _gate_req("POST", "/futures/usdt/price_orders", body={
-            "initial": {
-                "contract":    contract,
-                "size":        close_size,
-                "price":       "0",
-                "tif":         "ioc",
-                "reduce_only": True,
-                "text":        "t-smc-sl",
-            },
-            "trigger": {
-                "strategy_type": 0,
-                "price_type":    0,
-                "price":         _gate_round_price(sl_px, contract),
-                "rule":          2 if is_long else 1,
-                "expiration":    86400,
-            },
-        })
+        # Первая попытка
+        try:
+            _place_tp_sl()
+            tp_sl_ok = True
+        except Exception as e_tp:
+            olog(f"⚠ TP/SL попытка 1 упала: {e_tp} — повтор через 2с")
+            time.sleep(2.0)
+            try:
+                _place_tp_sl()
+                tp_sl_ok = True
+                olog("✓ TP/SL выставлены со второй попытки")
+            except Exception as e_tp2:
+                olog(f"🚨 TP/SL НЕ выставлены после 2 попыток: {e_tp2}")
+                _send_alert(
+                    f"🚨 <b>{symbol}</b> — позиция открыта, но TP/SL НЕ выставлены!\n"
+                    f"Причина: {e_tp2}\nВыставь стоп вручную! "
+                    f"TP={_fmt_px(tp_px)} SL={_fmt_px(sl_px)}"
+                )
 
-        olog(f"✅ {symbol} открыт + TP/SL выставлены")
+        emoji = "🟢" if is_long else "🔴"
+        status = "✅ открыт + TP/SL выставлены" if tp_sl_ok else "⚠️ открыт, TP/SL — см. выше"
+        olog(f"{status}: {symbol} {direction.upper()}")
         _send_alert(
-            f"{'🟢' if is_long else '🔴'} <b>{symbol} SMC AUTO</b> — {direction.upper()}\n"
+            f"{emoji} <b>{symbol} SMC AUTO</b> — {direction.upper()}\n"
             f"Entry ≈ {_fmt_px(entry_px)} | TP {_fmt_px(tp_px)} | SL {_fmt_px(sl_px)}\n"
             f"Size {size} контр | ~{notional:.1f}U | {applied_leverage}×плечо"
+            + ("" if tp_sl_ok else "\n⚠️ TP/SL не выставлены — проверь вручную!")
         )
-        return {"dir": direction, "entry": entry_px, "sl": sl_px, "tp": tp_px,
-                "size": size, "leverage": applied_leverage, "notional": round(notional, 2)}
+        return pos_info
     except Exception as e:
         olog(f"⚠ gate_open_position {symbol}: {e}")
+        _send_alert(f"🚨 <b>{symbol}</b> — ошибка открытия позиции:\n{e}")
         return None
 
 def _load_gate_cfg():
