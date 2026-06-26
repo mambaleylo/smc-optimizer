@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.51.8
+- v3.51.8: фон канваса графика оставался чёрным (#0d0d0d) в светлой теме —
+  drawChart() рисовал fillRect хардкодным цветом КАЖДЫЙ кадр, перекрывая
+  CSS var(--canvas-bg), который и так был на самом <canvas> правильным.
+  Добавлены CSS-переменные --chart-grid/--chart-axis/--chart-dim/
+  --chart-entry (свои значения для тёмной и светлой темы — сетка/подписи
+  были на белой/серой основе и были бы невидимы на светлом фоне).
+  drawChart() теперь читает все эти цвета через getComputedStyle() при
+  каждой перерисовке вместо хардкода. Цвета свечей/Long/Short/OB/FVG
+  не трогал — это намеренно фиксированная торговая палитра.
 SMC Optimizer v3.51.7
 - v3.51.7: критический фикс пустой вкладки «График». При переносе топ-20
   выше лога (v3.51.4) потерялся закрывающий </div> у #optPanel — из-за
@@ -477,7 +487,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.51.7"
+APP_VERSION  = "3.51.8"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -2629,6 +2639,10 @@ HTML = """<!DOCTYPE html><html lang="ru"><head>
   --log-bg:    #0a0a0a;
   --canvas-bg: #0a0a0a;
   --eq-track:  #2a2a2a;
+  --chart-grid:  rgba(255,255,255,0.04);
+  --chart-axis:  rgba(120,120,120,0.6);
+  --chart-dim:   rgba(140,140,140,0.4);
+  --chart-entry: rgba(200,200,200,0.4);
 }
 
 /* ── Светлая тема ── */
@@ -2658,6 +2672,10 @@ HTML = """<!DOCTYPE html><html lang="ru"><head>
     --log-bg:    #eceae4;
     --canvas-bg: #f7f5ef;
     --eq-track:  #ccc9c0;
+    --chart-grid:  rgba(0,0,0,0.07);
+    --chart-axis:  rgba(60,55,45,0.75);
+    --chart-dim:   rgba(70,65,55,0.6);
+    --chart-entry: rgba(50,45,35,0.45);
   }
 }
 
@@ -3619,15 +3637,22 @@ function drawChart(){
   mn-=pad2;mx+=pad2;
   function toY(p){return PAD.t+cH*(1-(p-mn)/(mx-mn));}
   function toX(i){return PAD.l+(i-s+0.5)*barW;}
+  // ── Цвета канваса берём из CSS-переменных — подхватывают тему автоматически
+  var _rs=getComputedStyle(document.documentElement);
+  var bgCol=_rs.getPropertyValue('--canvas-bg').trim()||'#0d0d0d';
+  var gridCol=_rs.getPropertyValue('--chart-grid').trim()||'rgba(255,255,255,0.04)';
+  var axisCol=_rs.getPropertyValue('--chart-axis').trim()||'rgba(120,120,120,0.6)';
+  var dimCol=_rs.getPropertyValue('--chart-dim').trim()||'rgba(140,140,140,0.4)';
+  var entryCol=_rs.getPropertyValue('--chart-entry').trim()||'rgba(200,200,200,0.4)';
   // ── Фон ─────────────────────────────────────────────────────────────────
-  ctx2.fillStyle='#0d0d0d';ctx2.fillRect(0,0,W,H);
+  ctx2.fillStyle=bgCol;ctx2.fillRect(0,0,W,H);
   // Сетка — только горизонтальные линии, очень тонкие
-  ctx2.strokeStyle='rgba(255,255,255,0.04)';ctx2.lineWidth=0.5;
+  ctx2.strokeStyle=gridCol;ctx2.lineWidth=0.5;
   function fmt(v){return v>1000?v.toFixed(1):v>10?v.toFixed(2):v.toFixed(4);}
   for(var g=0;g<=4;g++){
     var p=mn+(mx-mn)*g/4,y=toY(p);
     ctx2.beginPath();ctx2.moveTo(PAD.l,y);ctx2.lineTo(W-PAD.r,y);ctx2.stroke();
-    ctx2.fillStyle='rgba(120,120,120,0.6)';ctx2.font='9px monospace';ctx2.textAlign='right';
+    ctx2.fillStyle=axisCol;ctx2.font='9px monospace';ctx2.textAlign='right';
     ctx2.fillText(fmt(p),PAD.l-4,y+3);
   }
   // ── FVG — очень прозрачно, только штрих по левому краю ──────────────────
@@ -3690,7 +3715,7 @@ function drawChart(){
       ctx2.strokeStyle=clrSL;
       ctx2.beginPath();ctx2.moveTo(xe,ys);ctx2.lineTo(xe2,ys);ctx2.stroke();
       // Entry линия
-      ctx2.strokeStyle='rgba(200,200,200,0.4)';ctx2.lineWidth=0.8;ctx2.setLineDash([3,5]);
+      ctx2.strokeStyle=entryCol;ctx2.lineWidth=0.8;ctx2.setLineDash([3,5]);
       ctx2.beginPath();ctx2.moveTo(xe,ye);ctx2.lineTo(xe2,ye);ctx2.stroke();
       ctx2.setLineDash([]);
       // Метки — только у правого края
@@ -3743,7 +3768,7 @@ function drawChart(){
     else{ctx2.moveTo(xe-sz,ye+offset);ctx2.lineTo(xe+sz,ye+offset);ctx2.lineTo(xe,ye);}
     ctx2.fill();
   });
-  ctx2.fillStyle='rgba(140,140,140,0.4)';ctx2.font='9px monospace';ctx2.textAlign='center';
+  ctx2.fillStyle=dimCol;ctx2.font='9px monospace';ctx2.textAlign='center';
   var every=Math.ceil(vis.length/8);
   vis.forEach(function(c,idx){
     if(idx%every===0){
