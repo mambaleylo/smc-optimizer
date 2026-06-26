@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.51.10
+- v3.51.10: фикс заниженного баланса (~в 15 раз меньше реального). Причина:
+  Gate.io имеет разные архитектуры маржи на /futures/usdt/accounts
+  (margin_mode: 0=classic, 1=cross-currency, 2=combined). В "новом classic
+  margin mode" с включённой кросс-маржой реальные деньги лежат в
+  cross_margin_balance, а total/available при этом показывают только
+  остаток на изолированной части счёта — отсюда занижение. _gate_get_equity()
+  теперь сначала проверяет cross_margin_balance (уже включает floating PnL)
+  и только если кросс-маржи нет — считает как раньше (total+unrealised_pnl).
+  Также: каждый запрос equity теперь пишет в Лог строку с сырыми значениями
+  (margin_mode/total/available/unrealised_pnl/cross_margin_balance) —
+  если баланс всё равно не совпадёт, эта строка в логе покажет точную причину.
 SMC Optimizer v3.51.9
 - v3.51.9: AMOLED-экран — убран PF, Return теперь в долларах (как колонка
   "$100→$X" в топ-20) вместо процентов. Добавлен баланс на бирже.
@@ -500,7 +512,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.51.9"
+APP_VERSION  = "3.51.10"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -720,21 +732,44 @@ def _gate_get_balance():
 
 def _gate_get_equity():
     """Баланс аккаунта С УЧЁТОМ открытой позиции (для отображения в UI/AMOLED).
-    Gate возвращает:
-      total           — балансовый счёт (депозиты/выводы/реализованный PnL/комиссии),
-                         НЕ включает текущий floating PnL. Не "проваливается" при
-                         открытии позиции — маржа просто переезжает из available
-                         в position_margin, total не меняется.
-      unrealised_pnl  — плавающий PnL открытых позиций (по марк-цене).
-    equity = total + unrealised_pnl — это и есть реальный размер счёта прямо
-    сейчас, включая открытую сделку. В отличие от available (свободная маржа),
-    он не падает почти до нуля когда позиция открыта — available тут не годится,
-    т.к. показывает только незанятые деньги, а не весь счёт."""
+
+    У Gate несколько архитектур маржи на /futures/usdt/accounts
+    (поле margin_mode: 0=classic, 1=cross-currency, 2=combined), и в
+    "новом classic margin mode" (когда включена кросс-маржа) реальные
+    деньги аккаунта лежат в cross_margin_balance, а классические total/
+    available при этом показывают только небольшой остаток на изолированной
+    части — отсюда и было занижение баланса (если у тебя кросс-маржа — то
+    самое "в 15 раз меньше"). Поэтому проверяем cross_margin_balance первым:
+      cross_margin_balance — кросс-маржа: уже включает floating PnL,
+                              это и есть полный equity в этом режиме.
+    Если кросс-маржи нет (margin_mode=0, старый classic) — считаем как раньше:
+      total           — балансовый счёт, не включает floating PnL, не
+                         "проваливается" при открытии позиции.
+      unrealised_pnl  — плавающий PnL по марк-цене.
+      equity = total + unrealised_pnl
+    """
     try:
         data = _gate_req("GET", "/futures/usdt/accounts")
-        total = float(data.get("total", 0))
-        upnl  = float(data.get("unrealised_pnl", 0))
-        return total + upnl
+        def _f(key):
+            v = data.get(key)
+            if v in (None, ""):
+                return None
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return None
+        cross_bal = _f("cross_margin_balance")
+        total     = _f("total")
+        upnl      = _f("unrealised_pnl") or 0.0
+        avail     = _f("available")
+        olog(f"🔍 gate_equity: margin_mode={data.get('margin_mode')} "
+             f"enable_credit={data.get('enable_credit')} total={total} "
+             f"available={avail} unrealised_pnl={upnl} cross_margin_balance={cross_bal}")
+        if cross_bal is not None and cross_bal > 0:
+            return cross_bal
+        if total is not None:
+            return total + upnl
+        return avail
     except Exception as e:
         olog(f"⚠ gate_get_equity: {e}")
         return None
