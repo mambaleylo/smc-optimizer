@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.51.9
+- v3.51.9: AMOLED-экран — убран PF, Return теперь в долларах (как колонка
+  "$100→$X" в топ-20) вместо процентов. Добавлен баланс на бирже.
+  Нюанс: при открытой позиции available (свободная маржа) почти нулевая,
+  т.к. деньги заняты под маржу — поэтому для отображения баланса введена
+  отдельная _gate_get_equity() = total + unrealised_pnl (см. Gate API:
+  total — балансовый счёт без floating PnL, не меняется при открытии
+  позиции; unrealised_pnl — плавающий PnL по марк-цене). Это даёт реальный
+  размер счёта с учётом открытой сделки. _gate_get_balance() (available)
+  не трогал — он используется для сайзинга НОВОЙ позиции, и там нужна
+  именно свободная маржа, а не equity с учётом уже открытых позиций по
+  другим символам. Новый эндпоинт GET /gate_equity, баланс обновляется
+  при входе/выходе из сделки и раз в 30с пока AMOLED активен.
 SMC Optimizer v3.51.8
 - v3.51.8: фон канваса графика оставался чёрным (#0d0d0d) в светлой теме —
   drawChart() рисовал fillRect хардкодным цветом КАЖДЫЙ кадр, перекрывая
@@ -487,7 +500,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.51.8"
+APP_VERSION  = "3.51.9"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -695,13 +708,36 @@ def _gate_get_quanto(symbol):
         return 0.0001
 
 def _gate_get_balance():
-    """Свободный баланс USDT."""
+    """Свободный баланс USDT (для расчёта размера новой позиции — именно
+    свободная маржа, а не equity, иначе сайзинг переоценит доступные деньги
+    если уже есть открытая позиция по другому символу)."""
     try:
         data = _gate_req("GET", "/futures/usdt/accounts")
         return float(data.get("available", 0))
     except Exception as e:
         olog(f"⚠ gate_get_balance: {e}")
         return 0.0
+
+def _gate_get_equity():
+    """Баланс аккаунта С УЧЁТОМ открытой позиции (для отображения в UI/AMOLED).
+    Gate возвращает:
+      total           — балансовый счёт (депозиты/выводы/реализованный PnL/комиссии),
+                         НЕ включает текущий floating PnL. Не "проваливается" при
+                         открытии позиции — маржа просто переезжает из available
+                         в position_margin, total не меняется.
+      unrealised_pnl  — плавающий PnL открытых позиций (по марк-цене).
+    equity = total + unrealised_pnl — это и есть реальный размер счёта прямо
+    сейчас, включая открытую сделку. В отличие от available (свободная маржа),
+    он не падает почти до нуля когда позиция открыта — available тут не годится,
+    т.к. показывает только незанятые деньги, а не весь счёт."""
+    try:
+        data = _gate_req("GET", "/futures/usdt/accounts")
+        total = float(data.get("total", 0))
+        upnl  = float(data.get("unrealised_pnl", 0))
+        return total + upnl
+    except Exception as e:
+        olog(f"⚠ gate_get_equity: {e}")
+        return None
 
 def _gate_cancel_orders(symbol):
     """Отменить все открытые ордера по символу — и лимитные/рыночные,
@@ -3060,7 +3096,7 @@ function saveGateCfg(){
   fetch('/gate_cfg',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({gate_key:key,gate_secret:sec})})
     .then(function(r){return r.json();})
-    .then(function(d){ if(d.ok) atInfo('✅ Ключи сохранены','var(--green)'); })
+    .then(function(d){ if(d.ok){ atInfo('✅ Ключи сохранены','var(--green)'); _refreshGateEquity(); } })
     .catch(function(e){ atInfo('Ошибка: '+e,'var(--red)'); });
 }
 
@@ -3090,6 +3126,7 @@ function startAutoTrade(){
         document.getElementById('atBtn').style.background='#1a5c2a';
         atInfo('Авто-трейд запущен. Ждём нового сигнала...','var(--green)');
         scheduleAtPoll();
+        _refreshGateEquity();
       } else {
         atInfo('❌ '+d.msg,'var(--red)');
       }
@@ -3116,6 +3153,7 @@ function stopAutoTrade(){
     document.getElementById('atStatusBadge').style.color='var(--text4)';
     document.getElementById('atBtn').style.background='#1a3a5c';
     atInfo('Авто-трейд остановлен.','var(--yellow)');
+    _refreshGateEquity();
   }).catch(function(e){ atInfo('Ошибка: '+e,'var(--red)'); });
 }
 
@@ -3124,6 +3162,7 @@ function closePosition(){
   fetch('/auto_trade_close',{method:'POST'}).then(function(r){return r.json();})
     .then(function(d){
       atInfo(d.ok?'✅ Позиция закрыта':'❌ '+d.msg, d.ok?'var(--green)':'var(--red)');
+      if(d.ok) _refreshGateEquity();
     }).catch(function(e){ atInfo('Ошибка: '+e,'var(--red)'); });
 }
 
@@ -3224,6 +3263,7 @@ function saveAlertCfgSync(){
 }
 
 loadAlertCfg();
+_refreshGateEquity(); // прогреваем кэш баланса заранее, чтобы AMOLED не ждал первый цикл
 
 var EQ_KEYS = ['wr','pf','trades','rr','dd'];
 var _eqDebounce = null;
@@ -3977,6 +4017,14 @@ function _amoledIsNight(){
   return (h>=22 || h<7); // приглушённый режим ночью, не слепит
 }
 
+// ── Баланс на бирже (с учётом открытой позиции) для AMOLED-экрана ──────────
+let _gateEquityCache = null; // {value, ts}
+function _refreshGateEquity(){
+  fetch('/gate_equity').then(function(r){return r.json();}).then(function(d){
+    if(d.ok) _gateEquityCache = {value:d.equity, ts:Date.now()};
+  }).catch(function(){});
+}
+
 function _amoledPanel(night){
   const now=new Date();
   const time=now.toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'});
@@ -3984,16 +4032,20 @@ function _amoledPanel(night){
   let html=`<div class="as-time">${time}</div><div class="as-date">${date}</div>`;
 
   const p=_bestParams, r=window._lastBestResult;
+  let rowItems=[];
   if(p && r){
     const wrCol=night?'inherit':(r.winrate>=55?'#0f9':r.winrate>=45?'#f0b800':'#f45');
     const retCol=night?'inherit':(r.total_return>=0?'#0f9':'#f45');
-    html+=`<div class="as-divider"></div>`+
-      `<div class="as-row">`+
-        `<div><b style="color:${wrCol}">${r.winrate}%</b><span>WR</span></div>`+
-        `<div><b>${r.profit_factor}</b><span>PF</span></div>`+
-        `<div><b style="color:${retCol}">${r.total_return}%</b><span>Return</span></div>`+
-        `<div><b>${r.trades}</b><span>T</span></div>`+
-      `</div>`;
+    const finalBal=Math.round(100*(1+r.total_return/100)); // баланс при старте с $100 (как в топ-20)
+    rowItems.push(`<div><b style="color:${wrCol}">${r.winrate}%</b><span>WR</span></div>`);
+    rowItems.push(`<div><b style="color:${retCol}">$${finalBal}</b><span>Return</span></div>`);
+    rowItems.push(`<div><b>${r.trades}</b><span>T</span></div>`);
+  }
+  if(_gateEquityCache && _gateEquityCache.value!=null){
+    rowItems.push(`<div><b>$${_gateEquityCache.value.toFixed(2)}</b><span>Баланс</span></div>`);
+  }
+  if(rowItems.length){
+    html+=`<div class="as-divider"></div><div class="as-row">${rowItems.join('')}</div>`;
   }
 
   let statusLine='';
@@ -4038,6 +4090,7 @@ function _amoledShift(){
   const ov=document.getElementById('amoledOverlay');
   const content=document.getElementById('amoledContent');
   if(!ov||!content||ov.style.display!=='block') return;
+  _refreshGateEquity();
   const night=_amoledIsNight();
   content.style.opacity='0';
   setTimeout(()=>{
@@ -4256,6 +4309,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json({"gate_key": GATE_KEY[:4]+"***" if GATE_KEY else "",
                         "gate_secret": "***" if GATE_SECRET else "",
                         "has_key": bool(GATE_KEY and GATE_SECRET)})
+
+        elif self.path == "/gate_equity":
+            if not GATE_KEY or not GATE_SECRET:
+                self._json({"ok": False, "msg": "нет ключей"})
+            else:
+                eq = _gate_get_equity()
+                if eq is None:
+                    self._json({"ok": False, "msg": "ошибка запроса"})
+                else:
+                    self._json({"ok": True, "equity": eq})
 
         elif self.path == "/auto_trade_status":
             with auto_trade_lock:
