@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.51.5
+- v3.51.5: универсальный дизайн день/ночь. Весь CSS переведён на
+  CSS-переменные (:root). Тёмная тема — по умолчанию. Светлая тема
+  подхватывается автоматически через @media(prefers-color-scheme:light)
+  — система телефона управляет темой. Акцент #f0b800 (жёлтый) заменён
+  на #4d9fff (синий) — одинаково читается на любом фоне. Все инлайн-
+  стили с захардкоженными цветами (#555, #888, #0d0d0d и т.д.) заменены
+  на var(--text3), var(--input-bg) и др.
 SMC Optimizer v3.51.4
 - v3.51.4: топ-20 конфигураций перемещён выше лога — теперь сразу виден
   после панели управления на мобильном. Скринер также перемещён выше лога.
@@ -452,7 +460,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.51.4"
+APP_VERSION  = "3.51.5"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -2577,70 +2585,130 @@ HTML = """<!DOCTYPE html><html lang="ru"><head>
 <title>SMC Optimizer</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:#0d0d0d;color:#e0e0e0;font-family:'JetBrains Mono',monospace,sans-serif;font-size:13px}
-.topbar{background:#111;border-bottom:1px solid #222;padding:8px 12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-.topbar h1{color:#f0b800;font-size:15px;font-weight:700}
-.ver{color:#555;font-size:11px}
+
+/* ── Тёмная тема (по умолчанию) ── */
+:root{
+  --bg:        #0d0d0d;
+  --bg2:       #111111;
+  --bg3:       #161616;
+  --bg4:       #0a0a0a;
+  --border:    #222222;
+  --border2:   #1e1e1e;
+  --text:      #e0e0e0;
+  --text2:     #aaaaaa;
+  --text3:     #666666;
+  --text4:     #555555;
+  --accent:    #4d9fff;
+  --accent2:   #2a6fcc;
+  --green:     #00dd88;
+  --red:       #ff4455;
+  --yellow:    #f0b800;
+  --pill-bg:   #161616;
+  --pill-on:   #bdf5d8;
+  --pill-on-b: #1a8f4a;
+  --pill-warn: #ffe2a8;
+  --pill-warn-b:#8f5a1a;
+  --input-bg:  #0d0d0d;
+  --log-bg:    #0a0a0a;
+  --canvas-bg: #0a0a0a;
+  --eq-track:  #2a2a2a;
+}
+
+/* ── Светлая тема ── */
+@media(prefers-color-scheme:light){
+  :root{
+    --bg:        #f0f2f5;
+    --bg2:       #ffffff;
+    --bg3:       #ffffff;
+    --bg4:       #e8eaed;
+    --border:    #d0d4da;
+    --border2:   #dde1e7;
+    --text:      #1a1a1a;
+    --text2:     #444444;
+    --text3:     #777777;
+    --text4:     #999999;
+    --accent:    #1a6fd4;
+    --accent2:   #0f52a8;
+    --green:     #0a8f50;
+    --red:       #d42020;
+    --yellow:    #b87800;
+    --pill-bg:   #f5f5f5;
+    --pill-on:   #0a5c30;
+    --pill-on-b: #0a8f50;
+    --pill-warn: #7a4a00;
+    --pill-warn-b:#c87000;
+    --input-bg:  #ffffff;
+    --log-bg:    #f8f9fa;
+    --canvas-bg: #ffffff;
+    --eq-track:  #d8dbe0;
+  }
+}
+
+body{background:var(--bg);color:var(--text);font-family:'JetBrains Mono',monospace,sans-serif;font-size:13px}
+.topbar{background:var(--bg2);border-bottom:1px solid var(--border);padding:8px 12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.topbar h1{color:var(--accent);font-size:15px;font-weight:700}
+.ver{color:var(--text4);font-size:11px}
 .btn{padding:6px 14px;border:none;border-radius:5px;cursor:pointer;font-size:12px;font-weight:600}
 .btn-go{background:#1a8f4a;color:#fff}.btn-go:hover{background:#22b85e}
 .btn-stop{background:#8f1a1a;color:#fff}.btn-stop:hover{background:#b82222}
-.btn-sm{background:#222;color:#aaa;padding:4px 10px;font-size:11px}
-.global-status{display:flex;gap:8px;flex-wrap:wrap;padding:5px 12px;background:#0a0a0a;border-bottom:1px solid #1c1c1c}
-.gs-pill{display:flex;align-items:center;gap:5px;padding:3px 9px;border-radius:11px;background:#161616;border:1px solid #262626;font-size:11px;color:#888;transition:color .2s,border-color .2s}
-.gs-pill.on{color:#bdf5d8;border-color:#1a8f4a}
-.gs-pill.warn{color:#ffe2a8;border-color:#8f5a1a}
-.gs-dot{width:7px;height:7px;border-radius:50%;background:#3a3a3a;flex:none;transition:background .2s,box-shadow .2s}
-.gs-dot.on{background:#0f9;box-shadow:0 0 5px #0f9}
-.gs-dot.warn{background:#f0b800;box-shadow:0 0 5px #f0b800}
-.tabs{display:flex;gap:4px;padding:0 12px;background:#111;border-bottom:1px solid #222}
-.tab{padding:7px 16px;font-size:12px;cursor:pointer;color:#666;border-bottom:2px solid transparent;background:none;border:none}
-.tab.active{color:#f0b800;border-bottom:2px solid #f0b800}
+.btn-sm{background:var(--bg3);color:var(--text2);border:1px solid var(--border);padding:4px 10px;font-size:11px;border-radius:5px;cursor:pointer}
+.global-status{display:flex;gap:8px;flex-wrap:wrap;padding:5px 12px;background:var(--bg4);border-bottom:1px solid var(--border2)}
+.gs-pill{display:flex;align-items:center;gap:5px;padding:3px 9px;border-radius:11px;background:var(--pill-bg);border:1px solid var(--border);font-size:11px;color:var(--text3);transition:color .2s,border-color .2s}
+.gs-pill.on{color:var(--pill-on);border-color:var(--pill-on-b)}
+.gs-pill.warn{color:var(--pill-warn);border-color:var(--pill-warn-b)}
+.gs-dot{width:7px;height:7px;border-radius:50%;background:var(--border);flex:none;transition:background .2s,box-shadow .2s}
+.gs-dot.on{background:var(--green);box-shadow:0 0 5px var(--green)}
+.gs-dot.warn{background:var(--yellow);box-shadow:0 0 5px var(--yellow)}
+.tabs{display:flex;gap:4px;padding:0 12px;background:var(--bg2);border-bottom:1px solid var(--border)}
+.tab{padding:7px 16px;font-size:12px;cursor:pointer;color:var(--text3);border-bottom:2px solid transparent;background:none;border:none;border-bottom:2px solid transparent}
+.tab.active{color:var(--accent);border-bottom:2px solid var(--accent)}
 .tab-panel{display:none}.tab-panel.active{display:block}
 .body{display:grid;grid-template-columns:320px 1fr;gap:0;height:calc(100vh - 80px)}
 @media(max-width:700px){.body{grid-template-columns:1fr;height:auto}}
-.sidebar{background:#111;border-right:1px solid #1e1e1e;padding:10px;overflow-y:auto;height:100%}
+.sidebar{background:var(--bg2);border-right:1px solid var(--border2);padding:10px;overflow-y:auto;height:100%}
 .main{padding:10px;overflow-y:auto;height:100%}
-.card{background:#161616;border:1px solid #222;border-radius:6px;padding:10px;margin-bottom:8px}
-.card h3{color:#f0b800;font-size:12px;margin-bottom:6px}
-label{display:block;color:#888;font-size:11px;margin-bottom:2px}
-input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;padding:5px 7px;border-radius:4px;font-size:12px;margin-bottom:6px}
+.card{background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:10px;margin-bottom:8px}
+.card h3{color:var(--accent);font-size:12px;margin-bottom:6px}
+label{display:block;color:var(--text2);font-size:11px;margin-bottom:2px}
+input,select{width:100%;background:var(--input-bg);border:1px solid var(--border);color:var(--text);padding:5px 7px;border-radius:4px;font-size:12px;margin-bottom:6px}
+input:focus,select:focus{outline:none;border-color:var(--accent)}
 .stat-row{display:flex;justify-content:space-between;padding:2px 0;font-size:12px}
-.stat-label{color:#666}.stat-val{color:#e0e0e0;font-weight:600}
-.green{color:#0f9}.red{color:#f45}.yellow{color:#f0b800}
-.log-box{background:#0a0a0a;border:1px solid #1e1e1e;border-radius:4px;height:200px;overflow-y:auto;padding:6px;font-size:11px;font-family:monospace}
-.log-line{padding:1px 0;border-bottom:1px solid #111}
-.prog-bar{background:#1e1e1e;border-radius:3px;height:6px;margin:6px 0}
-.prog-fill{background:#f0b800;height:6px;border-radius:3px;transition:width .3s}
-.top20-row{display:grid;grid-template-columns:24px 1fr 1fr 1fr 1fr 1fr 1fr;gap:4px;padding:3px 0;border-bottom:1px solid #1a1a1a;font-size:11px;align-items:center}
+.stat-label{color:var(--text3)}.stat-val{color:var(--text);font-weight:600}
+.green{color:var(--green)}.red{color:var(--red)}.yellow{color:var(--yellow)}
+.log-box{background:var(--log-bg);border:1px solid var(--border2);border-radius:4px;height:200px;overflow-y:auto;padding:6px;font-size:11px;font-family:monospace}
+.log-line{padding:1px 0;border-bottom:1px solid var(--border2)}
+.prog-bar{background:var(--border2);border-radius:3px;height:6px;margin:6px 0}
+.prog-fill{background:var(--accent);height:6px;border-radius:3px;transition:width .3s}
+.top20-row{display:grid;grid-template-columns:24px 1fr 1fr 1fr 1fr 1fr 1fr;gap:4px;padding:3px 0;border-bottom:1px solid var(--border2);font-size:11px;align-items:center}
 .badge{display:inline-block;padding:1px 5px;border-radius:3px;font-size:10px;margin-right:3px}
-.badge-bull{background:#0a2a1a;color:#0f9}.badge-bear{background:#2a0a0a;color:#f45}
+.badge-bull{background:rgba(0,220,136,.15);color:var(--green)}.badge-bear{background:rgba(255,68,85,.15);color:var(--red)}
 #chartPanel{padding:10px}
 .chart-bar{display:flex;flex-wrap:wrap;gap:8px;align-items:flex-end;padding-bottom:10px}
-.chart-bar label{display:flex;flex-direction:column;font-size:11px;color:#888;gap:2px}
-.chart-bar input,.chart-bar select{background:#0d0d0d;border:1px solid #333;color:#e0e0e0;padding:4px 7px;border-radius:4px;font-size:12px;width:90px;margin-bottom:0}
-.chart-legend{display:flex;flex-wrap:wrap;gap:10px;padding:4px 0 8px;font-size:11px;color:#888}
+.chart-bar label{display:flex;flex-direction:column;font-size:11px;color:var(--text3);gap:2px}
+.chart-bar input,.chart-bar select{background:var(--input-bg);border:1px solid var(--border);color:var(--text);padding:4px 7px;border-radius:4px;font-size:12px;width:90px;margin-bottom:0}
+.chart-legend{display:flex;flex-wrap:wrap;gap:10px;padding:4px 0 8px;font-size:11px;color:var(--text3)}
 .chart-legend span{display:flex;align-items:center;gap:4px}
 .chart-legend i{display:inline-block;width:14px;height:6px;border-radius:2px}
 #chartMetrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(90px,1fr));gap:6px;margin-top:8px}
-.cm{background:#161616;border:1px solid #222;border-radius:5px;padding:8px 10px}
-.cm .cl{font-size:10px;color:#555}.cm .cv{font-size:16px;font-weight:700;color:#e0e0e0}
-#chartCanvas{display:block;width:100%;cursor:grab;border:1px solid #222;border-radius:5px;background:#0a0a0a}
-#chartStatus{font-size:11px;color:#555;padding:4px 0}
+.cm{background:var(--bg3);border:1px solid var(--border);border-radius:5px;padding:8px 10px}
+.cm .cl{font-size:10px;color:var(--text4)}.cm .cv{font-size:16px;font-weight:700;color:var(--text)}
+#chartCanvas{display:block;width:100%;cursor:grab;border:1px solid var(--border);border-radius:5px;background:var(--canvas-bg)}
+#chartStatus{font-size:11px;color:var(--text4);padding:4px 0}
 /* ── Эквалайзер fitness ── */
 .eq-bar{display:flex;justify-content:space-between;gap:2px;padding:4px 0 2px}
 .eq-ch{display:flex;flex-direction:column;align-items:center;gap:4px;flex:1;min-width:0}
-.eq-val{font-size:10px;color:#f0b800;font-weight:700;min-height:12px}
+.eq-val{font-size:10px;color:var(--accent);font-weight:700;min-height:12px}
 .eq-slot{position:relative;height:88px;width:100%;cursor:pointer;touch-action:none}
 .eq-slider{position:absolute;top:50%;left:50%;width:80px;height:18px;
   transform:translate(-50%,-50%) rotate(-90deg);
   -webkit-appearance:none;appearance:none;background:transparent;margin:0;
   pointer-events:none}
-.eq-slider::-webkit-slider-runnable-track{height:5px;background:#222;border-radius:3px}
+.eq-slider::-webkit-slider-runnable-track{height:5px;background:var(--eq-track);border-radius:3px}
 .eq-slider::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;border-radius:50%;
-  background:#f0b800;border:2px solid #0d0d0d;margin-top:-5.5px;box-shadow:0 0 4px rgba(240,184,0,.5)}
-.eq-slider::-moz-range-track{height:5px;background:#222;border-radius:3px}
-.eq-slider::-moz-range-thumb{width:16px;height:16px;border-radius:50%;background:#f0b800;border:2px solid #0d0d0d}
-.eq-lbl{font-size:9.5px;color:#888;text-align:center;line-height:1.2}
+  background:var(--accent);border:2px solid var(--bg);margin-top:-5.5px;box-shadow:0 0 4px rgba(77,159,255,.5)}
+.eq-slider::-moz-range-track{height:5px;background:var(--eq-track);border-radius:3px}
+.eq-slider::-moz-range-thumb{width:16px;height:16px;border-radius:50%;background:var(--accent);border:2px solid var(--bg)}
+.eq-lbl{font-size:9.5px;color:var(--text3);text-align:center;line-height:1.2}
 /* ── AMOLED screensaver ── */
 #amoledContent{
   position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);
@@ -2660,7 +2728,7 @@ input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;p
 #amoledContent .as-status{margin-top:14px;font-size:.78rem;opacity:.6;letter-spacing:.05em}
 #amoledContent.night{color:rgba(255,255,255,.10)}
 #amoledContent.night .as-time{color:inherit;font-weight:400}
-@media (max-width:480px){
+@media(max-width:480px){
   #amoledContent .as-time{font-size:3rem}
   #amoledContent .as-row{gap:16px}
   #amoledContent .as-row b{font-size:1.2rem}
@@ -2687,7 +2755,7 @@ input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;p
   <span class="ver" id="verBadge">v__VER__</span>
   <button class="btn btn-go" id="btnStart" onclick="startOpt()">&#9654; Старт</button>
   <button class="btn btn-stop" id="btnStop" onclick="stopOpt()" style="display:none">&#9632; Стоп</button>
-  <span id="statusBadge" style="color:#555;font-size:11px">готов</span>
+  <span id="statusBadge" style="color:var(--text4);font-size:11px">готов</span>
   <span id="netBadge" style="display:none;color:#f45;font-size:11px;font-weight:600">⚡ офлайн</span>
   <button class="btn-sm" id="amoledBtn" onclick="toggleAmoled()" title="AMOLED режим — гасит экран через 15с неактивности, защита от выгорания пикселей">&#11044; AMOLED</button>
 </div>
@@ -2708,7 +2776,7 @@ input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;p
     <label>Символ</label>
     <div style="display:flex;gap:6px;align-items:center">
       <input id="sym" value="DOGE_USDT" style="flex:1">
-      <label style="display:flex;align-items:center;gap:4px;color:#aaa;font-size:11px;white-space:nowrap;cursor:pointer">
+      <label style="display:flex;align-items:center;gap:4px;color:var(--text2);font-size:11px;white-space:nowrap;cursor:pointer">
         <input type="checkbox" id="scanAll" onchange="toggleScanAll(this)"> Все монеты
       </label>
     </div>
@@ -2723,7 +2791,7 @@ input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;p
     <label>Риск на сделку %</label><input id="risk_pct" type="number" value="10" step="1">
   </div>
   <div class="card">
-    <h3>🎛 Эквалайзер fitness <span style="color:#555;font-size:10px;font-weight:400">(на ходу)</span></h3>
+    <h3>🎛 Эквалайзер fitness <span style="color:var(--text4);font-size:10px;font-weight:400">(на ходу)</span></h3>
     <div class="eq-bar" id="eqBar">
       <div class="eq-ch"><div class="eq-val" id="eqVal_wr">1.00</div>
         <div class="eq-slot" onmousedown="eqAdjust(event,'wr')" ontouchstart="eqAdjust(event,'wr')"><input type="range" class="eq-slider" id="eq_wr" min="0" max="3" step="0.05" value="1"></div>
@@ -2746,13 +2814,13 @@ input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;p
       <button class="btn btn-go" id="btnWtStart" style="flex:1;font-size:11px" onclick="wtStart()">🎯 Автотюнинг</button>
       <button class="btn btn-stop" id="btnWtStop" style="flex:1;font-size:11px;display:none" onclick="wtStop()">⏹ Стоп</button>
     </div>
-    <div id="wtStatus" style="font-size:10px;color:#888;margin-top:4px;min-height:14px"></div>
-    <div id="wtLog" style="font-size:9.5px;color:#aaa;max-height:90px;overflow-y:auto;margin-top:3px;display:none"></div>
+    <div id="wtStatus" style="font-size:10px;color:var(--text3);margin-top:4px;min-height:14px"></div>
+    <div id="wtLog" style="font-size:9.5px;color:var(--text2);max-height:90px;overflow-y:auto;margin-top:3px;display:none"></div>
   </div>
   <div class="card">
     <h3>Лучший конфиг</h3>
     <button class="btn btn-go" style="width:100%;margin-bottom:8px;font-size:11px" onclick="applyBestToChart()">Открыть на графике</button>
-    <div id="bestCard" style="color:#555;font-size:11px">—</div>
+    <div id="bestCard" style="color:var(--text4);font-size:11px">—</div>
   </div>
   <div class="card">
     <h3>Алерты (Telegram / ntfy)</h3>
@@ -2763,7 +2831,7 @@ input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;p
       <button class="btn btn-sm" style="flex:1" onclick="saveAlertCfg()">💾 Сохранить</button>
       <button class="btn btn-sm" style="flex:1" onclick="testAlertCfg()">📨 Тест</button>
     </div>
-    <div id="alertCfgStatus" style="font-size:11px;color:#555;margin-top:6px">—</div>
+    <div id="alertCfgStatus" style="font-size:11px;color:var(--text4);margin-top:6px">—</div>
   </div>
   <div class="card">
     <h3>Прогресс</h3>
@@ -2776,9 +2844,9 @@ input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;p
 <div class="main">
   <div class="card" id="screenerCard" style="display:none">
     <h3>🔍 Скрининг всех монет</h3>
-    <div id="screenerStatus" style="color:#555;font-size:11px;margin-bottom:8px;white-space:pre;line-height:1.6">—</div>
+    <div id="screenerStatus" style="color:var(--text4);font-size:11px;margin-bottom:8px;white-space:pre;line-height:1.6">—</div>
     <div class="prog-bar"><div class="prog-fill" id="screenerProg" style="width:0%"></div></div>
-    <div id="screenerSymList" style="margin-top:6px;font-size:10px;color:#888;line-height:1.8;word-break:break-all"></div>
+    <div id="screenerSymList" style="margin-top:6px;font-size:10px;color:var(--text3);line-height:1.8;word-break:break-all"></div>
     <div id="screenerTable" style="margin-top:8px"></div>
   </div>
   <div class="card">
@@ -2805,31 +2873,31 @@ input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;p
     <label>TP%<input id="cTp" type="number" value="0.6" step="0.1" style="width:60px"></label>
     <button class="btn btn-go" onclick="loadChart()" style="align-self:flex-end">Загрузить</button>
     <button class="btn" id="monBtn" onclick="toggleChartMonitor()" style="align-self:flex-end">🔔 Алерты</button>
-    <button class="btn" id="atBtn" onclick="toggleAutoTrade()" style="align-self:flex-end;background:#1a3a5c">🤖 Авто</button>
+    <button class="btn" id="atBtn" onclick="toggleAutoTrade()" style="align-self:flex-end;background:var(--accent2);color:#fff">🤖 Авто</button>
   </div>
   <!-- Панель авто-торговли (скрыта по умолчанию) -->
   <div id="atPanel" style="display:none;background:#0d1a2a;border:1px solid #1a3a5c;border-radius:6px;padding:10px;margin-bottom:8px;font-size:12px">
     <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
       <b style="color:#3a9eff">🤖 Авто-торговля Gate.io</b>
-      <span id="atStatusBadge" style="color:#555;font-size:11px">выкл</span>
+      <span id="atStatusBadge" style="color:var(--text4);font-size:11px">выкл</span>
     </div>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:6px">
-      <label style="color:#888;font-size:11px">API Key
-        <input id="atKey" type="password" placeholder="Gate.io API Key" style="width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;padding:4px 6px;border-radius:4px;font-size:11px">
+      <label style="color:var(--text2);font-size:11px">API Key
+        <input id="atKey" type="password" placeholder="Gate.io API Key" style="width:100%;background:var(--input-bg);border:1px solid var(--border);color:var(--text);padding:4px 6px;border-radius:4px;font-size:11px">
       </label>
-      <label style="color:#888;font-size:11px">API Secret
-        <input id="atSecret" type="password" placeholder="Gate.io Secret" style="width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;padding:4px 6px;border-radius:4px;font-size:11px">
+      <label style="color:var(--text2);font-size:11px">API Secret
+        <input id="atSecret" type="password" placeholder="Gate.io Secret" style="width:100%;background:var(--input-bg);border:1px solid var(--border);color:var(--text);padding:4px 6px;border-radius:4px;font-size:11px">
       </label>
     </div>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:6px">
-      <label style="color:#888;font-size:11px">Вход % депозита
-        <input id="atPosPct" type="number" value="95" min="1" max="100" step="1" style="width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;padding:4px 6px;border-radius:4px;font-size:11px">
+      <label style="color:var(--text2);font-size:11px">Вход % депозита
+        <input id="atPosPct" type="number" value="95" min="1" max="100" step="1" style="width:100%;background:var(--input-bg);border:1px solid var(--border);color:var(--text);padding:4px 6px;border-radius:4px;font-size:11px">
       </label>
-      <label style="color:#888;font-size:11px">Риск % (плечо=риск÷SL)
-        <input id="atRisk" type="number" value="10" min="0.5" max="20" step="0.5" style="width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;padding:4px 6px;border-radius:4px;font-size:11px">
+      <label style="color:var(--text2);font-size:11px">Риск % (плечо=риск÷SL)
+        <input id="atRisk" type="number" value="10" min="0.5" max="20" step="0.5" style="width:100%;background:var(--input-bg);border:1px solid var(--border);color:var(--text);padding:4px 6px;border-radius:4px;font-size:11px">
       </label>
     </div>
-    <label style="display:flex;align-items:center;gap:6px;color:#888;font-size:11px;margin-bottom:6px;cursor:pointer">
+    <label style="display:flex;align-items:center;gap:6px;color:var(--text2);font-size:11px;margin-bottom:6px;cursor:pointer">
       <input id="atAutoSync" type="checkbox" onchange="toggleAutoSync()">
       🔁 Автоматически подхватывать новый лучший конфиг от оптимизатора (того же символа/ТФ) — TP/SL уже открытой сделки не трогает, влияет только на поиск следующего сигнала
     </label>
@@ -2838,8 +2906,8 @@ input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;p
       <button class="btn btn-sm" id="atStartBtn" style="flex:1;background:#1a5c2a;color:#0f9" onclick="startAutoTrade()">▶ Запустить</button>
       <button class="btn btn-sm" id="atStopBtn" style="flex:1;background:#3a0a0a;color:#f45;display:none" onclick="stopAutoTrade()">⏹ Стоп</button>
     </div>
-    <button class="btn btn-sm" style="width:100%;background:#3a1a0a;color:#f0b800;margin-bottom:4px" onclick="closePosition()">📤 Закрыть позицию вручную</button>
-    <div id="atInfo" style="font-size:11px;color:#555;line-height:1.6">—</div>
+    <button class="btn btn-sm" style="width:100%;background:#3a1a0a;color:var(--yellow);margin-bottom:4px" onclick="closePosition()">📤 Закрыть позицию вручную</button>
+    <div id="atInfo" style="font-size:11px;color:var(--text4);line-height:1.6">—</div>
   </div>
   <div id="chartStatus">Нажмите Загрузить</div>
   <div class="chart-legend">
