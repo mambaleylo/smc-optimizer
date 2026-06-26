@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.0
+- v3.52.0: вкладка «Симуляция» — TradingView-style replay. Загружаются все
+  свечи, часть скрывается за «горизонтом», кнопкой «+1» добавляется одна
+  свеча и сразу перерисовывается канвас с актуальными сигналами/OB/FVG.
+  Два новых API-эндпоинта: GET /sim_candles (сырые OHLC) и POST /sim_step
+  (прогон _simulate(_collect=True) на переданном срезе). Всё изолировано
+  в отдельном <div id="simPanel"> и функциях с префиксом sim*, не трогает
+  оптимизатор и авто-трейд. Убрать — удалить вкладку sim и две ветки elif.
 SMC Optimizer v3.51.14
 - v3.51.14: фикс устаревающего набора свечей в оптимизаторе. candles
   грузились ОДИН раз перед стартом run_optimizer() и больше никогда не
@@ -571,7 +579,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.51.14"
+APP_VERSION  = "3.52.0"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -3084,6 +3092,7 @@ input:focus,select:focus{outline:none;border-color:var(--accent)}
 <div class="tabs">
   <button class="tab active" onclick="switchTab('opt',this)">Оптимизатор</button>
   <button class="tab" onclick="switchTab('chart',this)">График</button>
+  <button class="tab" onclick="switchTab('sim',this)">▶ Симуляция</button>
 </div>
 <div id="optPanel" class="tab-panel active">
 <div class="body">
@@ -3239,7 +3248,43 @@ input:focus,select:focus{outline:none;border-color:var(--accent)}
   <canvas id="chartCanvas"></canvas>
   <div id="chartMetrics"></div>
 </div>
+<!-- ═══════════════════════════════════════════════════════════
+     ВКЛАДКА СИМУЛЯЦИЯ — изолированный модуль, не трогает opt/chart
+     Чтобы убрать: удали этот блок и кнопку "▶ Симуляция" в .tabs
+     ═══════════════════════════════════════════════════════════ -->
+<div id="simPanel" class="tab-panel">
+  <div class="chart-bar" style="flex-wrap:wrap;gap:6px">
+    <label>Символ<input id="simSym" value="BTC_USDT" style="width:110px"></label>
+    <label>ТФ<select id="simTf">
+      <option value="1m">1m</option><option value="5m">5m</option>
+      <option value="15m" selected>15m</option><option value="30m">30m</option>
+      <option value="1h">1h</option><option value="4h">4h</option><option value="1d">1d</option>
+    </select></label>
+    <label>Дней<input id="simDays" type="number" value="7" min="1" max="60" style="width:55px"></label>
+    <label>Старт %<input id="simCutPct" type="number" value="50" min="5" max="95" step="5" style="width:55px" title="С какого % исторических свечей начать воспроизведение"></label>
+    <label>Swing<input id="simSwing" type="number" value="10" min="3" max="50" style="width:55px"></label>
+    <label>SL%<input id="simSl" type="number" value="0.3" step="0.1" style="width:55px"></label>
+    <label>TP%<input id="simTp" type="number" value="0.6" step="0.1" style="width:55px"></label>
+    <button class="btn btn-go" onclick="simLoad()" style="align-self:flex-end">⬇ Загрузить</button>
+    <button class="btn" id="simBtnPrev" onclick="simStep(-1)" style="align-self:flex-end;display:none">◀ −1</button>
+    <button class="btn btn-go" id="simBtnNext" onclick="simStep(1)" style="align-self:flex-end;display:none">+1 свеча ▶</button>
+    <button class="btn btn-go" id="simBtnPlus10" onclick="simStep(10)" style="align-self:flex-end;display:none">+10 ▶▶</button>
+    <button class="btn" id="simBtnReset" onclick="simReset()" style="align-self:flex-end;display:none;background:#3a0a0a;color:#f45">↺ Сброс</button>
+  </div>
+  <div id="simStatus" style="color:var(--text4);font-size:12px;padding:4px 12px;min-height:22px">Загрузите свечи и нажмите +1 свеча</div>
+  <div class="chart-legend">
+    <span><i style="background:#089981"></i>Long</span>
+    <span><i style="background:#F23645"></i>Short</span>
+    <span><i style="background:rgba(49,121,245,0.3);border:1px solid #3179f5"></i>Bull OB</span>
+    <span><i style="background:rgba(247,124,128,0.3);border:1px solid #f77c80"></i>Bear OB</span>
+    <span><i style="background:rgba(0,255,104,0.2);border:1px solid #0f9"></i>FVG Bull</span>
+    <span><i style="background:rgba(255,0,8,0.15);border:1px solid #f45"></i>FVG Bear</span>
+  </div>
+  <canvas id="simCanvas" style="width:100%;display:block"></canvas>
+  <div id="simMetrics" style="font-size:12px;color:var(--text3);padding:6px 8px;min-height:24px"></div>
+</div>
 <script>
+
 var _bestParams = null;
 var _autoAppliedAt30 = false;
 var _chartExtra = {internal_len:5, ob_filter:'atr', ob_mitigation:'highlow',
@@ -3255,6 +3300,216 @@ function switchTab(id, btn){
   document.getElementById(id+'Panel').classList.add('active');
   btn.classList.add('active');
 }
+
+// ═══════════════════════════════════════════════════════════
+// МОДУЛЬ СИМУЛЯЦИИ — TradingView replay
+// Все переменные и функции с префиксом sim* — изолированы
+// ═══════════════════════════════════════════════════════════
+var _simAllCandles  = [];   // все загруженные свечи
+var _simCursor      = 0;    // текущий индекс (сколько свечей видно)
+var _simResult      = null; // последний ответ /sim_step
+var _simBusy        = false;
+
+function simLoad(){
+  var sym  = document.getElementById('simSym').value.trim() || 'BTC_USDT';
+  var tf   = document.getElementById('simTf').value;
+  var days = document.getElementById('simDays').value || 7;
+  document.getElementById('simStatus').textContent = '⏳ Загрузка свечей…';
+  fetch('/sim_candles?sym='+encodeURIComponent(sym)+'&tf='+tf+'&days='+days)
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if(d.error){ document.getElementById('simStatus').textContent = '❌ '+d.error; return; }
+      _simAllCandles = d.candles;
+      var pct = parseInt(document.getElementById('simCutPct').value) || 50;
+      _simCursor = Math.max(20, Math.floor(_simAllCandles.length * pct / 100));
+      _simResult = null;
+      document.getElementById('simStatus').textContent =
+        '✅ Загружено '+_simAllCandles.length+' свечей. Горизонт: свеча '+_simCursor+' / '+_simAllCandles.length+'. Нажмите +1 свеча.';
+      ['simBtnPrev','simBtnNext','simBtnPlus10','simBtnReset'].forEach(function(id){
+        document.getElementById(id).style.display = '';
+      });
+      simDrawCanvas(null);
+    })
+    .catch(function(e){ document.getElementById('simStatus').textContent = '❌ '+e; });
+}
+
+function simGetParams(){
+  return {
+    swing_len: parseInt(document.getElementById('simSwing').value) || 10,
+    internal_len: 5, ob_filter: 'atr', ob_mitigation: 'highlow',
+    fvg_enabled: true, fvg_threshold: 0.1, choch_only: false,
+    use_internal: true, min_ob_size: 1.0, require_fvg_confirm: false,
+    sl_pct: parseFloat(document.getElementById('simSl').value) || 0.3,
+    tp_pct: parseFloat(document.getElementById('simTp').value) || 0.6,
+  };
+}
+
+function simStep(n){
+  if(!_simAllCandles.length){ alert('Сначала загрузите свечи'); return; }
+  if(_simBusy) return;
+  _simCursor = Math.max(20, Math.min(_simAllCandles.length, _simCursor + n));
+  var slice = _simAllCandles.slice(0, _simCursor);
+  _simBusy = true;
+  document.getElementById('simStatus').textContent =
+    '⏳ Прогон simulate на '+slice.length+' свечах…';
+  fetch('/sim_step', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({candles: slice, params: simGetParams()})})
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      _simBusy = false;
+      if(d.error){
+        document.getElementById('simStatus').textContent = '⚠ '+d.error;
+        simDrawCanvas(null);
+        return;
+      }
+      _simResult = d;
+      var m = d.metrics || {};
+      var pct = ((_simCursor/_simAllCandles.length)*100).toFixed(1);
+      document.getElementById('simStatus').textContent =
+        '📍 Свеча '+_simCursor+' / '+_simAllCandles.length+' ('+pct+'%)  |  '
+        +'Сделок: '+(m.trades||0)+'  WR: '+((m.winrate||0)*100).toFixed(1)+'%  '
+        +'PF: '+(m.profit_factor||0).toFixed(2)+'  DD: '+(m.max_dd||0).toFixed(1)+'%  '
+        +'RR: '+(m.rr||0).toFixed(2);
+      simDrawCanvas(d);
+    })
+    .catch(function(e){ _simBusy=false; document.getElementById('simStatus').textContent='❌ '+e; });
+}
+
+function simReset(){
+  _simCursor = Math.max(20, Math.floor(_simAllCandles.length * (parseInt(document.getElementById('simCutPct').value)||50) / 100));
+  _simResult = null;
+  document.getElementById('simStatus').textContent = 'Горизонт сброшен на '+_simCursor+' свечей.';
+  simDrawCanvas(null);
+}
+
+function simDrawCanvas(data){
+  var canvas = document.getElementById('simCanvas');
+  if(!canvas) return;
+  var slice = _simAllCandles.slice(0, _simCursor);
+  if(!slice.length){ canvas.getContext('2d').clearRect(0,0,canvas.width,canvas.height); return; }
+
+  // Размер
+  var W = canvas.parentElement.clientWidth || 800;
+  var H = Math.max(320, Math.floor(W * 0.42));
+  canvas.width = W; canvas.height = H;
+  var ctx = canvas.getContext('2d');
+  ctx.clearRect(0,0,W,H);
+
+  // Диапазон цен
+  var prices = [];
+  slice.forEach(function(c){ prices.push(c.h, c.l); });
+  if(data){
+    (data.bull_obs||[]).forEach(function(o){ prices.push(o.top, o.bot); });
+    (data.bear_obs||[]).forEach(function(o){ prices.push(o.top, o.bot); });
+  }
+  var minP = Math.min.apply(null,prices), maxP = Math.max.apply(null,prices);
+  var pad = (maxP-minP)*0.05 || 1;
+  minP -= pad; maxP += pad;
+
+  var PAD_L=6, PAD_R=6, PAD_T=10, PAD_B=20;
+  var chartW = W-PAD_L-PAD_R, chartH = H-PAD_T-PAD_B;
+  function px(p){ return PAD_T + (1-(p-minP)/(maxP-minP))*chartH; }
+
+  var n = slice.length;
+  var cw = Math.max(1, Math.floor(chartW/n) - 1);
+  function cx(i){ return PAD_L + (i+0.5)*(chartW/n); }
+
+  // Горизонтальный разделитель прошлое/будущее (горизонт)
+  ctx.save();
+  ctx.strokeStyle = 'rgba(255,200,0,0.5)';
+  ctx.setLineDash([4,4]);
+  ctx.lineWidth = 1.5;
+  var horizX = PAD_L + chartW; // правый край = горизонт (мы рисуем только то что "видели")
+  ctx.beginPath(); ctx.moveTo(horizX-1, PAD_T); ctx.lineTo(horizX-1, H-PAD_B); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.restore();
+
+  // OB boxes
+  if(data){
+    (data.bull_obs||[]).forEach(function(o){
+      if(o.bot==null||o.top==null) return;
+      var x0=cx(o.start||0)-cw/2, x1=cx(n-1)+cw/2;
+      ctx.fillStyle='rgba(49,121,245,0.18)';
+      ctx.fillRect(x0, px(o.top), x1-x0, px(o.bot)-px(o.top));
+      ctx.strokeStyle='rgba(49,121,245,0.7)'; ctx.lineWidth=1;
+      ctx.strokeRect(x0, px(o.top), x1-x0, px(o.bot)-px(o.top));
+    });
+    (data.bear_obs||[]).forEach(function(o){
+      if(o.bot==null||o.top==null) return;
+      var x0=cx(o.start||0)-cw/2, x1=cx(n-1)+cw/2;
+      ctx.fillStyle='rgba(247,124,128,0.18)';
+      ctx.fillRect(x0, px(o.top), x1-x0, px(o.bot)-px(o.top));
+      ctx.strokeStyle='rgba(247,124,128,0.7)'; ctx.lineWidth=1;
+      ctx.strokeRect(x0, px(o.top), x1-x0, px(o.bot)-px(o.top));
+    });
+    // FVG
+    (data.fvg_bull||[]).forEach(function(o){
+      if(o.bot==null||o.top==null) return;
+      var x0=cx(o.start||0)-cw/2, x1=cx(n-1)+cw/2;
+      ctx.fillStyle='rgba(0,255,104,0.12)';
+      ctx.fillRect(x0,px(o.top),x1-x0,px(o.bot)-px(o.top));
+    });
+    (data.fvg_bear||[]).forEach(function(o){
+      if(o.bot==null||o.top==null) return;
+      var x0=cx(o.start||0)-cw/2, x1=cx(n-1)+cw/2;
+      ctx.fillStyle='rgba(255,0,8,0.1)';
+      ctx.fillRect(x0,px(o.top),x1-x0,px(o.bot)-px(o.top));
+    });
+  }
+
+  // Свечи
+  slice.forEach(function(c,i){
+    var x=cx(i), hw=Math.max(1,Math.floor(cw/2));
+    var isUp = c.c >= c.o;
+    ctx.strokeStyle = isUp ? '#089981' : '#F23645';
+    ctx.fillStyle   = isUp ? '#089981' : '#F23645';
+    // Фитиль
+    ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(x, px(c.h)); ctx.lineTo(x, px(c.l)); ctx.stroke();
+    // Тело
+    var top=Math.min(px(c.o),px(c.c)), bot=Math.max(px(c.o),px(c.c));
+    var bodyH=Math.max(1,bot-top);
+    if(cw>=3) ctx.fillRect(x-hw, top, hw*2, bodyH);
+    else { ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(x,top); ctx.lineTo(x,bot); ctx.stroke(); }
+  });
+
+  // Сигналы
+  if(data){
+    (data.signals||[]).forEach(function(s){
+      if(s.i==null) return;
+      var i=s.i; if(i<0||i>=n) return;
+      var x=cx(i), isLong=s.dir==='long';
+      ctx.fillStyle = isLong ? '#089981' : '#F23645';
+      ctx.beginPath();
+      if(isLong){
+        ctx.moveTo(x, px(s.entry)+14);
+        ctx.lineTo(x-5, px(s.entry)+24);
+        ctx.lineTo(x+5, px(s.entry)+24);
+      } else {
+        ctx.moveTo(x, px(s.entry)-14);
+        ctx.lineTo(x-5, px(s.entry)-24);
+        ctx.lineTo(x+5, px(s.entry)-24);
+      }
+      ctx.closePath(); ctx.fill();
+      // TP/SL lines
+      if(s.tp){ ctx.strokeStyle='rgba(8,153,129,0.6)'; ctx.setLineDash([3,3]); ctx.lineWidth=1;
+        ctx.beginPath(); ctx.moveTo(cx(i),px(s.tp)); ctx.lineTo(cx(n-1)+cw/2,px(s.tp)); ctx.stroke(); ctx.setLineDash([]); }
+      if(s.sl){ ctx.strokeStyle='rgba(242,54,69,0.6)'; ctx.setLineDash([3,3]); ctx.lineWidth=1;
+        ctx.beginPath(); ctx.moveTo(cx(i),px(s.sl)); ctx.lineTo(cx(n-1)+cw/2,px(s.sl)); ctx.stroke(); ctx.setLineDash([]); }
+    });
+  }
+
+  // Ось X — время первой и последней свечи
+  if(slice.length>1){
+    ctx.fillStyle='rgba(180,180,180,0.6)'; ctx.font='10px monospace'; ctx.textAlign='left';
+    var t0=new Date(slice[0].t*1000);
+    ctx.fillText(t0.toLocaleDateString('ru',{day:'2-digit',month:'2-digit'}), PAD_L+2, H-5);
+    ctx.textAlign='right';
+    var tN=new Date(slice[slice.length-1].t*1000);
+    ctx.fillText(tN.toLocaleDateString('ru',{day:'2-digit',month:'2-digit'})+' '+tN.toLocaleTimeString('ru',{hour:'2-digit',minute:'2-digit'}), W-PAD_R-2, H-5);
+  }
+}
+// ═══════════════════════════════ конец модуля симуляции ═══════════════════
 
 function applyBestToChart(){
   if(!_bestParams){ alert('Нет лучшего конфига — запустите оптимизатор'); return; }
@@ -4556,6 +4811,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         "gate_secret": "***" if GATE_SECRET else "",
                         "has_key": bool(GATE_KEY and GATE_SECRET)})
 
+        elif self.path.startswith("/sim_candles"):
+            # Симуляция: отдаём сырые свечи клиенту для replay
+            from urllib.parse import urlparse, parse_qs
+            qs   = parse_qs(urlparse(self.path).query)
+            sym  = qs.get("sym",  ["BTC_USDT"])[0]
+            tf   = qs.get("tf",   ["15m"])[0]
+            days = int(float(qs.get("days", ["7"])[0]))
+            candles = _fetch_candles(sym, tf, days)
+            if not candles:
+                self._json({"error": "no data"}); return
+            slim = [{"t":c["t"],"o":c["open"],"h":c["high"],"l":c["low"],"c":c["close"]} for c in candles]
+            self._json({"candles": slim, "sym": sym, "tf": tf})
         elif self.path == "/gate_equity":
             if not GATE_KEY or not GATE_SECRET:
                 self._json({"ok": False, "msg": "нет ключей"})
@@ -4804,6 +5071,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except Exception as e:
                 self._json({"ok": False, "msg": str(e)})
 
+        elif self.path == "/sim_step":
+            # Симуляция: прогон _simulate на переданном срезе свечей
+            try:
+                raw = body.get("candles", [])
+                p   = body.get("params", {})
+                if not raw or not p:
+                    self._json({"error": "candles or params missing"}); return
+                candles = [{"t":c["t"],"open":c["o"],"high":c["h"],"low":c["l"],"close":c["c"]} for c in raw]
+                sl_p = float(p.get("sl_pct", 0.8))
+                tp_p = float(p.get("tp_pct", 1.6))
+                result = _simulate(candles, p, sl_pct=sl_p, tp_pct=tp_p, _collect=True)
+                if not result:
+                    self._json({"error": "too few candles"}); return
+                self._json({
+                    "signals":  result.get("signals", []),
+                    "bull_obs": result.get("bull_obs", []),
+                    "bear_obs": result.get("bear_obs", []),
+                    "fvg_bull": result.get("fvg_bull", []),
+                    "fvg_bear": result.get("fvg_bear", []),
+                    "metrics":  {k: result[k] for k in ("trades","winrate","profit_factor","max_dd","total_return","fitness","rr") if k in result},
+                })
+            except Exception as e:
+                self._json({"error": str(e)})
+
         else:
             self.send_response(404); self.end_headers()
 
@@ -4834,5 +5125,6 @@ if __name__ == "__main__":
     except RuntimeError:
         pass
     main()
+
 
 
