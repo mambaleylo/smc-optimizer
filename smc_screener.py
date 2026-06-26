@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.1
+- v3.52.1: симуляция — sliding window OOS + кнопка «★ Лучший конфиг».
+  Теперь _simulate гоняется не на [0..cursor], а на скользящем окне
+  [cursor-trainCount .. cursor], где trainCount = «Окно обучения дней»
+  переведённое в свечи выбранного ТФ. При каждом +1 свеча окно целиком
+  сдвигается вправо — история левее окна скрыта, индикатор её «не видит».
+  Кнопка «★ Лучший конфиг» копирует swing/sl/tp из _bestParams оптимизатора
+  прямо в поля симуляции без перезагрузки свечей.
 SMC Optimizer v3.52.0
 - v3.52.0: вкладка «Симуляция» — TradingView-style replay. Загружаются все
   свечи, часть скрывается за «горизонтом», кнопкой «+1» добавляется одна
@@ -579,7 +587,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.0"
+APP_VERSION  = "3.52.1"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -3260,12 +3268,14 @@ input:focus,select:focus{outline:none;border-color:var(--accent)}
       <option value="15m" selected>15m</option><option value="30m">30m</option>
       <option value="1h">1h</option><option value="4h">4h</option><option value="1d">1d</option>
     </select></label>
-    <label>Дней<input id="simDays" type="number" value="7" min="1" max="60" style="width:55px"></label>
-    <label>Старт %<input id="simCutPct" type="number" value="50" min="5" max="95" step="5" style="width:55px" title="С какого % исторических свечей начать воспроизведение"></label>
-    <label>Swing<input id="simSwing" type="number" value="10" min="3" max="50" style="width:55px"></label>
-    <label>SL%<input id="simSl" type="number" value="0.3" step="0.1" style="width:55px"></label>
-    <label>TP%<input id="simTp" type="number" value="0.6" step="0.1" style="width:55px"></label>
+    <label title="Всего дней истории для загрузки">Всего дней<input id="simDays" type="number" value="60" min="2" max="120" style="width:55px"></label>
+    <label title="Окно обучения: сколько дней перед горизонтом гонять _simulate. Остаток слева — скрытая история.">Окно обуч. дней<input id="simTrainDays" type="number" value="30" min="1" max="90" style="width:55px"></label>
+    <label title="С какого % загруженных свечей начать горизонт (правый край окна обучения)">Старт %<input id="simCutPct" type="number" value="50" min="5" max="95" step="5" style="width:50px"></label>
+    <label>Swing<input id="simSwing" type="number" value="10" min="3" max="50" style="width:50px"></label>
+    <label>SL%<input id="simSl" type="number" value="0.3" step="0.1" style="width:50px"></label>
+    <label>TP%<input id="simTp" type="number" value="0.6" step="0.1" style="width:50px"></label>
     <button class="btn btn-go" onclick="simLoad()" style="align-self:flex-end">⬇ Загрузить</button>
+    <button class="btn" id="simBtnBest" onclick="simApplyBest()" style="align-self:flex-end;display:none" title="Взять SL/TP/Swing из лучшего конфига оптимизатора">★ Лучший конфиг</button>
     <button class="btn" id="simBtnPrev" onclick="simStep(-1)" style="align-self:flex-end;display:none">◀ −1</button>
     <button class="btn btn-go" id="simBtnNext" onclick="simStep(1)" style="align-self:flex-end;display:none">+1 свеча ▶</button>
     <button class="btn btn-go" id="simBtnPlus10" onclick="simStep(10)" style="align-self:flex-end;display:none">+10 ▶▶</button>
@@ -3302,30 +3312,44 @@ function switchTab(id, btn){
 }
 
 // ═══════════════════════════════════════════════════════════
-// МОДУЛЬ СИМУЛЯЦИИ — TradingView replay
+// МОДУЛЬ СИМУЛЯЦИИ — TradingView replay + sliding window OOS
 // Все переменные и функции с префиксом sim* — изолированы
 // ═══════════════════════════════════════════════════════════
-var _simAllCandles  = [];   // все загруженные свечи
-var _simCursor      = 0;    // текущий индекс (сколько свечей видно)
+var _simAllCandles  = [];   // все загруженные свечи (полный массив)
+var _simCursor      = 0;    // правый край окна обучения (индекс в _simAllCandles)
 var _simResult      = null; // последний ответ /sim_step
 var _simBusy        = false;
+var _simTrainCount  = 0;    // кол-во свечей в окне обучения (пересчитывается при загрузке)
+
+// Сколько свечей = N дней на выбранном ТФ
+function _simDaysToCandles(days){
+  var tf  = document.getElementById('simTf').value;
+  var sec = {"1m":60,"5m":300,"15m":900,"30m":1800,"1h":3600,"4h":14400,"1d":86400}[tf] || 900;
+  return Math.round(days * 86400 / sec);
+}
 
 function simLoad(){
   var sym  = document.getElementById('simSym').value.trim() || 'BTC_USDT';
   var tf   = document.getElementById('simTf').value;
-  var days = document.getElementById('simDays').value || 7;
+  var days = parseInt(document.getElementById('simDays').value) || 60;
   document.getElementById('simStatus').textContent = '⏳ Загрузка свечей…';
   fetch('/sim_candles?sym='+encodeURIComponent(sym)+'&tf='+tf+'&days='+days)
     .then(function(r){ return r.json(); })
     .then(function(d){
       if(d.error){ document.getElementById('simStatus').textContent = '❌ '+d.error; return; }
       _simAllCandles = d.candles;
+      _simTrainCount = _simDaysToCandles(parseInt(document.getElementById('simTrainDays').value) || 30);
       var pct = parseInt(document.getElementById('simCutPct').value) || 50;
-      _simCursor = Math.max(20, Math.floor(_simAllCandles.length * pct / 100));
+      // Горизонт = правый край окна обучения; левый = cursor - trainCount
+      _simCursor = Math.min(
+        _simAllCandles.length,
+        Math.max(_simTrainCount + 1, Math.floor(_simAllCandles.length * pct / 100))
+      );
       _simResult = null;
+      var trainLeft = Math.max(0, _simCursor - _simTrainCount);
       document.getElementById('simStatus').textContent =
-        '✅ Загружено '+_simAllCandles.length+' свечей. Горизонт: свеча '+_simCursor+' / '+_simAllCandles.length+'. Нажмите +1 свеча.';
-      ['simBtnPrev','simBtnNext','simBtnPlus10','simBtnReset'].forEach(function(id){
+        '✅ Загружено '+_simAllCandles.length+' св. | Окно обучения: ['+trainLeft+'…'+_simCursor+'] ('+_simTrainCount+' св.) | Нажмите +1 свеча';
+      ['simBtnBest','simBtnPrev','simBtnNext','simBtnPlus10','simBtnReset'].forEach(function(id){
         document.getElementById(id).style.display = '';
       });
       simDrawCanvas(null);
@@ -3344,21 +3368,37 @@ function simGetParams(){
   };
 }
 
+function simApplyBest(){
+  if(!_bestParams){ alert('Нет лучшего конфига — запустите оптимизатор'); return; }
+  var p = _bestParams;
+  if(p.swing_len != null) document.getElementById('simSwing').value = p.swing_len;
+  if(p.sl_pct    != null) document.getElementById('simSl').value    = p.sl_pct;
+  if(p.tp_pct    != null) document.getElementById('simTp').value    = p.tp_pct;
+  document.getElementById('simStatus').textContent =
+    '★ Применён лучший конфиг: swing='+p.swing_len+' sl='+p.sl_pct+' tp='+p.tp_pct;
+}
+
 function simStep(n){
   if(!_simAllCandles.length){ alert('Сначала загрузите свечи'); return; }
   if(_simBusy) return;
-  _simCursor = Math.max(20, Math.min(_simAllCandles.length, _simCursor + n));
-  var slice = _simAllCandles.slice(0, _simCursor);
+  // Обновляем счётчик свечей окна обучения на случай если поле изменили после загрузки
+  _simTrainCount = _simDaysToCandles(parseInt(document.getElementById('simTrainDays').value) || 30);
+  _simCursor = Math.max(_simTrainCount + 1, Math.min(_simAllCandles.length, _simCursor + n));
+
+  // Sliding window: берём ровно trainCount свечей заканчивающихся на cursor
+  var winStart = Math.max(0, _simCursor - _simTrainCount);
+  var slice    = _simAllCandles.slice(winStart, _simCursor);
+
   _simBusy = true;
   document.getElementById('simStatus').textContent =
-    '⏳ Прогон simulate на '+slice.length+' свечах…';
+    '⏳ simulate на окне ['+winStart+'…'+_simCursor+'] ('+slice.length+' св.)…';
   fetch('/sim_step', {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({candles: slice, params: simGetParams()})})
     .then(function(r){ return r.json(); })
     .then(function(d){
       _simBusy = false;
       if(d.error){
-        document.getElementById('simStatus').textContent = '⚠ '+d.error;
+        document.getElementById('simStatus').textContent = '⚠ '+d.error+' (нужно минимум ~'+(_simTrainCount<20?'20+':_simTrainCount)+' св.)';
         simDrawCanvas(null);
         return;
       }
@@ -3366,29 +3406,34 @@ function simStep(n){
       var m = d.metrics || {};
       var pct = ((_simCursor/_simAllCandles.length)*100).toFixed(1);
       document.getElementById('simStatus').textContent =
-        '📍 Свеча '+_simCursor+' / '+_simAllCandles.length+' ('+pct+'%)  |  '
-        +'Сделок: '+(m.trades||0)+'  WR: '+((m.winrate||0)*100).toFixed(1)+'%  '
-        +'PF: '+(m.profit_factor||0).toFixed(2)+'  DD: '+(m.max_dd||0).toFixed(1)+'%  '
-        +'RR: '+(m.rr||0).toFixed(2);
-      simDrawCanvas(d);
+        '📍 Горизонт: '+_simCursor+'/'+_simAllCandles.length+' ('+pct+'%)  окно:['+winStart+'…'+_simCursor+']  |  '
+        +'Сделок:'+(m.trades||0)+'  WR:'+((m.winrate||0)*100).toFixed(1)+'%  '
+        +'PF:'+(m.profit_factor||0).toFixed(2)+'  DD:'+(m.max_dd||0).toFixed(1)+'%  RR:'+(m.rr||0).toFixed(2);
+      simDrawCanvas(d, winStart);
     })
     .catch(function(e){ _simBusy=false; document.getElementById('simStatus').textContent='❌ '+e; });
 }
 
 function simReset(){
-  _simCursor = Math.max(20, Math.floor(_simAllCandles.length * (parseInt(document.getElementById('simCutPct').value)||50) / 100));
+  _simTrainCount = _simDaysToCandles(parseInt(document.getElementById('simTrainDays').value) || 30);
+  var pct = parseInt(document.getElementById('simCutPct').value) || 50;
+  _simCursor = Math.min(
+    _simAllCandles.length,
+    Math.max(_simTrainCount + 1, Math.floor(_simAllCandles.length * pct / 100))
+  );
   _simResult = null;
-  document.getElementById('simStatus').textContent = 'Горизонт сброшен на '+_simCursor+' свечей.';
+  document.getElementById('simStatus').textContent = '↺ Горизонт сброшен на свечу '+_simCursor;
   simDrawCanvas(null);
 }
 
-function simDrawCanvas(data){
+function simDrawCanvas(data, winStart){
   var canvas = document.getElementById('simCanvas');
   if(!canvas) return;
-  var slice = _simAllCandles.slice(0, _simCursor);
+  winStart = winStart || 0;
+  // Рисуем только окно обучения [winStart .. cursor]
+  var slice = _simAllCandles.slice(winStart, _simCursor);
   if(!slice.length){ canvas.getContext('2d').clearRect(0,0,canvas.width,canvas.height); return; }
 
-  // Размер
   var W = canvas.parentElement.clientWidth || 800;
   var H = Math.max(320, Math.floor(W * 0.42));
   canvas.width = W; canvas.height = H;
@@ -3414,17 +3459,17 @@ function simDrawCanvas(data){
   var cw = Math.max(1, Math.floor(chartW/n) - 1);
   function cx(i){ return PAD_L + (i+0.5)*(chartW/n); }
 
-  // Горизонтальный разделитель прошлое/будущее (горизонт)
+  // Правый край = горизонт (будущее скрыто)
   ctx.save();
-  ctx.strokeStyle = 'rgba(255,200,0,0.5)';
-  ctx.setLineDash([4,4]);
-  ctx.lineWidth = 1.5;
-  var horizX = PAD_L + chartW; // правый край = горизонт (мы рисуем только то что "видели")
-  ctx.beginPath(); ctx.moveTo(horizX-1, PAD_T); ctx.lineTo(horizX-1, H-PAD_B); ctx.stroke();
-  ctx.setLineDash([]);
-  ctx.restore();
+  ctx.strokeStyle = 'rgba(255,200,0,0.6)';
+  ctx.setLineDash([4,4]); ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.moveTo(W-PAD_R-1, PAD_T); ctx.lineTo(W-PAD_R-1, H-PAD_B); ctx.stroke();
+  ctx.setLineDash([]); ctx.restore();
+  // Метка "горизонт"
+  ctx.fillStyle='rgba(255,200,0,0.7)'; ctx.font='10px monospace'; ctx.textAlign='right';
+  ctx.fillText('горизонт', W-PAD_R-4, PAD_T+10);
 
-  // OB boxes
+  // OB boxes — индексы сигналов уже относительны переданного slice (бэкенд не знает winStart)
   if(data){
     (data.bull_obs||[]).forEach(function(o){
       if(o.bot==null||o.top==null) return;
@@ -3442,7 +3487,6 @@ function simDrawCanvas(data){
       ctx.strokeStyle='rgba(247,124,128,0.7)'; ctx.lineWidth=1;
       ctx.strokeRect(x0, px(o.top), x1-x0, px(o.bot)-px(o.top));
     });
-    // FVG
     (data.fvg_bull||[]).forEach(function(o){
       if(o.bot==null||o.top==null) return;
       var x0=cx(o.start||0)-cw/2, x1=cx(n-1)+cw/2;
@@ -3463,17 +3507,15 @@ function simDrawCanvas(data){
     var isUp = c.c >= c.o;
     ctx.strokeStyle = isUp ? '#089981' : '#F23645';
     ctx.fillStyle   = isUp ? '#089981' : '#F23645';
-    // Фитиль
     ctx.lineWidth=1;
     ctx.beginPath(); ctx.moveTo(x, px(c.h)); ctx.lineTo(x, px(c.l)); ctx.stroke();
-    // Тело
     var top=Math.min(px(c.o),px(c.c)), bot=Math.max(px(c.o),px(c.c));
     var bodyH=Math.max(1,bot-top);
     if(cw>=3) ctx.fillRect(x-hw, top, hw*2, bodyH);
-    else { ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(x,top); ctx.lineTo(x,bot); ctx.stroke(); }
+    else { ctx.beginPath(); ctx.moveTo(x,top); ctx.lineTo(x,bot); ctx.stroke(); }
   });
 
-  // Сигналы
+  // Сигналы (индексы относительны slice)
   if(data){
     (data.signals||[]).forEach(function(s){
       if(s.i==null) return;
@@ -3482,16 +3524,11 @@ function simDrawCanvas(data){
       ctx.fillStyle = isLong ? '#089981' : '#F23645';
       ctx.beginPath();
       if(isLong){
-        ctx.moveTo(x, px(s.entry)+14);
-        ctx.lineTo(x-5, px(s.entry)+24);
-        ctx.lineTo(x+5, px(s.entry)+24);
+        ctx.moveTo(x, px(s.entry)+14); ctx.lineTo(x-5, px(s.entry)+24); ctx.lineTo(x+5, px(s.entry)+24);
       } else {
-        ctx.moveTo(x, px(s.entry)-14);
-        ctx.lineTo(x-5, px(s.entry)-24);
-        ctx.lineTo(x+5, px(s.entry)-24);
+        ctx.moveTo(x, px(s.entry)-14); ctx.lineTo(x-5, px(s.entry)-24); ctx.lineTo(x+5, px(s.entry)-24);
       }
       ctx.closePath(); ctx.fill();
-      // TP/SL lines
       if(s.tp){ ctx.strokeStyle='rgba(8,153,129,0.6)'; ctx.setLineDash([3,3]); ctx.lineWidth=1;
         ctx.beginPath(); ctx.moveTo(cx(i),px(s.tp)); ctx.lineTo(cx(n-1)+cw/2,px(s.tp)); ctx.stroke(); ctx.setLineDash([]); }
       if(s.sl){ ctx.strokeStyle='rgba(242,54,69,0.6)'; ctx.setLineDash([3,3]); ctx.lineWidth=1;
@@ -3499,7 +3536,7 @@ function simDrawCanvas(data){
     });
   }
 
-  // Ось X — время первой и последней свечи
+  // Ось X
   if(slice.length>1){
     ctx.fillStyle='rgba(180,180,180,0.6)'; ctx.font='10px monospace'; ctx.textAlign='left';
     var t0=new Date(slice[0].t*1000);
