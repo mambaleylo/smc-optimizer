@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.50.9
+- v3.50.9: PnL в уведомлении о закрытии позиции. Добавлена функция
+  _gate_get_last_pnl — запрашивает /futures/usdt/position_close и
+  берёт последнюю запись. Алерт теперь показывает Entry→Close цену,
+  реальный PnL в USDT и % с биржи (✅/❌ в зависимости от результата).
+  При ошибке API — фоллбэк на старый текст без PnL.
 SMC Optimizer v3.50.8
 - v3.50.8: дефолтные значения SL/TP изменены: SL 0.6%→0.3%, TP 1.2%→0.6%
   во всех местах (opt_state, screener_state, HTML-инпуты оптимизатора
@@ -414,7 +420,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.50.8"
+APP_VERSION  = "3.50.9"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -625,7 +631,26 @@ def _gate_cancel_orders(symbol):
     except Exception as e:
         olog(f"⚠ gate_cancel_orders (price_orders) {contract}: {e}")
 
-def _gate_close_position(symbol):
+def _gate_get_last_pnl(symbol):
+    """Возвращает PnL последней закрытой позиции по символу (USDT).
+    Использует /futures/usdt/position_close — Gate отдаёт список закрытий
+    в обратном хронологическом порядке; берём первую запись."""
+    try:
+        contract = symbol.replace("/", "_").upper()
+        data = _gate_req("GET", "/futures/usdt/position_close",
+                         params={"contract": contract, "limit": 1})
+        if not isinstance(data, list) or not data:
+            return None
+        rec = data[0]
+        pnl       = float(rec.get("pnl",       0))
+        pnl_pct   = float(rec.get("pnl_pct",   0)) * 100  # Gate отдаёт как доля, не %
+        close_px  = float(rec.get("close_price", 0))
+        return {"pnl": pnl, "pnl_pct": pnl_pct, "close_price": close_px}
+    except Exception as e:
+        olog(f"⚠ gate_get_last_pnl: {e}")
+        return None
+
+
     """Закрыть позицию рыночным ордером."""
     try:
         contract = symbol.replace("/", "_").upper()
@@ -1009,13 +1034,28 @@ def _auto_trade_loop():
                                         auto_trade_state["position"] = None
                                     armed         = False
                                     last_entry_ts = None
-                                    dirru = our_pos_now.get("dir", "?").upper()
+                                    dirru   = our_pos_now.get("dir", "?").upper()
+                                    entry   = our_pos_now.get("entry", 0)
                                     olog(f"✅ Позиция {dirru} закрыта на бирже (TP/SL или вручную)")
-                                    _send_alert(
-                                        f"{'🟢' if dirru=='LONG' else '🔴'} <b>{sym}</b> — "
-                                        f"позиция {dirru} закрыта\n"
-                                        f"TP/SL сработал или закрыта вручную. Жду следующего сигнала."
-                                    )
+                                    # Запрашиваем реальный PnL с биржи
+                                    pnl_info = _gate_get_last_pnl(sym)
+                                    if pnl_info:
+                                        pnl     = pnl_info["pnl"]
+                                        pnl_pct = pnl_info["pnl_pct"]
+                                        close_p = pnl_info["close_price"]
+                                        sign    = "+" if pnl >= 0 else ""
+                                        result_emoji = "✅" if pnl >= 0 else "❌"
+                                        _send_alert(
+                                            f"{result_emoji} <b>{sym}</b> — позиция {dirru} закрыта\n"
+                                            f"Entry {_fmt_px(entry)} → Close {_fmt_px(close_p)}\n"
+                                            f"PnL: <b>{sign}{pnl:.2f} USDT ({sign}{pnl_pct:.2f}%)</b>"
+                                        )
+                                    else:
+                                        _send_alert(
+                                            f"{'🟢' if dirru=='LONG' else '🔴'} <b>{sym}</b> — "
+                                            f"позиция {dirru} закрыта\n"
+                                            f"TP/SL сработал или закрыта вручную. Жду следующего сигнала."
+                                        )
                             with auto_trade_lock:
                                 auto_trade_state["last_check"] = time.time()
                                 auto_trade_state["last_error"] = ""
