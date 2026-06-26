@@ -1,5 +1,22 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.51.14
+- v3.51.14: фикс устаревающего набора свечей в оптимизаторе. candles
+  грузились ОДИН раз перед стартом run_optimizer() и больше никогда не
+  обновлялись — пройдут сутки, оптимизатор крутит тысячи циклов, а
+  "адаптация" всё это время идёт на одном и том же старом окне свечей,
+  даже не видя, что рынок ушёл вперёд. Воркеры (_worker_candles) тоже
+  получали свечи один раз через initializer при создании пула.
+  Теперь раз в tf_sec (примерно раз в свечу выбранного ТФ — чаще смысла
+  нет, новых данных всё равно не появится быстрее) оптимизатор: дёргает
+  _fetch_candles(sym, tf, days) заново (она всегда тянет окно
+  [now-days*86400, now], так что просто сдвигается вместе с реальным
+  временем), пересоздаёт пул воркеров с свежими свечами через
+  initializer, пересчитывает best на новом окне (старая метрика
+  несравнима с новым окном напрямую) и сбрасывает топ-20/счётчик
+  стагнации, чтобы не мешать оценки с разных окон в одном рейтинге.
+  Алерт в Telegram на каждое обновление НЕ шлём — при коротких ТФ это
+  было бы по уведомлению каждые несколько минут; видно в логе.
 SMC Optimizer v3.51.13
 - v3.51.13: исправлена логика v3.51.12 на противоположную. Раньше сигнал,
   пойманный до 150 циклов, "придерживался" (last_entry_ts не обновлялся) и
@@ -554,7 +571,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.51.13"
+APP_VERSION  = "3.51.14"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -2567,6 +2584,16 @@ def run_optimizer():
         opt_state["top20"] = top20
         opt_state["best"]  = None
 
+    # ── Периодическое обновление набора свечей ───────────────────────────
+    # candles грузились ОДИН раз перед стартом и больше никогда не обновлялись
+    # — оптимизатор мог крутиться сутками на одном и том же старом окне,
+    # даже не замечая, что рынок давно ушёл вперёд (свежих свечей не видел).
+    # _fetch_candles всегда тянет окно [now-days*86400, now], так что просто
+    # вызываем его повторно — обновляем примерно раз в свечу (tf_sec), чаще
+    # смысла нет, новых данных всё равно не появится быстрее.
+    tf_sec_refresh    = TF_SECONDS.get(tf, 900)
+    last_candle_fetch = time.time()
+
     try:
         while not _stop_flag.is_set():
             cycle += 1
@@ -2575,6 +2602,46 @@ def run_optimizer():
             with opt_lock:
                 opt_state["cycle"] = cycle
                 opt_state["eco_mode"] = eco_mode
+
+            if time.time() - last_candle_fetch >= tf_sec_refresh:
+                olog(f"🔄 Цикл {cycle}: обновляю набор свечей "
+                     f"(прошло ≥{tf_sec_refresh}с с последней загрузки) — "
+                     f"иначе адаптация будет идти на устаревшем окне")
+                try:
+                    fresh_candles = _fetch_candles(sym, tf, days)
+                except Exception as _fe:
+                    fresh_candles = None
+                    olog(f"⚠ Не удалось обновить свечи: {_fe}")
+                if fresh_candles and len(fresh_candles) >= 100:
+                    candles = fresh_candles
+                    try:
+                        pool.shutdown(wait=True)
+                    except Exception:
+                        pass
+                    pool = _PoolExecutor(
+                        max_workers=n_workers,
+                        initializer=_worker_init,
+                        initargs=(candles, risk)
+                    )
+                    # best/топ-20 посчитаны на старом окне свечей — несравнимы
+                    # с новым окном напрямую. Пересчитываем best на свежих
+                    # данных (чтобы UI показывал честную метрику) и сбрасываем
+                    # топ-20/стагнацию, чтобы не путать оценки с разных окон.
+                    best_result = _simulate(candles, best_params, risk_pct=risk)
+                    best_fit    = best_result["fitness"] if best_result else 0.0
+                    top20       = []
+                    no_improve  = 0
+                    with opt_lock:
+                        opt_state["top20"] = []
+                        opt_state["best"]  = ({"params": best_params, "result": best_result}
+                                               if best_result else None)
+                    olog(f"✔ Свечи обновлены: {len(candles)} шт. best пересчитан "
+                         f"на новом окне: fit={best_fit:.4f}")
+                else:
+                    olog("⚠ Обновление свечей пропущено — данных мало/ошибка, "
+                         "продолжаю на текущем наборе")
+                last_candle_fetch = time.time()
+
             if eco_mode and not _eco_announced:
                 _eco_announced = True
                 olog(f"🌡 Цикл {cycle}: стагнация {no_improve} циклов — включён эко-режим "
