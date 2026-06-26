@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.50.4
+- v3.50.4: три критических фикса. 1) Монитор графика теперь шлёт алерт о
+  новом сигнале сразу при старте (раньше первый сигнал молча проглатывался).
+  2) Чужая позиция на бирже (другой телефон/ручной вход) больше не
+  пропускается — бот выставляет TP/SL по текущему сигналу и принимает
+  управление; если направление противоположное — предупреждает в Telegram.
+  3) Убрано Telegram-уведомление о каждом новом лучшем конфиге оптимизатора
+  (осталось только в лог + push на GitHub).
 SMC Optimizer v3.50.3
 - v3.50.3: защита от чужой позиции на бирже — если при новом сигнале на Gate
   уже открыта позиция с чужим тикетом (не нашим), сигнал пропускается и
@@ -374,7 +382,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.50.3"
+APP_VERSION  = "3.50.4"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -806,23 +814,90 @@ def _auto_trade_loop():
 
                             existing = _gate_get_position(sym)
 
-                            # ── Защита от чужой позиции ────────────────────
-                            # Если на бирже уже есть позиция, но мы её не открывали
-                            # (auto_trade_state["position"] is None) → чужой тикет,
-                            # пропускаем сигнал и чистим зависшие TP/SL-алерты.
-                            with auto_trade_lock:
-                                our_pos = auto_trade_state.get("position")
+                            # ── Чужая / неизвестная позиция ───────────────
+                            # На бирже есть позиция, но мы её не открывали
+                            # (auto_trade_state["position"] is None).
+                            # Причина: другой телефон, ручной вход, рестарт.
+                            # Стратегия: принимаем управление — выставляем
+                            # TP/SL по текущему сигналу, не закрывая позицию.
                             if existing and our_pos is None:
-                                olog(f"🚫 Пропуск сигнала {direction.upper()} — "
-                                     f"на бирже уже открыта позиция {existing['dir'].upper()} "
-                                     f"с чужим тикетом (не наша). Не трогаем.")
-                                _send_alert(
-                                    f"⚠️ <b>{sym}</b> — сигнал {direction.upper()} пропущен\\n"
-                                    f"На бирже уже открыта {existing['dir'].upper()} позиция "
-                                    f"с чужим тикетом — авто-трейд её не закрывает."
-                                )
-                                with auto_trade_lock:
-                                    auto_trade_state["last_entry_ts"] = entry_ts
+                                same_dir = existing["dir"] == direction
+                                if same_dir:
+                                    olog(f"🔗 Обнаружена позиция {existing['dir'].upper()} "
+                                         f"без нашего TP/SL — принимаем управление, "
+                                         f"выставляем TP={_fmt_px(tp_px)} SL={_fmt_px(sl_px)}")
+                                    try:
+                                        contract  = sym.replace("/", "_").upper()
+                                        is_long   = direction == "long"
+                                        raw_size  = existing.get("size", 0)
+                                        close_size = -abs(raw_size) if is_long else abs(raw_size)
+                                        # TP
+                                        _gate_req("POST", "/futures/usdt/price_orders", body={
+                                            "initial": {
+                                                "contract":    contract,
+                                                "size":        close_size,
+                                                "price":       "0",
+                                                "tif":         "ioc",
+                                                "reduce_only": True,
+                                                "text":        "t-smc-tp",
+                                            },
+                                            "trigger": {
+                                                "strategy_type": 0,
+                                                "price_type":    0,
+                                                "price":         _gate_round_price(tp_px, contract),
+                                                "rule":          1 if is_long else 2,
+                                                "expiration":    86400,
+                                            },
+                                        })
+                                        # SL
+                                        _gate_req("POST", "/futures/usdt/price_orders", body={
+                                            "initial": {
+                                                "contract":    contract,
+                                                "size":        close_size,
+                                                "price":       "0",
+                                                "tif":         "ioc",
+                                                "reduce_only": True,
+                                                "text":        "t-smc-sl",
+                                            },
+                                            "trigger": {
+                                                "strategy_type": 0,
+                                                "price_type":    0,
+                                                "price":         _gate_round_price(sl_px, contract),
+                                                "rule":          2 if is_long else 1,
+                                                "expiration":    86400,
+                                            },
+                                        })
+                                        adopted = {
+                                            "dir": direction, "entry": existing.get("entry", entry_px),
+                                            "sl": sl_px, "tp": tp_px,
+                                            "size": raw_size, "leverage": 0, "notional": 0
+                                        }
+                                        with auto_trade_lock:
+                                            auto_trade_state["position"]      = adopted
+                                            auto_trade_state["last_entry_ts"] = entry_ts
+                                        emoji = "🟢" if is_long else "🔴"
+                                        _send_alert(
+                                            f"{emoji} <b>{sym}</b> — принята чужая позиция "
+                                            f"{direction.upper()}\n"
+                                            f"TP {_fmt_px(tp_px)} | SL {_fmt_px(sl_px)} выставлены"
+                                        )
+                                        olog(f"✅ TP/SL выставлены на принятую позицию {direction.upper()}")
+                                    except Exception as _e:
+                                        olog(f"⚠ Не удалось выставить TP/SL на чужую позицию: {_e}")
+                                        with auto_trade_lock:
+                                            auto_trade_state["last_entry_ts"] = entry_ts
+                                else:
+                                    # Направление противоположное — не трогаем,
+                                    # просто предупреждаем
+                                    olog(f"⚠ Чужая позиция {existing['dir'].upper()} против "
+                                         f"сигнала {direction.upper()} — не трогаем")
+                                    _send_alert(
+                                        f"⚠️ <b>{sym}</b> — чужая позиция "
+                                        f"{existing['dir'].upper()} против сигнала "
+                                        f"{direction.upper()}\nЗакрой вручную или отключи авто-трейд"
+                                    )
+                                    with auto_trade_lock:
+                                        auto_trade_state["last_entry_ts"] = entry_ts
                             elif existing and existing["dir"] == direction:
                                 # entry_ts сменился (структура OB/swing
                                 # переразметилась на новой свече), но
@@ -1875,13 +1950,14 @@ def _chart_monitor_loop(sym, tf, days, p):
                         new_sig = None
                         with chart_mon_lock:
                             if not chart_mon_state["armed"]:
-                                # Первый запуск — просто запоминаем текущий
-                                # сигнал, чтобы не спамить алертом по уже
-                                # имеющейся (старой) сделке
+                                # Первый запуск — всегда шлём алерт, чтобы не
+                                # потерять сигнал который уже был когда монитор
+                                # только стартовал
                                 chart_mon_state["armed"]         = True
                                 chart_mon_state["last_entry_ts"] = entry_ts
                                 chart_mon_state["last_dir"]      = sig["dir"]
                                 chart_mon_state["signal_gone_notified"] = False
+                                new_sig = sig
                             elif entry_ts != chart_mon_state["last_entry_ts"]:
                                 chart_mon_state["last_entry_ts"] = entry_ts
                                 chart_mon_state["last_dir"]      = sig["dir"]
@@ -2001,13 +2077,6 @@ def run_optimizer():
              f"swing={nb_p['swing_len']}")
         threading.Thread(target=_gh_save_best,
             args=({"params": nb_p, "result": nb_r},), daemon=True).start()
-        _send_alert(
-                f"🏆 SMC {sym} {tf} — новый лучший\n"
-                f"WR={nb_r['winrate']}% PF={nb_r['profit_factor']} "
-                f"DD={nb_r['max_dd']}% Trades={nb_r['trades']}\n"
-                f"SL={nb_p['sl_pct']}% TP={nb_p['tp_pct']}% "
-                f"swing={nb_p['swing_len']}"
-            )
 
     with opt_lock:
         opt_state["top20"] = top20
