@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.51.3
+- v3.51.3: защита от разрыва интернета. 1) _gate_req: retry 3 попытки
+  с паузой 2с при ConnectionError/Timeout — TP/SL не потеряются при
+  кратком разрыве. 2) _send_alert: фоновый поток + 3 попытки с паузой
+  5с — алерты не теряются при временной недоступности Telegram/ntfy.
+  3) _auto_trade_loop и _chart_monitor_loop: при сетевой ошибке спят
+  15с (не до следующего бара) — быстрое восстановление после разрыва.
+  4) UI: индикатор «⚡ офлайн» в шапке — появляется при потере связи
+  браузера с сетью (событие offline/online).
 SMC Optimizer v3.51.2
 - v3.51.2: переделан AMOLED скринсейвер. Блок теперь гуляет по ВСЕМУ
   экрану (был только центр 28-72% по X, 32-68% по Y). Позиция вычисляется
@@ -440,7 +449,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.51.2"
+APP_VERSION  = "3.51.3"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -569,8 +578,9 @@ def _gate_sign(key, secret, method, url, query_str="", body_str=""):
     sig = hmac.new(secret.encode(), msg.encode(), _hl.sha512).hexdigest()
     return {"KEY": key, "Timestamp": ts, "SIGN": sig}
 
-def _gate_req(method, path, params=None, body=None):
-    """Подписанный запрос к Gate.io Futures USDT API."""
+def _gate_req(method, path, params=None, body=None, _retries=3, _retry_delay=2.0):
+    """Подписанный запрос к Gate.io Futures USDT API.
+    При сетевых ошибках (timeout, connection) делает до _retries попыток."""
     if not GATE_KEY or not GATE_SECRET:
         raise RuntimeError("Gate.io ключи не настроены")
     import hashlib as _hl
@@ -589,11 +599,31 @@ def _gate_req(method, path, params=None, body=None):
     }
     url = f"https://fx-api.gateio.ws{url_path}"
     if query_str: url += "?" + query_str
-    r = requests.request(method, url, headers=headers,
-                         data=body_str if body_str else None, timeout=10)
-    if not r.ok:
-        raise RuntimeError(f"Gate {method} {path} → {r.status_code}: {r.text[:200]}")
-    return r.json()
+
+    last_exc = None
+    for attempt in range(1, _retries + 1):
+        try:
+            r = requests.request(method, url, headers=headers,
+                                 data=body_str if body_str else None, timeout=10)
+            if not r.ok:
+                raise RuntimeError(f"Gate {method} {path} → {r.status_code}: {r.text[:200]}")
+            return r.json()
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+                requests.exceptions.ReadTimeout) as e:
+            last_exc = e
+            if attempt < _retries:
+                olog(f"⚠ Gate сеть (попытка {attempt}/{_retries}): {e} — повтор через {_retry_delay}с")
+                time.sleep(_retry_delay)
+            # Не делаем retry на логические ошибки API (RuntimeError выше)
+        except RuntimeError:
+            raise
+        except Exception as e:
+            last_exc = e
+            if attempt < _retries:
+                olog(f"⚠ Gate ошибка (попытка {attempt}/{_retries}): {e} — повтор через {_retry_delay}с")
+                time.sleep(_retry_delay)
+    raise last_exc
 
 def _gate_get_position(symbol):
     """Текущая позиция по символу (None если нет)."""
@@ -1136,6 +1166,13 @@ def _auto_trade_loop():
                                 auto_trade_state["position"] = None
                             armed = False
                             last_entry_ts = None
+
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout) as e:
+            olog(f"⚠ Авто-трейд: нет сети — {e} — повтор через 15с")
+            with auto_trade_lock:
+                auto_trade_state["last_error"] = f"нет сети: {e}"
+            _auto_trade_stop.wait(timeout=15)
 
         except Exception as e:
             olog(f"⚠ Авто-трейд ошибка: {e}")
@@ -1769,15 +1806,42 @@ def _gh_save_best(best):
 
 # ─── Telegram / ntfy ────────────────────────────────────────────────────────
 def _send_alert(msg):
-    if TG_TOKEN and TG_CHAT:
-        try:
-            requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                json={"chat_id":TG_CHAT,"text":msg,"parse_mode":"HTML"}, timeout=8)
-        except: pass
-    if NTFY_URL:
-        try:
-            requests.post(NTFY_URL, data=msg.encode(), timeout=8)
-        except: pass
+    """Отправка алерта в Telegram и/или ntfy.
+    Запускается в фоновом потоке чтобы не блокировать авто-трейд.
+    При сетевой ошибке — 3 попытки с паузой 5с."""
+    def _do_send():
+        for attempt in range(1, 4):
+            sent = False
+            if TG_TOKEN and TG_CHAT:
+                try:
+                    r = requests.post(
+                        f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                        json={"chat_id": TG_CHAT, "text": msg, "parse_mode": "HTML"},
+                        timeout=8)
+                    if r.ok:
+                        sent = True
+                    else:
+                        olog(f"⚠ TG алерт HTTP {r.status_code} (попытка {attempt}/3)")
+                except (requests.exceptions.ConnectionError,
+                        requests.exceptions.Timeout) as e:
+                    olog(f"⚠ TG алерт сеть (попытка {attempt}/3): {e}")
+                except Exception as e:
+                    olog(f"⚠ TG алерт: {e}")
+                    break  # не сетевая ошибка — не ретраим
+            if NTFY_URL:
+                try:
+                    requests.post(NTFY_URL, data=msg.encode(), timeout=8)
+                    sent = True
+                except (requests.exceptions.ConnectionError,
+                        requests.exceptions.Timeout) as e:
+                    olog(f"⚠ ntfy алерт сеть (попытка {attempt}/3): {e}")
+                except Exception as e:
+                    olog(f"⚠ ntfy алерт: {e}")
+                    break
+            if sent or attempt == 3:
+                break
+            time.sleep(5)
+    threading.Thread(target=_do_send, daemon=True).start()
 
 def _load_alert_cfg():
     """Подхватывает сохранённые TG/ntfy настройки из файла (приоритет над env)."""
@@ -2155,6 +2219,11 @@ def _chart_monitor_loop(sym, tf, days, p):
                                 f"Последний сигнал ({last_dir_was.upper()}) исчез после переразметки. "
                                 f"Открытых позиций по нему нет или TP/SL уже сработал — проверь вручную."
                             )
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout) as e:
+            olog(f"⚠ Монитор графика: нет сети — {e} — повтор через 15с")
+            _chart_mon_stop.wait(timeout=15)
+            continue
         except Exception as e:
             olog(f"⚠ Монитор графика: {e}")
         # Спим до следующего закрытия бара (+небольшой запас)
@@ -2616,6 +2685,7 @@ input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;p
   <button class="btn btn-go" id="btnStart" onclick="startOpt()">&#9654; Старт</button>
   <button class="btn btn-stop" id="btnStop" onclick="stopOpt()" style="display:none">&#9632; Стоп</button>
   <span id="statusBadge" style="color:#555;font-size:11px">готов</span>
+  <span id="netBadge" style="display:none;color:#f45;font-size:11px;font-weight:600">⚡ офлайн</span>
   <button class="btn-sm" id="amoledBtn" onclick="toggleAmoled()" title="AMOLED режим — гасит экран через 15с неактивности, защита от выгорания пикселей">&#11044; AMOLED</button>
 </div>
 <div class="global-status" id="globalStatus" title="Текущий статус трёх независимых процессов: перебор параметров, монитор графика (алерты) и авто-торговля. Кнопка «Стоп» у перебора останавливает только его — монитор и авто-торговля управляются отдельно.">
@@ -3995,6 +4065,18 @@ function toggleAmoled(){
 
 _amoledBtnRefresh();
 if(_amoledOn){ _acquireWakeLock(); _resetAmoledTimer(); }
+
+// ── Индикатор сети ──────────────────────────────────────────────────────────
+(function(){
+  var nb = document.getElementById('netBadge');
+  if(!nb) return;
+  function _netUpdate(){
+    nb.style.display = navigator.onLine ? 'none' : 'inline';
+  }
+  window.addEventListener('online',  _netUpdate);
+  window.addEventListener('offline', _netUpdate);
+  _netUpdate();
+})();
 </script></body></html>
 """.replace("__VER__", APP_VERSION)
 
