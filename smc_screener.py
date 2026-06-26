@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.51.1
+- v3.51.1: убрано принудительное переключение вкладки на «График» при
+  нахождении нового лучшего конфига. Конфиг по-прежнему применяется к
+  графику автоматически (loadChart()), но пользователь остаётся на той
+  вкладке где находился — оптимизатор, скринер и т.д. не прерываются.
 SMC Optimizer v3.51.0
 - v3.51.0: проверка позиций по ДРУГИМ парам перед открытием сделки.
   Если на бирже открыта позиция не по нашему символу (другой телефон
@@ -428,7 +433,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.51.0"
+APP_VERSION  = "3.51.1"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -2811,12 +2816,7 @@ function applyBestToChart(){
     min_ob_size:        p.min_ob_size        != null ? p.min_ob_size        : 1.0,
     require_fvg_confirm:p.require_fvg_confirm!= null ? p.require_fvg_confirm: false,
   };
-  // Переключаем вкладку надёжно — ищем кнопку по тексту
-  var tabBtns = document.querySelectorAll('.tab');
-  var chartBtn = null;
-  for(var i=0;i<tabBtns.length;i++){ if(tabBtns[i].textContent.trim()==='График'){ chartBtn=tabBtns[i]; break; } }
-  if(chartBtn) switchTab('chart', chartBtn);
-  // setTimeout чтобы canvas успел стать видимым перед drawChart
+  // Применяем конфиг к графику без переключения вкладки
   setTimeout(function(){ loadChart(); }, 80);
 }
 
