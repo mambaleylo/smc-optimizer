@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.50.7
+- v3.50.7: ещё 3 бага авто-трейда. 1) В ветке «тот же сигнал» добавлена
+  проверка _gate_get_position — если позиция закрылась по TP/SL или
+  вручную, бот теперь замечает это, сбрасывает position/armed, шлёт
+  Telegram-алерт «позиция закрыта». Раньше UI вечно показывал «позиция
+  открыта» после срабатывания стопа. 2) close_size при принятии чужой
+  позиции теперь int() — Gate API требует целое число, float вызывал
+  ошибку. 3) После обнаружения закрытия позиции armed=False/last_entry_ts
+  =None — позволяет переоткрыться на следующем баре без смены сигнала.
 SMC Optimizer v3.50.6
 - v3.50.6: найдено и исправлено 4 бага в авто-трейде и мониторе.
   1) КРИТИЧЕСКИЙ: our_pos не был объявлен перед использованием →
@@ -401,7 +410,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.50.6"
+APP_VERSION  = "3.50.7"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -880,7 +889,7 @@ def _auto_trade_loop():
                                         contract  = sym.replace("/", "_").upper()
                                         is_long   = direction == "long"
                                         raw_size  = existing.get("size", 0)
-                                        close_size = -abs(raw_size) if is_long else abs(raw_size)
+                                        close_size = -int(abs(raw_size)) if is_long else int(abs(raw_size))
                                         # TP
                                         _gate_req("POST", "/futures/usdt/price_orders", body={
                                             "initial": {
@@ -984,7 +993,25 @@ def _auto_trade_loop():
                                     auto_trade_state["position"] = pos_info
                                     auto_trade_state["last_entry_ts"] = entry_ts
                         else:
-                            # Тот же сигнал — обновляем время последней проверки
+                            # Тот же сигнал — проверяем не закрылась ли позиция по TP/SL
+                            with auto_trade_lock:
+                                our_pos_now = auto_trade_state.get("position")
+                            if our_pos_now is not None:
+                                # У нас была открыта позиция — проверяем биржу
+                                still_open = _gate_get_position(sym)
+                                if not still_open:
+                                    # Позиция закрыта (TP/SL сработал или закрыта вручную)
+                                    with auto_trade_lock:
+                                        auto_trade_state["position"] = None
+                                    armed         = False
+                                    last_entry_ts = None
+                                    dirru = our_pos_now.get("dir", "?").upper()
+                                    olog(f"✅ Позиция {dirru} закрыта на бирже (TP/SL или вручную)")
+                                    _send_alert(
+                                        f"{'🟢' if dirru=='LONG' else '🔴'} <b>{sym}</b> — "
+                                        f"позиция {dirru} закрыта\n"
+                                        f"TP/SL сработал или закрыта вручную. Жду следующего сигнала."
+                                    )
                             with auto_trade_lock:
                                 auto_trade_state["last_check"] = time.time()
                                 auto_trade_state["last_error"] = ""
