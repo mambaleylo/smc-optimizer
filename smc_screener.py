@@ -1,5 +1,26 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.51.11
+- v3.51.11: три фикса авто-трейда после рестарта.
+  (1) КРИТИЧНО: _gate_close_position нигде не была объявлена через def —
+  тело функции висело без заголовка внутри _gate_get_last_pnl как мёртвый
+  недостижимый код. Каждый вызов (смена направления в авто-трейде, кнопка
+  «Закрыть позицию») падал NameError. Восстановлено `def _gate_close_position
+  (symbol):`. Из-за этого бота раньше реально закрывали позиции ТОЛЬКО
+  TP/SL-триггеры на бирже — сам бот не мог закрыть позицию вручную.
+  (2) Дубли TP/SL после рестарта. auto_trade_state["position"] — в памяти
+  процесса, при рестарте становится None, хотя TP/SL уже стоят на бирже с
+  прошлого запуска. Код "принятия чужой позиции" слепо ставил НОВЫЕ TP/SL
+  только по признаку our_pos is None — теперь сначала GET /futures/usdt/
+  price_orders?status=open по контракту; если ордера уже есть — просто
+  принимаем трек без повторной установки.
+  (3) Уведомление о закрытии приходило с опозданием (только когда закрывалась
+  свеча) — основной цикл сигналов идёт раз в tf_sec, а TP/SL на бирже
+  срабатывают мгновенно. Логику проверки закрытия вынесли в
+  _check_position_closed_and_alert(), и теперь во время ожидания следующей
+  свечи позиция дополнительно опрашивается каждые 10с (POS_POLL_SEC) —
+  уведомление с реальным PnL приходит почти сразу после срабатывания
+  стопа/тейка, а не через весь таймфрейм.
 SMC Optimizer v3.51.10
 - v3.51.10: фикс заниженного баланса (~в 15 раз меньше реального). Причина:
   Gate.io имеет разные архитектуры маржи на /futures/usdt/accounts
@@ -512,7 +533,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.51.10"
+APP_VERSION  = "3.51.11"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -810,6 +831,41 @@ def _gate_get_last_pnl(symbol):
         return None
 
 
+def _check_position_closed_and_alert(sym, our_pos_now):
+    """Проверяет, не закрылась ли отслеживаемая позиция на бирже; если
+    закрылась — шлёт алерт с реальным PnL. Возвращает True если позиция
+    закрыта (вызывающий код должен сбросить armed/last_entry_ts/position),
+    False если позиция всё ещё открыта. Вынесено в отдельную функцию, чтобы
+    одинаково использоваться и в основном цикле сигналов (раз в свечу), и
+    в быстром опросе во время ожидания (раз в POS_POLL_SEC секунд) — иначе
+    уведомление о закрытии приходило только когда дожидались следующей свечи."""
+    still_open = _gate_get_position(sym)
+    if still_open:
+        return False
+    dirru = our_pos_now.get("dir", "?").upper()
+    entry = our_pos_now.get("entry", 0)
+    olog(f"✅ Позиция {dirru} закрыта на бирже (TP/SL или вручную)")
+    pnl_info = _gate_get_last_pnl(sym)
+    if pnl_info:
+        pnl     = pnl_info["pnl"]
+        pnl_pct = pnl_info["pnl_pct"]
+        close_p = pnl_info["close_price"]
+        sign    = "+" if pnl >= 0 else ""
+        result_emoji = "✅" if pnl >= 0 else "❌"
+        _send_alert(
+            f"{result_emoji} <b>{sym}</b> — позиция {dirru} закрыта\n"
+            f"Entry {_fmt_px(entry)} → Close {_fmt_px(close_p)}\n"
+            f"PnL: <b>{sign}{pnl:.2f} USDT ({sign}{pnl_pct:.2f}%)</b>"
+        )
+    else:
+        _send_alert(
+            f"{'🟢' if dirru=='LONG' else '🔴'} <b>{sym}</b> — "
+            f"позиция {dirru} закрыта\n"
+            f"TP/SL сработал или закрыта вручную. Жду следующего сигнала."
+        )
+    return True
+
+def _gate_close_position(symbol):
     """Закрыть позицию рыночным ордером."""
     try:
         contract = symbol.replace("/", "_").upper()
@@ -1092,50 +1148,32 @@ def _auto_trade_loop():
                                 if existing and our_pos is None:
                                     same_dir = existing["dir"] == direction
                                     if same_dir:
-                                        olog(f"🔗 Обнаружена позиция {existing['dir'].upper()} "
-                                             f"без нашего TP/SL — принимаем управление, "
-                                             f"выставляем TP={_fmt_px(tp_px)} SL={_fmt_px(sl_px)}")
+                                        contract  = sym.replace("/", "_").upper()
+                                        is_long   = direction == "long"
+                                        raw_size  = existing.get("size", 0)
+                                        close_size = -int(abs(raw_size)) if is_long else int(abs(raw_size))
+                                        # Проверяем — вдруг TP/SL уже стоят на бирже.
+                                        # Раньше тут СЛЕПО ставили новые TP/SL только
+                                        # потому что our_pos is None — а это просто
+                                        # значит, что в памяти потеряли трек (например
+                                        # рестарт процесса), а не что ордеров нет.
+                                        # Из-за этого после каждого рестарта дублировались
+                                        # уже существующие TP/SL.
+                                        already_has_tpsl = False
+                                        open_orders = []
                                         try:
-                                            contract  = sym.replace("/", "_").upper()
-                                            is_long   = direction == "long"
-                                            raw_size  = existing.get("size", 0)
-                                            close_size = -int(abs(raw_size)) if is_long else int(abs(raw_size))
-                                            # TP
-                                            _gate_req("POST", "/futures/usdt/price_orders", body={
-                                                "initial": {
-                                                    "contract":    contract,
-                                                    "size":        close_size,
-                                                    "price":       "0",
-                                                    "tif":         "ioc",
-                                                    "reduce_only": True,
-                                                    "text":        "t-smc-tp",
-                                                },
-                                                "trigger": {
-                                                    "strategy_type": 0,
-                                                    "price_type":    0,
-                                                    "price":         _gate_round_price(tp_px, contract),
-                                                    "rule":          1 if is_long else 2,
-                                                    "expiration":    86400,
-                                                },
-                                            })
-                                            # SL
-                                            _gate_req("POST", "/futures/usdt/price_orders", body={
-                                                "initial": {
-                                                    "contract":    contract,
-                                                    "size":        close_size,
-                                                    "price":       "0",
-                                                    "tif":         "ioc",
-                                                    "reduce_only": True,
-                                                    "text":        "t-smc-sl",
-                                                },
-                                                "trigger": {
-                                                    "strategy_type": 0,
-                                                    "price_type":    0,
-                                                    "price":         _gate_round_price(sl_px, contract),
-                                                    "rule":          2 if is_long else 1,
-                                                    "expiration":    86400,
-                                                },
-                                            })
+                                            _r = _gate_req("GET", "/futures/usdt/price_orders",
+                                                           params={"contract": contract, "status": "open"})
+                                            open_orders = _r if isinstance(_r, list) else []
+                                            already_has_tpsl = len(open_orders) > 0
+                                        except Exception as _ce:
+                                            olog(f"⚠ Проверка существующих TP/SL: {_ce}")
+
+                                        if already_has_tpsl:
+                                            olog(f"🔗 Обнаружена позиция {existing['dir'].upper()} — "
+                                                 f"TP/SL уже стоят на бирже ({len(open_orders)} "
+                                                 f"ордер(ов)), принимаем управление БЕЗ повторной "
+                                                 f"установки")
                                             adopted = {
                                                 "dir": direction, "entry": existing.get("entry", entry_px),
                                                 "sl": sl_px, "tp": tp_px,
@@ -1146,15 +1184,70 @@ def _auto_trade_loop():
                                                 auto_trade_state["last_entry_ts"] = entry_ts
                                             emoji = "🟢" if is_long else "🔴"
                                             _send_alert(
-                                                f"{emoji} <b>{sym}</b> — принята чужая позиция "
-                                                f"{direction.upper()}\n"
-                                                f"TP {_fmt_px(tp_px)} | SL {_fmt_px(sl_px)} выставлены"
+                                                f"{emoji} <b>{sym}</b> — принята позиция "
+                                                f"{direction.upper()} (после рестарта)\n"
+                                                f"TP/SL уже стояли на бирже — не дублируем"
                                             )
-                                            olog(f"✅ TP/SL выставлены на принятую позицию {direction.upper()}")
-                                        except Exception as _e:
-                                            olog(f"⚠ Не удалось выставить TP/SL на чужую позицию: {_e}")
-                                            with auto_trade_lock:
-                                                auto_trade_state["last_entry_ts"] = entry_ts
+                                        else:
+                                            olog(f"🔗 Обнаружена позиция {existing['dir'].upper()} "
+                                                 f"без TP/SL — принимаем управление, "
+                                                 f"выставляем TP={_fmt_px(tp_px)} SL={_fmt_px(sl_px)}")
+                                            try:
+                                              # TP
+                                              _gate_req("POST", "/futures/usdt/price_orders", body={
+                                                  "initial": {
+                                                      "contract":    contract,
+                                                      "size":        close_size,
+                                                      "price":       "0",
+                                                      "tif":         "ioc",
+                                                      "reduce_only": True,
+                                                      "text":        "t-smc-tp",
+                                                  },
+                                                  "trigger": {
+                                                      "strategy_type": 0,
+                                                      "price_type":    0,
+                                                      "price":         _gate_round_price(tp_px, contract),
+                                                      "rule":          1 if is_long else 2,
+                                                      "expiration":    86400,
+                                                  },
+                                              })
+                                              # SL
+                                              _gate_req("POST", "/futures/usdt/price_orders", body={
+                                                  "initial": {
+                                                      "contract":    contract,
+                                                      "size":        close_size,
+                                                      "price":       "0",
+                                                      "tif":         "ioc",
+                                                      "reduce_only": True,
+                                                      "text":        "t-smc-sl",
+                                                  },
+                                                  "trigger": {
+                                                      "strategy_type": 0,
+                                                      "price_type":    0,
+                                                      "price":         _gate_round_price(sl_px, contract),
+                                                      "rule":          2 if is_long else 1,
+                                                      "expiration":    86400,
+                                                  },
+                                              })
+                                              adopted = {
+                                                  "dir": direction, "entry": existing.get("entry", entry_px),
+                                                  "sl": sl_px, "tp": tp_px,
+                                                  "size": raw_size, "leverage": 0, "notional": 0
+                                              }
+                                              with auto_trade_lock:
+                                                  auto_trade_state["position"]      = adopted
+                                                  auto_trade_state["last_entry_ts"] = entry_ts
+                                              emoji = "🟢" if is_long else "🔴"
+                                              _send_alert(
+                                                  f"{emoji} <b>{sym}</b> — принята чужая позиция "
+                                                  f"{direction.upper()}\n"
+                                                  f"TP {_fmt_px(tp_px)} | SL {_fmt_px(sl_px)} выставлены"
+                                              )
+                                              olog(f"✅ TP/SL выставлены на принятую позицию {direction.upper()}")
+                                            except Exception as _e:
+                                              olog(f"⚠ Не удалось выставить TP/SL на чужую позицию: {_e}")
+                                              with auto_trade_lock:
+                                                  auto_trade_state["last_entry_ts"] = entry_ts
                                     else:
                                         # Направление противоположное — не трогаем,
                                         # просто предупреждаем
@@ -1207,36 +1300,11 @@ def _auto_trade_loop():
                             with auto_trade_lock:
                                 our_pos_now = auto_trade_state.get("position")
                             if our_pos_now is not None:
-                                # У нас была открыта позиция — проверяем биржу
-                                still_open = _gate_get_position(sym)
-                                if not still_open:
-                                    # Позиция закрыта (TP/SL сработал или закрыта вручную)
+                                if _check_position_closed_and_alert(sym, our_pos_now):
                                     with auto_trade_lock:
                                         auto_trade_state["position"] = None
                                     armed         = False
                                     last_entry_ts = None
-                                    dirru   = our_pos_now.get("dir", "?").upper()
-                                    entry   = our_pos_now.get("entry", 0)
-                                    olog(f"✅ Позиция {dirru} закрыта на бирже (TP/SL или вручную)")
-                                    # Запрашиваем реальный PnL с биржи
-                                    pnl_info = _gate_get_last_pnl(sym)
-                                    if pnl_info:
-                                        pnl     = pnl_info["pnl"]
-                                        pnl_pct = pnl_info["pnl_pct"]
-                                        close_p = pnl_info["close_price"]
-                                        sign    = "+" if pnl >= 0 else ""
-                                        result_emoji = "✅" if pnl >= 0 else "❌"
-                                        _send_alert(
-                                            f"{result_emoji} <b>{sym}</b> — позиция {dirru} закрыта\n"
-                                            f"Entry {_fmt_px(entry)} → Close {_fmt_px(close_p)}\n"
-                                            f"PnL: <b>{sign}{pnl:.2f} USDT ({sign}{pnl_pct:.2f}%)</b>"
-                                        )
-                                    else:
-                                        _send_alert(
-                                            f"{'🟢' if dirru=='LONG' else '🔴'} <b>{sym}</b> — "
-                                            f"позиция {dirru} закрыта\n"
-                                            f"TP/SL сработал или закрыта вручную. Жду следующего сигнала."
-                                        )
                             with auto_trade_lock:
                                 auto_trade_state["last_check"] = time.time()
                                 auto_trade_state["last_error"] = ""
@@ -1289,8 +1357,32 @@ def _auto_trade_loop():
                 auto_trade_state["last_error"] = str(e)
 
         now = time.time()
-        sleep_for = tf_sec - (now % tf_sec) + 3
-        _auto_trade_stop.wait(timeout=max(5, sleep_for))
+        sleep_for = max(5, tf_sec - (now % tf_sec) + 3)
+        # ── Быстрый опрос закрытия позиции во время ожидания свечи ──────────
+        # TP/SL на бирже срабатывают мгновенно, а основной цикл сигналов идёт
+        # раз в свечу (tf_sec) — раньше уведомление о закрытии приходило
+        # только когда дожидались следующей свечи, а не сразу после срабатывания
+        # стопа/тейка. Опрашиваем позицию каждые POS_POLL_SEC секунд во время
+        # ожидания, чтобы заметить закрытие почти сразу.
+        POS_POLL_SEC = 10
+        waited = 0.0
+        while waited < sleep_for and not _auto_trade_stop.is_set():
+            step = min(POS_POLL_SEC, sleep_for - waited)
+            if _auto_trade_stop.wait(timeout=step):
+                break
+            waited += step
+            with auto_trade_lock:
+                tracked = auto_trade_state.get("position")
+            if tracked is not None:
+                try:
+                    if _check_position_closed_and_alert(sym, tracked):
+                        with auto_trade_lock:
+                            auto_trade_state["position"] = None
+                        armed         = False
+                        last_entry_ts = None
+                        break  # позиции больше нет — дальше можно сразу на новый цикл сигналов
+                except Exception as _pe:
+                    olog(f"⚠ Быстрая проверка закрытия позиции: {_pe}")
 
     olog("🛑 Авто-трейд остановлен")
     with auto_trade_lock:
