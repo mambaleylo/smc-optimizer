@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.51.4
+- v3.51.4: топ-20 конфигураций перемещён выше лога — теперь сразу виден
+  после панели управления на мобильном. Скринер также перемещён выше лога.
 SMC Optimizer v3.51.3
 - v3.51.3: защита от разрыва интернета. 1) _gate_req: retry 3 попытки
   с паузой 2с при ConnectionError/Timeout — TP/SL не потеряются при
@@ -449,7 +452,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.51.3"
+APP_VERSION  = "3.51.4"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -2771,6 +2774,13 @@ input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;p
   <div class="card log-box" id="logBox"></div>
 </div>
 <div class="main">
+  <div class="card" id="screenerCard" style="display:none">
+    <h3>🔍 Скрининг всех монет</h3>
+    <div id="screenerStatus" style="color:#555;font-size:11px;margin-bottom:8px;white-space:pre;line-height:1.6">—</div>
+    <div class="prog-bar"><div class="prog-fill" id="screenerProg" style="width:0%"></div></div>
+    <div id="screenerSymList" style="margin-top:6px;font-size:10px;color:#888;line-height:1.8;word-break:break-all"></div>
+    <div id="screenerTable" style="margin-top:8px"></div>
+  </div>
   <div class="card">
     <h3>Топ-20 конфигураций</h3>
     <div id="top20Container">
@@ -2780,14 +2790,6 @@ input,select{width:100%;background:#0d0d0d;border:1px solid #333;color:#e0e0e0;p
       </div>
     </div>
   </div>
-  <div class="card" id="screenerCard" style="display:none">
-    <h3>🔍 Скрининг всех монет</h3>
-    <div id="screenerStatus" style="color:#555;font-size:11px;margin-bottom:8px;white-space:pre;line-height:1.6">—</div>
-    <div class="prog-bar"><div class="prog-fill" id="screenerProg" style="width:0%"></div></div>
-    <div id="screenerSymList" style="margin-top:6px;font-size:10px;color:#888;line-height:1.8;word-break:break-all"></div>
-    <div id="screenerTable" style="margin-top:8px"></div>
-  </div>
-</div>
 </div>
 </div>
 <div id="chartPanel" class="tab-panel">
