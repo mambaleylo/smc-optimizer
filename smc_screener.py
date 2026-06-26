@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.51.12
+- v3.51.12: запрет на открытие сделки в авто-трейде пока оптимизатор не
+  прошёл MIN_CYCLES_BEFORE_TRADE=150 циклов (opt_state["cycle"]) — параметры
+  на малом числе циклов недостаточно проверены walk-forward'ом, торговать
+  по ним рано. Применяется к открытию новой позиции и к флипу направления
+  (закрыть старую + открыть новую); НЕ применяется к "принятию чужой
+  позиции" — там мы просто защищаем уже открытую кем-то позицию TP/SL,
+  а не открываем новую, так что блокировать незащищённую позицию было бы
+  хуже, чем поставить ей стоп независимо от числа циклов. Пока заблокировано:
+  last_entry_ts НЕ обновляется, чтобы сигнал остался "новым" и был
+  немедленно подхвачен, как только порог циклов будет пройден — иначе
+  можно было прозевать вход. Алерт в Telegram/ntfy шлётся один раз на
+  сигнал (cycle_gate_alerted), лог пишется каждую свечу.
 SMC Optimizer v3.51.11
 - v3.51.11: три фикса авто-трейда после рестарта.
   (1) КРИТИЧНО: _gate_close_position нигде не была объявлена через def —
@@ -533,7 +546,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.51.11"
+APP_VERSION  = "3.51.12"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -1077,6 +1090,11 @@ def _auto_trade_loop():
     armed = False
     last_entry_ts = None
 
+    # Запрет на открытие сделки пока оптимизатор не прошёл достаточно
+    # циклов — параметры на малом числе циклов недостаточно проверены.
+    MIN_CYCLES_BEFORE_TRADE = 150
+    cycle_gate_alerted = False  # чтобы не спамить алертом каждую свечу
+
     while not _auto_trade_stop.is_set():
         try:
             with auto_trade_lock:
@@ -1276,25 +1294,43 @@ def _auto_trade_loop():
                                     with auto_trade_lock:
                                         auto_trade_state["last_entry_ts"] = entry_ts
                                 else:
-                                    olog(f"🤖 Новый сигнал: {direction.upper()} "
-                                         f"entry={_fmt_px(entry_px)} sl={_fmt_px(sl_px)} tp={_fmt_px(tp_px)}")
-    
-                                    # Закрываем старую позицию (если есть, и направление другое)
-                                    if existing:
-                                        olog(f"🔄 Закрываем старую позицию {existing['dir'].upper()} "
-                                             f"перед открытием новой ({direction.upper()})")
-                                        _gate_close_position(sym)
-                                        time.sleep(1.0)
-    
-                                    # Открываем новую
-                                    with auto_trade_lock:
-                                        pos_pct = auto_trade_state.get("position_pct", risk_pct)
-                                    pos_info = _gate_open_position(
-                                        sym, direction, entry_px, sl_px, tp_px, risk_pct,
-                                        position_pct=pos_pct)
-                                    with auto_trade_lock:
-                                        auto_trade_state["position"] = pos_info
-                                        auto_trade_state["last_entry_ts"] = entry_ts
+                                    with opt_lock:
+                                        cur_cycle = opt_state.get("cycle", 0)
+                                    if cur_cycle < MIN_CYCLES_BEFORE_TRADE:
+                                        olog(f"⏳ Сигнал {direction.upper()} есть, но открытие "
+                                             f"заблокировано — оптимизатор прошёл {cur_cycle}/"
+                                             f"{MIN_CYCLES_BEFORE_TRADE} циклов. Жду, last_entry_ts "
+                                             f"не обновляю — подхвачу сразу как порог пройден.")
+                                        if not cycle_gate_alerted:
+                                            _send_alert(
+                                                f"⏳ <b>{sym}</b> — сигнал {direction.upper()} есть, "
+                                                f"но авто-трейд ждёт минимум "
+                                                f"{MIN_CYCLES_BEFORE_TRADE} циклов оптимизатора "
+                                                f"(сейчас {cur_cycle}). Откроет сделку как только "
+                                                f"наберётся порог."
+                                            )
+                                            cycle_gate_alerted = True
+                                        # last_entry_ts НЕ трогаем — сигнал останется "новым".
+                                    else:
+                                        olog(f"🤖 Новый сигнал: {direction.upper()} "
+                                             f"entry={_fmt_px(entry_px)} sl={_fmt_px(sl_px)} tp={_fmt_px(tp_px)}")
+
+                                        # Закрываем старую позицию (если есть, и направление другое)
+                                        if existing:
+                                            olog(f"🔄 Закрываем старую позицию {existing['dir'].upper()} "
+                                                 f"перед открытием новой ({direction.upper()})")
+                                            _gate_close_position(sym)
+                                            time.sleep(1.0)
+
+                                        # Открываем новую
+                                        with auto_trade_lock:
+                                            pos_pct = auto_trade_state.get("position_pct", risk_pct)
+                                        pos_info = _gate_open_position(
+                                            sym, direction, entry_px, sl_px, tp_px, risk_pct,
+                                            position_pct=pos_pct)
+                                        with auto_trade_lock:
+                                            auto_trade_state["position"] = pos_info
+                                            auto_trade_state["last_entry_ts"] = entry_ts
                         else:
                             # Тот же сигнал — проверяем не закрылась ли позиция по TP/SL
                             with auto_trade_lock:
