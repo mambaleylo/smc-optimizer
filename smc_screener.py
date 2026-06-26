@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.51.6
+- v3.51.6: смягчены цвета. Светлая тема: белый #fff → молочный #eceae4
+  (тёплый бежевый фон, не слепит). Синий акцент: #4d9fff → #7ab3e0
+  (пастельный) в тёмной теме, #1a6fd4 → #4a7fb5 в светлой.
 SMC Optimizer v3.51.5
 - v3.51.5: универсальный дизайн день/ночь. Весь CSS переведён на
   CSS-переменные (:root). Тёмная тема — по умолчанию. Светлая тема
@@ -460,7 +464,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.51.5"
+APP_VERSION  = "3.51.6"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -2598,8 +2602,8 @@ HTML = """<!DOCTYPE html><html lang="ru"><head>
   --text2:     #aaaaaa;
   --text3:     #666666;
   --text4:     #555555;
-  --accent:    #4d9fff;
-  --accent2:   #2a6fcc;
+  --accent:    #7ab3e0;
+  --accent2:   #5a93c8;
   --green:     #00dd88;
   --red:       #ff4455;
   --yellow:    #f0b800;
@@ -2617,30 +2621,30 @@ HTML = """<!DOCTYPE html><html lang="ru"><head>
 /* ── Светлая тема ── */
 @media(prefers-color-scheme:light){
   :root{
-    --bg:        #f0f2f5;
-    --bg2:       #ffffff;
-    --bg3:       #ffffff;
-    --bg4:       #e8eaed;
-    --border:    #d0d4da;
-    --border2:   #dde1e7;
-    --text:      #1a1a1a;
-    --text2:     #444444;
-    --text3:     #777777;
-    --text4:     #999999;
-    --accent:    #1a6fd4;
-    --accent2:   #0f52a8;
-    --green:     #0a8f50;
-    --red:       #d42020;
-    --yellow:    #b87800;
-    --pill-bg:   #f5f5f5;
-    --pill-on:   #0a5c30;
-    --pill-on-b: #0a8f50;
-    --pill-warn: #7a4a00;
-    --pill-warn-b:#c87000;
-    --input-bg:  #ffffff;
-    --log-bg:    #f8f9fa;
-    --canvas-bg: #ffffff;
-    --eq-track:  #d8dbe0;
+    --bg:        #eceae4;
+    --bg2:       #f4f2ec;
+    --bg3:       #f7f5ef;
+    --bg4:       #e4e2dc;
+    --border:    #ccc9c0;
+    --border2:   #d8d5cc;
+    --text:      #1e1c18;
+    --text2:     #4a4840;
+    --text3:     #7a7870;
+    --text4:     #9a9890;
+    --accent:    #4a7fb5;
+    --accent2:   #3a6a9a;
+    --green:     #2a7a50;
+    --red:       #b83030;
+    --yellow:    #a07020;
+    --pill-bg:   #eceae4;
+    --pill-on:   #1a5c38;
+    --pill-on-b: #2a7a50;
+    --pill-warn: #6a4a10;
+    --pill-warn-b:#a07020;
+    --input-bg:  #f7f5ef;
+    --log-bg:    #eceae4;
+    --canvas-bg: #f7f5ef;
+    --eq-track:  #ccc9c0;
   }
 }
 
