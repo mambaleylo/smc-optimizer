@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.51.7
+- v3.51.7: критический фикс пустой вкладки «График». При переносе топ-20
+  выше лога (v3.51.4) потерялся закрывающий </div> у #optPanel — из-за
+  этого #chartPanel и #atPanel оказались ВНУТРИ #optPanel в DOM. Когда
+  optPanel терял класс .active (display:none), он гасил все вложенные
+  элементы независимо от собственного .active у chartPanel — вкладка
+  «График» переключалась (подсветка таба менялась), но контент не
+  показывался. Добавлен пропущенный </div> перед chartPanel.
+  Также: v3.51.5 заявлял полный переход на CSS-переменные, но пропустил
+  инлайн-цвета статусов (#0f9/#f45/#f0b800/#888/#555 в statusBadge,
+  atStatusBadge, atInfo, alertCfgStatus) — отсюда неоновый зелёный,
+  не сочетавшийся со светлой темой. Все эти места переведены на
+  var(--green)/var(--red)/var(--yellow)/var(--text4)/var(--text2).
 SMC Optimizer v3.51.6
 - v3.51.6: смягчены цвета. Светлая тема: белый #fff → молочный #eceae4
   (тёплый бежевый фон, не слепит). Синий акцент: #4d9fff → #7ab3e0
@@ -464,7 +477,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.51.6"
+APP_VERSION  = "3.51.7"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -2864,6 +2877,7 @@ input:focus,select:focus{outline:none;border-color:var(--accent)}
   </div>
 </div>
 </div>
+</div>
 <div id="chartPanel" class="tab-panel">
   <div class="chart-bar">
     <label>Символ<input id="cSym" value="DOGE_USDT"></label>
@@ -3024,12 +3038,12 @@ function loadGateCfg(){
 function saveGateCfg(){
   var key = document.getElementById('atKey').value.trim();
   var sec = document.getElementById('atSecret').value.trim();
-  if(!key || !sec){ atInfo('Введите ключ и секрет','#f45'); return; }
+  if(!key || !sec){ atInfo('Введите ключ и секрет','var(--red)'); return; }
   fetch('/gate_cfg',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({gate_key:key,gate_secret:sec})})
     .then(function(r){return r.json();})
-    .then(function(d){ if(d.ok) atInfo('✅ Ключи сохранены','#0f9'); })
-    .catch(function(e){ atInfo('Ошибка: '+e,'#f45'); });
+    .then(function(d){ if(d.ok) atInfo('✅ Ключи сохранены','var(--green)'); })
+    .catch(function(e){ atInfo('Ошибка: '+e,'var(--red)'); });
 }
 
 function startAutoTrade(){
@@ -3054,14 +3068,14 @@ function startAutoTrade(){
         document.getElementById('atStartBtn').style.display='none';
         document.getElementById('atStopBtn').style.display='';
         document.getElementById('atStatusBadge').textContent='🟢 активен · '+sym+' '+tf;
-        document.getElementById('atStatusBadge').style.color='#0f9';
+        document.getElementById('atStatusBadge').style.color='var(--green)';
         document.getElementById('atBtn').style.background='#1a5c2a';
-        atInfo('Авто-трейд запущен. Ждём нового сигнала...','#0f9');
+        atInfo('Авто-трейд запущен. Ждём нового сигнала...','var(--green)');
         scheduleAtPoll();
       } else {
-        atInfo('❌ '+d.msg,'#f45');
+        atInfo('❌ '+d.msg,'var(--red)');
       }
-    }).catch(function(e){ atInfo('Ошибка: '+e,'#f45'); });
+    }).catch(function(e){ atInfo('Ошибка: '+e,'var(--red)'); });
 }
 
 function toggleAutoSync(){
@@ -3070,8 +3084,8 @@ function toggleAutoSync(){
     body:JSON.stringify({auto_sync:on})})
     .then(function(r){return r.json();})
     .then(function(d){
-      if(d.ok) atInfo(on?'🔁 Авто-синк с оптимизатором включён':'Авто-синк выключен', on?'#0f9':'#888');
-    }).catch(function(e){ atInfo('Ошибка: '+e,'#f45'); });
+      if(d.ok) atInfo(on?'🔁 Авто-синк с оптимизатором включён':'Авто-синк выключен', on?'var(--green)':'var(--text4)');
+    }).catch(function(e){ atInfo('Ошибка: '+e,'var(--red)'); });
 }
 
 function stopAutoTrade(){
@@ -3081,18 +3095,18 @@ function stopAutoTrade(){
     document.getElementById('atStartBtn').style.display='';
     document.getElementById('atStopBtn').style.display='none';
     document.getElementById('atStatusBadge').textContent='выкл';
-    document.getElementById('atStatusBadge').style.color='#555';
+    document.getElementById('atStatusBadge').style.color='var(--text4)';
     document.getElementById('atBtn').style.background='#1a3a5c';
-    atInfo('Авто-трейд остановлен.','#f0b800');
-  }).catch(function(e){ atInfo('Ошибка: '+e,'#f45'); });
+    atInfo('Авто-трейд остановлен.','var(--yellow)');
+  }).catch(function(e){ atInfo('Ошибка: '+e,'var(--red)'); });
 }
 
 function closePosition(){
   if(!confirm('Закрыть текущую позицию рыночным ордером?')) return;
   fetch('/auto_trade_close',{method:'POST'}).then(function(r){return r.json();})
     .then(function(d){
-      atInfo(d.ok?'✅ Позиция закрыта':'❌ '+d.msg, d.ok?'#0f9':'#f45');
-    }).catch(function(e){ atInfo('Ошибка: '+e,'#f45'); });
+      atInfo(d.ok?'✅ Позиция закрыта':'❌ '+d.msg, d.ok?'var(--green)':'var(--red)');
+    }).catch(function(e){ atInfo('Ошибка: '+e,'var(--red)'); });
 }
 
 function scheduleAtPoll(){
@@ -3141,13 +3155,13 @@ function pollAtStatus(){
 function atInfo(msg, color){
   var el = document.getElementById('atInfo');
   el.innerHTML = msg;
-  el.style.color = color||'#e0e0e0';
+  el.style.color = color||'var(--text)';
 }
 
 function alertCfgStatus(t,ok){
   var el=document.getElementById('alertCfgStatus');
   el.textContent=t;
-  el.style.color = ok===true?'#0f9':(ok===false?'#f45':'#555');
+  el.style.color = ok===true?'var(--green)':(ok===false?'var(--red)':'var(--text4)');
 }
 
 function loadAlertCfg(){
@@ -3357,7 +3371,7 @@ function startOpt(){
   document.getElementById('btnStart').style.display='none';
   document.getElementById('btnStop').style.display='';
   var badge = document.getElementById('statusBadge');
-  badge.style.color='#f0b800';
+  badge.style.color='var(--yellow)';
   var dots=0, phases=['⏳ загрузка свечей.','⏳ загрузка свечей..','⏳ загрузка свечей...'];
   if(_startingDots) clearInterval(_startingDots);
   _startingDots = setInterval(function(){
@@ -3373,12 +3387,12 @@ function startOpt(){
   fetch('/scan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
     .then(function(){
       clearInterval(_startingDots); _startingDots=null;
-      badge.textContent='работает...'; badge.style.color='#0f9';
+      badge.textContent='работает...'; badge.style.color='var(--green)';
       scheduleNext();
     })
     .catch(function(e){
       clearInterval(_startingDots); _startingDots=null;
-      badge.textContent='ошибка запуска'; badge.style.color='#f45';
+      badge.textContent='ошибка запуска'; badge.style.color='var(--red)';
       document.getElementById('btnStart').style.display='';
       document.getElementById('btnStop').style.display='none';
     });
@@ -3415,12 +3429,12 @@ function poll(){
       document.getElementById('btnStop').style.display='none';
       document.getElementById('btnStart').style.display='';
       var badge=document.getElementById('statusBadge');
-      badge.textContent='завершено'; badge.style.color='#aaa';
+      badge.textContent='завершено'; badge.style.color='var(--text2)';
     } else {
       var badge=document.getElementById('statusBadge');
       var cyc=d.cycle||0, tri=(d.trials||0).toLocaleString();
       badge.textContent = cyc>0 ? ('цикл '+cyc+' · '+tri+' попыток') : '⏳ инициализация...';
-      badge.style.color = cyc>0?'#0f9':'#f0b800';
+      badge.style.color = cyc>0?'var(--green)':'var(--yellow)';
       scheduleNext();
     }
 
