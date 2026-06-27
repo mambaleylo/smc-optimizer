@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.11
+- v3.52.11: при переходе на вкладку График автоматически применяется лучший
+  конфиг (_bestParams) если он уже найден — не нужно ждать улучшения fitness
+  или нажимать «Открыть на графике». applyBestToChart без alert если параметров
+  нет — просто грузит с текущими полями.
 SMC Optimizer v3.52.10
 - v3.52.10: фикс — сигнал авто-трейда теперь пишется в opt_state["chart"]
   также при восстановлении позиции после рестарта (две ветки: "TP/SL уже
@@ -640,7 +645,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.10"
+APP_VERSION  = "3.52.11"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -3398,6 +3403,10 @@ function switchTab(id, btn){
   document.querySelectorAll('.tab').forEach(function(b){b.classList.remove('active');});
   document.getElementById(id+'Panel').classList.add('active');
   btn.classList.add('active');
+  // При переходе на вкладку График — автоматически применяем лучший конфиг если есть
+  if(id === 'chart' && _bestParams){
+    applyBestToChart();
+  }
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -3644,7 +3653,7 @@ function simDrawCanvas(data, winStart){
 // ═══════════════════════════════ конец модуля симуляции ═══════════════════
 
 function applyBestToChart(){
-  if(!_bestParams){ alert('Нет лучшего конфига — запустите оптимизатор'); return; }
+  if(!_bestParams){ loadChart(); return; }  // нет конфига — просто грузим с текущими полями
   var p = _bestParams;
   // Сначала выставляем все значения, потом переключаем вкладку и грузим
   document.getElementById('cSym').value   = document.getElementById('sym').value;
