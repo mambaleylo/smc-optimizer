@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.5
+- v3.52.5: дефолты SL=0.6%/TP=1.0% везде (opt_state, screener_state, HTML,
+  fallback в /scan и /scan_all). Окно авто-торговли теперь всегда тёмное
+  (#0d1a2a/#0a1420) — не зависит от CSS-переменных темы, читается в любом
+  режиме (светлом/тёмном).
 SMC Optimizer v3.52.4
 - v3.52.4: фикс периодического сброса эквалайзера к 1.0. Причина: pkill/краш
   сервера в момент записи FITNESS_W_PATH портил JSON-файл → при следующем
@@ -609,7 +614,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.4"
+APP_VERSION  = "3.52.5"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -682,7 +687,7 @@ opt_state  = {
     "running": False, "logs": [], "best": None, "top20": [],
     "cycle": 0, "trials": 0, "progress": 0,
     "symbol": "BTC_USDT", "tf": "15m", "days": 30,
-    "sl_pct": 0.3, "tp_pct": 0.6, "risk_pct": 10.0,
+    "sl_pct": 0.6, "tp_pct": 1.0, "risk_pct": 10.0,
     "offset_days": 0,
     "chart": None, "fetch_pct": 0, "logs_dropped": 0,
     "eco_mode": False,
@@ -696,7 +701,7 @@ screener_state = {
     "current_sym": "", "sym_index": 0, "sym_total": 0,
     "current_cycle": 0, "max_cycles": 100,
     "results": [], "tf":"15m", "days":30,
-    "sl_pct":0.3, "tp_pct":0.6, "risk_pct":10.0,
+    "sl_pct":0.6, "tp_pct":1.0, "risk_pct":10.0,
     "active_workers": {},  # sym -> {"cycle": N, "max_cycles": 100, "phase": "fetch"|"opt"}
 }
 _screener_stop   = threading.Event()
@@ -3152,8 +3157,8 @@ input:focus,select:focus{outline:none;border-color:var(--accent)}
     </select>
     <label>Дней истории</label><input id="days" type="number" value="30" min="7" max="365">
     <label title="Смещение окна в прошлое: 0 = последние N дней, 30 = N дней заканчивающихся 30 дней назад. Используй для OOS: обучи на [now-60д..now-30д] поставив Дней=30 Смещение=30, затем проверь в Симуляции на [now-30д..now].">Смещение (дней назад)</label><input id="offset_days" type="number" value="0" min="0" max="365" title="0 = последние N дней. N = окно заканчивается N дней назад.">
-    <label>SL %</label><input id="sl_pct" type="number" value="0.3" step="0.05">
-    <label>TP %</label><input id="tp_pct" type="number" value="0.6" step="0.05">
+    <label>SL %</label><input id="sl_pct" type="number" value="0.6" step="0.05">
+    <label>TP %</label><input id="tp_pct" type="number" value="1.0" step="0.05">
     <label>Риск на сделку %</label><input id="risk_pct" type="number" value="10" step="1">
   </div>
   <div class="card">
@@ -3243,38 +3248,38 @@ input:focus,select:focus{outline:none;border-color:var(--accent)}
     <button class="btn" id="atBtn" onclick="toggleAutoTrade()" style="align-self:flex-end;background:var(--accent2);color:#fff">🤖 Авто</button>
   </div>
   <!-- Панель авто-торговли (скрыта по умолчанию) -->
-  <div id="atPanel" style="display:none;background:#0d1a2a;border:1px solid #1a3a5c;border-radius:6px;padding:10px;margin-bottom:8px;font-size:12px">
+  <div id="atPanel" style="display:none;background:#0d1a2a;border:1px solid #1a3a5c;border-radius:6px;padding:10px;margin-bottom:8px;font-size:12px;color:#c8d8e8">
     <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
       <b style="color:#3a9eff">🤖 Авто-торговля Gate.io</b>
-      <span id="atStatusBadge" style="color:var(--text4);font-size:11px">выкл</span>
+      <span id="atStatusBadge" style="color:#7a9ab8;font-size:11px">выкл</span>
     </div>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:6px">
-      <label style="color:var(--text2);font-size:11px">API Key
-        <input id="atKey" type="password" placeholder="Gate.io API Key" style="width:100%;background:var(--input-bg);border:1px solid var(--border);color:var(--text);padding:4px 6px;border-radius:4px;font-size:11px">
+      <label style="color:#8aaac8;font-size:11px">API Key
+        <input id="atKey" type="password" placeholder="Gate.io API Key" style="width:100%;background:#0a1420;border:1px solid #1a3a5c;color:#c8d8e8;padding:4px 6px;border-radius:4px;font-size:11px">
       </label>
-      <label style="color:var(--text2);font-size:11px">API Secret
-        <input id="atSecret" type="password" placeholder="Gate.io Secret" style="width:100%;background:var(--input-bg);border:1px solid var(--border);color:var(--text);padding:4px 6px;border-radius:4px;font-size:11px">
+      <label style="color:#8aaac8;font-size:11px">API Secret
+        <input id="atSecret" type="password" placeholder="Gate.io Secret" style="width:100%;background:#0a1420;border:1px solid #1a3a5c;color:#c8d8e8;padding:4px 6px;border-radius:4px;font-size:11px">
       </label>
     </div>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:6px">
-      <label style="color:var(--text2);font-size:11px">Вход % депозита
-        <input id="atPosPct" type="number" value="95" min="1" max="100" step="1" style="width:100%;background:var(--input-bg);border:1px solid var(--border);color:var(--text);padding:4px 6px;border-radius:4px;font-size:11px">
+      <label style="color:#8aaac8;font-size:11px">Вход % депозита
+        <input id="atPosPct" type="number" value="95" min="1" max="100" step="1" style="width:100%;background:#0a1420;border:1px solid #1a3a5c;color:#c8d8e8;padding:4px 6px;border-radius:4px;font-size:11px">
       </label>
-      <label style="color:var(--text2);font-size:11px">Риск % (плечо=риск÷SL)
-        <input id="atRisk" type="number" value="10" min="0.5" max="20" step="0.5" style="width:100%;background:var(--input-bg);border:1px solid var(--border);color:var(--text);padding:4px 6px;border-radius:4px;font-size:11px">
+      <label style="color:#8aaac8;font-size:11px">Риск % (плечо=риск÷SL)
+        <input id="atRisk" type="number" value="10" min="0.5" max="20" step="0.5" style="width:100%;background:#0a1420;border:1px solid #1a3a5c;color:#c8d8e8;padding:4px 6px;border-radius:4px;font-size:11px">
       </label>
     </div>
-    <label style="display:flex;align-items:center;gap:6px;color:var(--text2);font-size:11px;margin-bottom:6px;cursor:pointer">
+    <label style="display:flex;align-items:center;gap:6px;color:#8aaac8;font-size:11px;margin-bottom:6px;cursor:pointer">
       <input id="atAutoSync" type="checkbox" onchange="toggleAutoSync()">
       🔁 Автоматически подхватывать новый лучший конфиг от оптимизатора (того же символа/ТФ) — TP/SL уже открытой сделки не трогает, влияет только на поиск следующего сигнала
     </label>
     <div style="display:flex;gap:6px;margin-bottom:6px">
-      <button class="btn btn-sm" style="flex:1" onclick="saveGateCfg()">💾 Сохранить ключи</button>
-      <button class="btn btn-sm" id="atStartBtn" style="flex:1;background:#1a5c2a;color:#0f9" onclick="startAutoTrade()">▶ Запустить</button>
-      <button class="btn btn-sm" id="atStopBtn" style="flex:1;background:#3a0a0a;color:#f45;display:none" onclick="stopAutoTrade()">⏹ Стоп</button>
+      <button class="btn btn-sm" style="flex:1;background:#0a1e30;border-color:#1a3a5c;color:#8aaac8" onclick="saveGateCfg()">💾 Сохранить ключи</button>
+      <button class="btn btn-sm" id="atStartBtn" style="flex:1;background:#0a2a15;border-color:#1a5c2a;color:#0f9" onclick="startAutoTrade()">▶ Запустить</button>
+      <button class="btn btn-sm" id="atStopBtn" style="flex:1;background:#2a0a0a;border-color:#5c1a1a;color:#f45;display:none" onclick="stopAutoTrade()">⏹ Стоп</button>
     </div>
-    <button class="btn btn-sm" style="width:100%;background:#3a1a0a;color:var(--yellow);margin-bottom:4px" onclick="closePosition()">📤 Закрыть позицию вручную</button>
-    <div id="atInfo" style="font-size:11px;color:var(--text4);line-height:1.6">—</div>
+    <button class="btn btn-sm" style="width:100%;background:#2a1a0a;border-color:#5c3a1a;color:#f0b800;margin-bottom:4px" onclick="closePosition()">📤 Закрыть позицию вручную</button>
+    <div id="atInfo" style="font-size:11px;color:#7a9ab8;line-height:1.6">—</div>
   </div>
   <div id="chartStatus">Нажмите Загрузить</div>
   <div class="chart-legend">
@@ -4962,7 +4967,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "tf":     body.get("tf","15m"),
                     "days":   body.get("days",30),
                     "sl_pct": body.get("sl_pct",0.6),
-                    "tp_pct": body.get("tp_pct",1.2),
+                    "tp_pct": body.get("tp_pct",1.0),
                     "risk_pct": body.get("risk_pct",10.0),
                     "offset_days": int(body.get("offset_days", 0)),
                 })
@@ -4986,7 +4991,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         "tf":body.get("tf","15m"),
                         "days":int(body.get("days",30)),
                         "sl_pct":float(body.get("sl_pct",0.6)),
-                        "tp_pct":float(body.get("tp_pct",1.2)),
+                        "tp_pct":float(body.get("tp_pct",1.0)),
                         "risk_pct":float(body.get("risk_pct",10.0)),
                         "current_sym":"",
                     })
