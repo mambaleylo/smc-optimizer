@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.3
+- v3.52.3: фикс симуляции — несовпадение ключей между _simulate(_collect=True)
+  и JS-рендерером. _simulate возвращает hi/lo/entry_i, JS ожидал top/bot/i.
+  Теперь simDrawCanvas читает оба варианта (hi||top, lo||bot, i||entry_i).
+  OB/FVG теперь рисуются до end_i (точка митигации), а не до правого края.
+  Фикс размера canvas на мобиле (clientWidth мог возвращать 0).
 SMC Optimizer v3.52.2
 - v3.52.2: параметр «Смещение (дней назад)» в оптимизаторе. _fetch_candles
   теперь принимает offset_days — окно свечей сдвигается в прошлое на N дней
@@ -596,7 +602,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.2"
+APP_VERSION  = "3.52.3"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -3446,7 +3452,8 @@ function simDrawCanvas(data, winStart){
   var slice = _simAllCandles.slice(winStart, _simCursor);
   if(!slice.length){ canvas.getContext('2d').clearRect(0,0,canvas.width,canvas.height); return; }
 
-  var W = canvas.parentElement.clientWidth || 800;
+  var W = canvas.parentElement.clientWidth || canvas.parentElement.offsetWidth || window.innerWidth || 800;
+  W = Math.max(W, 200);
   var H = Math.max(320, Math.floor(W * 0.42));
   canvas.width = W; canvas.height = H;
   var ctx = canvas.getContext('2d');
@@ -3484,32 +3491,36 @@ function simDrawCanvas(data, winStart){
   // OB boxes — индексы сигналов уже относительны переданного slice (бэкенд не знает winStart)
   if(data){
     (data.bull_obs||[]).forEach(function(o){
-      if(o.bot==null||o.top==null) return;
-      var x0=cx(o.start||0)-cw/2, x1=cx(n-1)+cw/2;
+      var top=o.hi||o.top, bot=o.lo||o.bot;
+      if(bot==null||top==null) return;
+      var x0=cx((o.i||o.start)||0)-cw/2, x1=cx(Math.min(n-1,(o.end_i!=null?o.end_i:n-1)))+cw/2;
       ctx.fillStyle='rgba(49,121,245,0.18)';
-      ctx.fillRect(x0, px(o.top), x1-x0, px(o.bot)-px(o.top));
+      ctx.fillRect(x0, px(top), x1-x0, px(bot)-px(top));
       ctx.strokeStyle='rgba(49,121,245,0.7)'; ctx.lineWidth=1;
-      ctx.strokeRect(x0, px(o.top), x1-x0, px(o.bot)-px(o.top));
+      ctx.strokeRect(x0, px(top), x1-x0, px(bot)-px(top));
     });
     (data.bear_obs||[]).forEach(function(o){
-      if(o.bot==null||o.top==null) return;
-      var x0=cx(o.start||0)-cw/2, x1=cx(n-1)+cw/2;
+      var top=o.hi||o.top, bot=o.lo||o.bot;
+      if(bot==null||top==null) return;
+      var x0=cx((o.i||o.start)||0)-cw/2, x1=cx(Math.min(n-1,(o.end_i!=null?o.end_i:n-1)))+cw/2;
       ctx.fillStyle='rgba(247,124,128,0.18)';
-      ctx.fillRect(x0, px(o.top), x1-x0, px(o.bot)-px(o.top));
+      ctx.fillRect(x0, px(top), x1-x0, px(bot)-px(top));
       ctx.strokeStyle='rgba(247,124,128,0.7)'; ctx.lineWidth=1;
-      ctx.strokeRect(x0, px(o.top), x1-x0, px(o.bot)-px(o.top));
+      ctx.strokeRect(x0, px(top), x1-x0, px(bot)-px(top));
     });
     (data.fvg_bull||[]).forEach(function(o){
-      if(o.bot==null||o.top==null) return;
-      var x0=cx(o.start||0)-cw/2, x1=cx(n-1)+cw/2;
+      var top=o.hi||o.top, bot=o.lo||o.bot;
+      if(bot==null||top==null) return;
+      var x0=cx((o.i||o.start)||0)-cw/2, x1=cx(Math.min(n-1,(o.end_i!=null?o.end_i:n-1)))+cw/2;
       ctx.fillStyle='rgba(0,255,104,0.12)';
-      ctx.fillRect(x0,px(o.top),x1-x0,px(o.bot)-px(o.top));
+      ctx.fillRect(x0,px(top),x1-x0,px(bot)-px(top));
     });
     (data.fvg_bear||[]).forEach(function(o){
-      if(o.bot==null||o.top==null) return;
-      var x0=cx(o.start||0)-cw/2, x1=cx(n-1)+cw/2;
+      var top=o.hi||o.top, bot=o.lo||o.bot;
+      if(bot==null||top==null) return;
+      var x0=cx((o.i||o.start)||0)-cw/2, x1=cx(Math.min(n-1,(o.end_i!=null?o.end_i:n-1)))+cw/2;
       ctx.fillStyle='rgba(255,0,8,0.1)';
-      ctx.fillRect(x0,px(o.top),x1-x0,px(o.bot)-px(o.top));
+      ctx.fillRect(x0,px(top),x1-x0,px(bot)-px(top));
     });
   }
 
@@ -3530,9 +3541,10 @@ function simDrawCanvas(data, winStart){
   // Сигналы (индексы относительны slice)
   if(data){
     (data.signals||[]).forEach(function(s){
-      if(s.i==null) return;
-      var i=s.i; if(i<0||i>=n) return;
-      var x=cx(i), isLong=s.dir==='long';
+      var si = (s.i != null) ? s.i : s.entry_i;
+      if(si==null) return;
+      if(si<0||si>=n) return;
+      var x=cx(si), isLong=s.dir==='long';
       ctx.fillStyle = isLong ? '#089981' : '#F23645';
       ctx.beginPath();
       if(isLong){
@@ -3542,9 +3554,9 @@ function simDrawCanvas(data, winStart){
       }
       ctx.closePath(); ctx.fill();
       if(s.tp){ ctx.strokeStyle='rgba(8,153,129,0.6)'; ctx.setLineDash([3,3]); ctx.lineWidth=1;
-        ctx.beginPath(); ctx.moveTo(cx(i),px(s.tp)); ctx.lineTo(cx(n-1)+cw/2,px(s.tp)); ctx.stroke(); ctx.setLineDash([]); }
+        ctx.beginPath(); ctx.moveTo(cx(si),px(s.tp)); ctx.lineTo(cx(n-1)+cw/2,px(s.tp)); ctx.stroke(); ctx.setLineDash([]); }
       if(s.sl){ ctx.strokeStyle='rgba(242,54,69,0.6)'; ctx.setLineDash([3,3]); ctx.lineWidth=1;
-        ctx.beginPath(); ctx.moveTo(cx(i),px(s.sl)); ctx.lineTo(cx(n-1)+cw/2,px(s.sl)); ctx.stroke(); ctx.setLineDash([]); }
+        ctx.beginPath(); ctx.moveTo(cx(si),px(s.sl)); ctx.lineTo(cx(n-1)+cw/2,px(s.sl)); ctx.stroke(); ctx.setLineDash([]); }
     });
   }
 
