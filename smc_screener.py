@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.4
+- v3.52.4: фикс периодического сброса эквалайзера к 1.0. Причина: pkill/краш
+  сервера в момент записи FITNESS_W_PATH портил JSON-файл → при следующем
+  старте _load_fitness_weights падал в except → оставались дефолтные 1.0.
+  Теперь _save_fitness_weights пишет атомарно через .tmp + os.replace().
+  _load_fitness_weights при повреждённом основном файле пробует .tmp как
+  резервную копию перед тем как сдаться.
 SMC Optimizer v3.52.3
 - v3.52.3: фикс симуляции — несовпадение ключей между _simulate(_collect=True)
   и JS-рендерером. _simulate возвращает hi/lo/entry_i, JS ожидал top/bot/i.
@@ -602,7 +609,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.3"
+APP_VERSION  = "3.52.4"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -2188,27 +2195,34 @@ def _save_last_symbol(sym):
 
 def _load_fitness_weights():
     """Подхватывает сохранённые веса эквалайзера fitness из файла."""
-    try:
-        with open(FITNESS_W_PATH, "r") as f:
-            cfg = json.load(f)
-        with fitness_w_lock:
-            for k in FITNESS_WEIGHTS:
-                if k in cfg:
-                    try:
-                        FITNESS_WEIGHTS[k] = float(cfg[k])
-                    except (TypeError, ValueError):
-                        pass
-    except FileNotFoundError:
-        pass
-    except Exception as e:
-        olog(f"⚠ Не удалось прочитать {FITNESS_W_PATH}: {e}")
+    for path in [FITNESS_W_PATH, FITNESS_W_PATH + ".tmp"]:
+        try:
+            with open(path, "r") as f:
+                cfg = json.load(f)
+            if not isinstance(cfg, dict) or not cfg:
+                continue  # повреждённый/пустой файл — пробуем .tmp
+            with fitness_w_lock:
+                for k in FITNESS_WEIGHTS:
+                    if k in cfg:
+                        try:
+                            FITNESS_WEIGHTS[k] = float(cfg[k])
+                        except (TypeError, ValueError):
+                            pass
+            return  # успешно загрузили
+        except FileNotFoundError:
+            continue
+        except Exception as e:
+            olog(f"⚠ Не удалось прочитать {path}: {e}")
+            continue
 
 def _save_fitness_weights():
     try:
         with fitness_w_lock:
             snap = dict(FITNESS_WEIGHTS)
-        with open(FITNESS_W_PATH, "w") as f:
+        tmp = FITNESS_W_PATH + ".tmp"
+        with open(tmp, "w") as f:
             json.dump(snap, f)
+        os.replace(tmp, FITNESS_W_PATH)  # атомарная замена — не портит файл при краше
     except Exception as e:
         olog(f"⚠ Не удалось сохранить {FITNESS_W_PATH}: {e}")
 
