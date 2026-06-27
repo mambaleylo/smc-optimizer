@@ -1,5 +1,29 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.16
+- v3.52.16: фикс ложного «чужая позиция LONG против сигнала SHORT» когда
+  позиция на самом деле своя. Причина: auto_trade_state["position"] в памяти
+  безусловно обнуляется при каждом (ре)старте треда авто-трейда (рестарт
+  процесса, краш, повторный клик «Запустить»), а позиция на бирже могла
+  остаться от прошлого запуска. Рассинхрон обнаруживался только на
+  следующей смене сигнала — если за время простоя сигнал успевал
+  поменяться на противоположное направление, бот считал свою же позицию
+  чужой и просто предупреждал, ничего не делая (до тех пор, пока сигнал
+  случайно не вернётся к прежнему направлению).
+  Фикс: (1) сразу при armed (постановке на охрану) тред сверяется с
+  биржей через новую _gate_inspect_open_orders() — ищет ОТКРЫТЫЕ TP/SL
+  ордера с тегами t-smc-tp/t-smc-sl (их ставит только этот бот) —
+  находка такого тега это надёжное доказательство "позиция моя", не
+  зависящее от совпадения направления с текущим сигналом, восстанавливает
+  владение немедленно вместо ожидания случайного совпадения направления;
+  (2) /auto_trade_start больше не обнуляет position вслепую если рестарт
+  происходит на том же символе — сохраняет уже отслеженную позицию;
+  (3) фронтенд: pollGlobalStatus (работает с загрузки страницы независимо
+  от открытой панели авто-трейда) теперь восстанавливает кнопки
+  Start/Stop и бейдж из реального d.enabled — раньше после перезагрузки
+  страницы кнопка показывала «Запустить» даже когда бэкенд уже торговал,
+  и повторный клик дёргал /auto_trade_start вхолостую, что было одним из
+  путей попасть в описанный рассинхрон.
 SMC Optimizer v3.52.15
 - v3.52.15: убраны кнопка «🔔 Алерты» и пилюля «Монитор» из UI — монитор
   графика дублирует авто-трейд который уже шлёт алерты сам. Код монитора
@@ -854,6 +878,40 @@ def _gate_get_position(symbol):
         olog(f"⚠ gate_get_position: {e}")
         return None
 
+def _gate_inspect_open_orders(symbol):
+    """Смотрит открытые price_orders (TP/SL) по символу на бирже.
+    Возвращает (any_orders, ours, sl_price, tp_price):
+      any_orders — есть ли вообще открытые триггерные ордера по контракту
+      ours       — True только если среди них есть НАШИ теги t-smc-tp/t-smc-sl
+                   (выставляются только этим ботом в _gate_open_position и
+                   в ветке восстановления) — надёжный признак "это моя
+                   забытая после рестарта позиция", а не настоящая чужая
+                   ручная сделка, у которой таких тегов быть не может.
+      sl_price/tp_price — триггерные цены из найденных своих ордеров (для
+                   точного восстановления, без угадывания по текущему сигналу)
+    """
+    contract = symbol.replace("/", "_").upper()
+    sl_price = tp_price = None
+    ours = False
+    orders = []
+    try:
+        r = _gate_req("GET", "/futures/usdt/price_orders",
+                       params={"contract": contract, "status": "open"})
+        orders = r if isinstance(r, list) else []
+    except Exception as e:
+        olog(f"⚠ Проверка открытых TP/SL ордеров: {e}")
+    for o in orders:
+        text = (o.get("initial") or {}).get("text", "")
+        if text in ("t-smc-tp", "t-smc-sl"):
+            ours = True
+            try:
+                px = float((o.get("trigger") or {}).get("price"))
+            except (TypeError, ValueError):
+                px = None
+            if text == "t-smc-tp": tp_price = px
+            else:                  sl_price = px
+    return len(orders) > 0, ours, sl_price, tp_price
+
 def _gate_get_price(symbol):
     """Текущая цена фьючерса (mark price)."""
     try:
@@ -1239,6 +1297,59 @@ def _auto_trade_loop():
                             last_entry_ts = entry_ts
                             olog(f"🤖 Авто-трейд вооружён, текущий сигнал: "
                                  f"{sig['dir'].upper()} entry={_fmt_px(sig['entry'])}")
+
+                            # ── Reconciliation при (ре)старте треда ────────
+                            # our_pos в памяти всегда стартует как None при
+                            # каждом запуске этого треда (рестарт процесса,
+                            # краш, повторный клик «Запустить»), а позиция на
+                            # бирже могла остаться от прошлого запуска. Раньше
+                            # это обнаруживалось только на СЛЕДУЮЩЕЙ смене
+                            # сигнала — и если за время простоя направление
+                            # сигнала успело смениться на противоположное,
+                            # код считал свою же позицию «чужой» и просто
+                            # предупреждал, ничего не делая (до 15+ минут,
+                            # пока сигнал случайно не вернётся в прежнее
+                            # направление). Сверяем с биржей сразу здесь —
+                            # причём по тегам ордеров (t-smc-tp/t-smc-sl,
+                            # которые ставит только этот бот), а не по
+                            # совпадению направления с сигналом — иначе как
+                            # раз пропустили бы именно случай рассинхрона.
+                            try:
+                                with auto_trade_lock:
+                                    _our_now = auto_trade_state.get("position")
+                                if _our_now is None:
+                                    _exist0 = _gate_get_position(sym)
+                                    if _exist0:
+                                        _any_o, _ours_o, _sl_o, _tp_o = _gate_inspect_open_orders(sym)
+                                        if _ours_o:
+                                            _adopted0 = {
+                                                "dir":    _exist0["dir"],
+                                                "entry":  _exist0.get("entry", 0),
+                                                "sl":     _sl_o if _sl_o is not None else sig["sl"],
+                                                "tp":     _tp_o if _tp_o is not None else sig["tp"],
+                                                "size":   _exist0.get("size", 0),
+                                                "leverage": 0, "notional": 0,
+                                            }
+                                            with auto_trade_lock:
+                                                auto_trade_state["position"] = _adopted0
+                                            olog(f"🔗 Reconcile при старте: на бирже найдена позиция "
+                                                 f"{_exist0['dir'].upper()} с нашими тегами TP/SL — "
+                                                 f"это не чужая, восстановлено владение "
+                                                 f"(сигнал сейчас: {sig['dir'].upper()})")
+                                            _send_alert(
+                                                f"{'🟢' if _exist0['dir']=='long' else '🔴'} <b>{sym}</b> — "
+                                                f"восстановлено владение позицией {_exist0['dir'].upper()} "
+                                                f"после рестарта (TP/SL на бирже подтверждены тегами бота)"
+                                            )
+                                        elif _exist0["dir"] != sig["dir"]:
+                                            olog(f"⚠ Reconcile при старте: на бирже позиция "
+                                                 f"{_exist0['dir'].upper()} без узнаваемых тегов TP/SL "
+                                                 f"бота, направление не совпадает с вооружённым сигналом "
+                                                 f"{sig['dir'].upper()} — не трогаем, обычная проверка "
+                                                 f"сработает на следующей смене сигнала")
+                            except Exception as _re0:
+                                olog(f"⚠ Reconcile при старте авто-трейда: {_re0}")
+
                         elif entry_ts != last_entry_ts:
                             # Новый сигнал!
                             last_entry_ts = entry_ts
@@ -3842,6 +3953,19 @@ function scheduleAtPoll(){
 function pollAtStatus(){
   fetch('/auto_trade_status').then(function(r){return r.json();}).then(function(d){
     if(!d.enabled){ _atActive=false; return; }
+    if(!_atActive){
+      // UI могло потерять синхронизацию с реальным статусом сервера
+      // (перезагрузка страницы, открытие в новой вкладке) — бэкенд
+      // продолжал торговать, а кнопка показывала «Запустить». Повторный
+      // клик на неё дёргал /auto_trade_start и обнулял отслеженную
+      // позицию. Восстанавливаем кнопки/бейдж из реального d.enabled.
+      _atActive = true;
+      document.getElementById('atStartBtn').style.display='none';
+      document.getElementById('atStopBtn').style.display='';
+      document.getElementById('atBtn').style.background='#1a5c2a';
+    }
+    document.getElementById('atStatusBadge').textContent='🟢 активен · '+(d.symbol||'')+' '+(d.tf||'');
+    document.getElementById('atStatusBadge').style.color='var(--green)';
     document.getElementById('atAutoSync').checked = !!d.auto_sync;
     var pos = d.position;
     var info = '';
@@ -4070,6 +4194,22 @@ function pollGlobalStatus(){
         _gsSet('gsTrade','gsTradeDot','gsTradeTxt','warn','Авто-трейд: '+(d.symbol||'')+' '+(d.tf||'')+' · позиция открыта');
       } else {
         _gsSet('gsTrade','gsTradeDot','gsTradeTxt','on','Авто-трейд: '+(d.symbol||'')+' '+(d.tf||''));
+      }
+      if(!_atActive){
+        // Этот поллер работает всегда, с самой загрузки страницы, независимо
+        // от того открыта ли панель авто-трейда. Раньше кнопки Start/Stop и
+        // бейдж синхронизировались только внутри startAutoTrade() — после
+        // перезагрузки страницы (или открытия в новой вкладке) UI показывал
+        // «▶ Запустить» даже когда бэкенд уже торгует, и повторный клик
+        // сбрасывал отслеженную позицию в auto_trade_state. Восстанавливаем
+        // реальный статус сразу здесь и запускаем обычный поллинг инфо-панели.
+        _atActive = true;
+        document.getElementById('atStartBtn').style.display='none';
+        document.getElementById('atStopBtn').style.display='';
+        document.getElementById('atStatusBadge').textContent='🟢 активен · '+(d.symbol||'')+' '+(d.tf||'');
+        document.getElementById('atStatusBadge').style.color='var(--green)';
+        document.getElementById('atBtn').style.background='#1a5c2a';
+        scheduleAtPoll();
       }
     } else {
       _gsSet('gsTrade','gsTradeDot','gsTradeTxt','off','Авто-трейд: выкл');
@@ -5277,9 +5417,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 _auto_trade_thread.join(timeout=3)
             _auto_trade_stop.clear()
             with auto_trade_lock:
+                # Если это повторный старт на ТОМ ЖЕ символе (например,
+                # случайный повторный клик «Запустить» по уже работающему
+                # боту из-за того, что страница была перезагружена и кнопка
+                # не отражала реальный статус) — не теряем уже отслеженную
+                # позицию вслепую. На новом символе/при первом старте position
+                # действительно должен быть None — поток сам сверится с
+                # биржей через reconciliation на arm.
+                _keep_pos = (auto_trade_state.get("symbol") == sym and
+                             auto_trade_state.get("position") is not None)
+                _prev_position = auto_trade_state.get("position") if _keep_pos else None
                 auto_trade_state.update({
                     "enabled": True, "symbol": sym, "tf": tf, "days": days,
-                    "params": p, "risk_pct": risk_pct, "position_pct": position_pct, "position": None,
+                    "params": p, "risk_pct": risk_pct, "position_pct": position_pct,
+                    "position": _prev_position,
                     "last_entry_ts": None, "last_check": 0, "last_error": "",
                     "auto_sync": auto_sync,
                 })
