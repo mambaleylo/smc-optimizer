@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.15
+- v3.52.15: убраны кнопка «🔔 Алерты» и пилюля «Монитор» из UI — монитор
+  графика дублирует авто-трейд который уже шлёт алерты сам. Код монитора
+  остался в бэкенде (не сломан), просто недоступен из UI.
 SMC Optimizer v3.52.14
 - v3.52.14: убран чекбокс «Автоматически подхватывать конфиг» из панели
   авто-трейда — auto_sync теперь всегда True (авто-синк включён постоянно).
@@ -658,7 +662,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.14"
+APP_VERSION  = "3.52.15"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -3197,7 +3201,6 @@ input:focus,select:focus{outline:none;border-color:var(--accent)}
 </div>
 <div class="global-status" id="globalStatus" title="Текущий статус трёх независимых процессов: перебор параметров, монитор графика (алерты) и авто-торговля. Кнопка «Стоп» у перебора останавливает только его — монитор и авто-торговля управляются отдельно.">
   <span class="gs-pill" id="gsOpt"><span class="gs-dot" id="gsOptDot"></span><span id="gsOptTxt">Перебор: ...</span></span>
-  <span class="gs-pill" id="gsMon"><span class="gs-dot" id="gsMonDot"></span><span id="gsMonTxt">Монитор: ...</span></span>
   <span class="gs-pill" id="gsTrade"><span class="gs-dot" id="gsTradeDot"></span><span id="gsTradeTxt">Авто-трейд: ...</span></span>
 </div>
 <div class="tabs">
@@ -3314,7 +3317,6 @@ input:focus,select:focus{outline:none;border-color:var(--accent)}
     <label>SL%<input id="cSl" type="number" value="0.6" step="0.1" style="width:60px"></label>
     <label>TP%<input id="cTp" type="number" value="1.0" step="0.1" style="width:60px"></label>
     <button class="btn btn-go" onclick="loadChart()" style="align-self:flex-end">Загрузить</button>
-    <button class="btn" id="monBtn" onclick="toggleChartMonitor()" style="align-self:flex-end">🔔 Алерты</button>
     <button class="btn" id="atBtn" onclick="toggleAutoTrade()" style="align-self:flex-end;background:var(--accent2);color:#fff">🤖 Авто</button>
   </div>
   <!-- Панель авто-торговли (скрыта по умолчанию) -->
