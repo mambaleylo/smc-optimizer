@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.13
+- v3.52.13: фикс несовпадения параметров графика и оптимизатора. При загрузке
+  страницы cSym/cTf/cDays синхронизируются с opt_state (symbol/tf/days).
+  Дефолты полей графика: BTC_USDT/15m/30дней/SL=0.6/TP=1.0. switchTab('chart')
+  без _bestParams теперь тоже синхронизирует sym/tf/days из оптимизатора перед
+  loadChart — не грузит 7-дневный DOGE с дефолтными параметрами.
 SMC Optimizer v3.52.12
 - v3.52.12: авто-обновление графика при улучшении fitness теперь работает
   только если вкладка График уже активна (не прерывает работу на других
@@ -649,7 +655,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.12"
+APP_VERSION  = "3.52.13"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -3295,15 +3301,15 @@ input:focus,select:focus{outline:none;border-color:var(--accent)}
 </div>
 <div id="chartPanel" class="tab-panel">
   <div class="chart-bar">
-    <label>Символ<input id="cSym" value="DOGE_USDT"></label>
+    <label>Символ<input id="cSym" value="BTC_USDT"></label>
     <label>ТФ<select id="cTf">
       <option value="1m">1m</option><option value="5m">5m</option><option value="15m" selected>15m</option>
       <option value="30m">30m</option><option value="1h">1h</option><option value="4h">4h</option><option value="1d">1d</option>
     </select></label>
-    <label>Дней<input id="cDays" type="number" value="7" min="1" max="60" style="width:60px"></label>
+    <label>Дней<input id="cDays" type="number" value="30" min="1" max="60" style="width:60px"></label>
     <label>Swing<input id="cSwing" type="number" value="10" min="3" max="50" style="width:60px"></label>
-    <label>SL%<input id="cSl" type="number" value="0.3" step="0.1" style="width:60px"></label>
-    <label>TP%<input id="cTp" type="number" value="0.6" step="0.1" style="width:60px"></label>
+    <label>SL%<input id="cSl" type="number" value="0.6" step="0.1" style="width:60px"></label>
+    <label>TP%<input id="cTp" type="number" value="1.0" step="0.1" style="width:60px"></label>
     <button class="btn btn-go" onclick="loadChart()" style="align-self:flex-end">Загрузить</button>
     <button class="btn" id="monBtn" onclick="toggleChartMonitor()" style="align-self:flex-end">🔔 Алерты</button>
     <button class="btn" id="atBtn" onclick="toggleAutoTrade()" style="align-self:flex-end;background:var(--accent2);color:#fff">🤖 Авто</button>
@@ -3407,9 +3413,24 @@ function switchTab(id, btn){
   document.querySelectorAll('.tab').forEach(function(b){b.classList.remove('active');});
   document.getElementById(id+'Panel').classList.add('active');
   btn.classList.add('active');
-  // При переходе на вкладку График — автоматически применяем лучший конфиг если есть
-  if(id === 'chart' && _bestParams){
-    applyBestToChart();
+  if(id === 'chart'){
+    if(_bestParams){
+      applyBestToChart();
+    } else {
+      // Параметров ещё нет — синхронизируем поля графика с полями оптимизатора и грузим
+      var symEl = document.getElementById('sym');
+      var tfEl  = document.getElementById('tf');
+      var daysEl= document.getElementById('days');
+      if(symEl)  document.getElementById('cSym').value  = symEl.value;
+      if(daysEl) document.getElementById('cDays').value = daysEl.value;
+      if(tfEl){
+        var tfSel = document.getElementById('cTf');
+        for(var i=0;i<tfSel.options.length;i++){
+          if(tfSel.options[i].value===tfEl.value){tfSel.selectedIndex=i;break;}
+        }
+      }
+      setTimeout(function(){ loadChart(); }, 80);
+    }
   }
 }
 
@@ -4201,6 +4222,16 @@ fetch('/opt_status').then(function(r){return r.json();}).then(function(d){
     var symEl = document.getElementById('sym'), cSymEl = document.getElementById('cSym');
     if(symEl)  symEl.value  = d.symbol;
     if(cSymEl) cSymEl.value = d.symbol;
+  }
+  if(d.tf){
+    var tfSel = document.getElementById('cTf');
+    if(tfSel){ for(var i=0;i<tfSel.options.length;i++){
+      if(tfSel.options[i].value===d.tf){tfSel.selectedIndex=i;break;}
+    }}
+  }
+  if(d.days){
+    var cDaysEl = document.getElementById('cDays');
+    if(cDaysEl) cDaysEl.value = d.days;
   }
   if(d.running){
     document.getElementById('btnStart').style.display='none';
