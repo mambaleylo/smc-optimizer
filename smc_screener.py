@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.7
+- v3.52.7: вес «$100→$» (ret) добавлен в эквалайзер fitness. Компонент
+  log(equity/init_deposit) добавлен в log_fit — при весе >1.0 оптимизатор
+  сильнее предпочитает конфиги с высоким итоговым балансом. Слайдер добавлен
+  в UI. Автотюнинг учитывает ret в GRIDS и WR_KEYS. Начальное значение 1.0.
 SMC Optimizer v3.52.6
 - v3.52.6: откат стилей окна авто-торговли — возврат к var(--...) CSS
   переменным чтобы окно корректно менялось вместе с системной темой.
@@ -617,7 +622,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.6"
+APP_VERSION  = "3.52.7"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -672,7 +677,7 @@ _log_lock  = threading.Lock()  # отдельный лок для olog — не 
 # Эквалайзер весов fitness — тюнится "на ходу" со страницы (см. /fitness_weights).
 # При всех весах=1.0 формула математически совпадает с исходной (см. _simulate).
 fitness_w_lock  = threading.Lock()
-FITNESS_WEIGHTS = {"wr": 1.0, "pf": 1.0, "trades": 1.0, "rr": 1.0, "dd": 1.0}
+FITNESS_WEIGHTS = {"wr": 1.0, "pf": 1.0, "trades": 1.0, "rr": 1.0, "dd": 1.0, "ret": 1.0}
 
 # ─── Автотюнинг весов (coordinate descent + walk-forward) ──────────────────
 weight_tune_lock  = threading.Lock()
@@ -1993,7 +1998,8 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
         fw.get("wr",     1.0) * math.log(max(wr, _eps)) +
         fw.get("pf",     1.0) * math.log(max(min(pf, 5.0), _eps)) +
         fw.get("trades", 1.0) * math.log(max(trade_factor, _eps)) +
-        fw.get("rr",     1.0) * math.log(max(rr_bonus, _eps)) -
+        fw.get("rr",     1.0) * math.log(max(rr_bonus, _eps)) +
+        fw.get("ret",    1.0) * math.log(max(equity / init_deposit, _eps)) -
         fw.get("dd",     1.0) * math.log(max(1 + max_dd, _eps))
     )
     fitness = math.exp(log_fit)
@@ -2366,7 +2372,7 @@ def _run_weight_tune():
         # Стартуем всегда с дефолтных весов (все 1.0), а не с текущего
         # состояния эквалайзера — иначе результат зависит от того, что было
         # выкручено вручную до запуска, и повторные запуски дают разные веса.
-        current_fw = {"wr": 1.0, "pf": 1.0, "trades": 1.0, "rr": 1.0, "dd": 1.0}
+        current_fw = {"wr": 1.0, "pf": 1.0, "trades": 1.0, "rr": 1.0, "dd": 1.0, "ret": 1.0}
 
         # Для просадки минимум сетки = 1.0 — запрещаем тюнеру снижать штраф
         # за DD ниже базового уровня. Иначе тюнер выбирает dd=0.5 (минимум)
@@ -2377,10 +2383,11 @@ def _run_weight_tune():
             "trades": [0.5, 1.0, 1.5, 2.0, 3.0],
             "rr":     [0.5, 1.0, 1.5, 2.0, 3.0],
             "dd":     [1.0, 1.5, 2.0, 3.0],   # минимум 1.0 — штраф за DD обязателен
+            "ret":    [0.5, 1.0, 1.5, 2.0, 3.0],
         }
-        WR_KEYS = ["wr", "pf", "trades", "rr", "dd"]
+        WR_KEYS = ["wr", "pf", "trades", "rr", "dd", "ret"]
         WR_NAMES = {"wr": "WinRate", "pf": "ProfitFactor", "trades": "Кол-во сделок",
-                    "rr": "RR", "dd": "Просадка"}
+                    "rr": "RR", "dd": "Просадка", "ret": "$100→$"}
 
         for pass_i in range(1, passes + 1):
             if _weight_tune_stop.is_set(): break
@@ -3182,6 +3189,9 @@ input:focus,select:focus{outline:none;border-color:var(--accent)}
       <div class="eq-ch"><div class="eq-val" id="eqVal_dd">1.00</div>
         <div class="eq-slot" onmousedown="eqAdjust(event,'dd')" ontouchstart="eqAdjust(event,'dd')"><input type="range" class="eq-slider" id="eq_dd" min="0" max="3" step="0.05" value="1"></div>
         <div class="eq-lbl">Просадка</div></div>
+      <div class="eq-ch"><div class="eq-val" id="eqVal_ret">1.00</div>
+        <div class="eq-slot" onmousedown="eqAdjust(event,'ret')" ontouchstart="eqAdjust(event,'ret')"><input type="range" class="eq-slider" id="eq_ret" min="0" max="3" step="0.05" value="1"></div>
+        <div class="eq-lbl">$100→$</div></div>
     </div>
     <button class="btn btn-sm" style="width:100%;margin-top:4px" onclick="resetEq()">↺ Сброс к 1.0</button>
     <div style="display:flex;gap:6px;margin-top:6px">
@@ -3849,7 +3859,7 @@ function saveAlertCfgSync(){
 loadAlertCfg();
 _refreshGateEquity(); // прогреваем кэш баланса заранее, чтобы AMOLED не ждал первый цикл
 
-var EQ_KEYS = ['wr','pf','trades','rr','dd'];
+var EQ_KEYS = ['wr','pf','trades','rr','dd','ret'];
 var _eqDebounce = null;
 function eqAdjust(e, k){
   e.preventDefault();
