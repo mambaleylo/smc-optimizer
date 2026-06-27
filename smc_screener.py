@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.14
+- v3.52.14: убран чекбокс «Автоматически подхватывать конфиг» из панели
+  авто-трейда — auto_sync теперь всегда True (авто-синк включён постоянно).
 SMC Optimizer v3.52.13
 - v3.52.13: фикс несовпадения параметров графика и оптимизатора. При загрузке
   страницы cSym/cTf/cDays синхронизируются с opt_state (symbol/tf/days).
@@ -655,7 +658,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.13"
+APP_VERSION  = "3.52.14"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -771,7 +774,7 @@ auto_trade_state = {
     "position": None,         # текущая открытая позиция: {dir, entry, sl, tp, size, order_ids}
     "last_entry_ts": None,    # таймстемп свечи последнего сигнала
     "last_check": 0, "last_error": "",
-    "auto_sync": False,       # подхватывать новый best от оптимизатора того же sym/tf на ходу
+    "auto_sync": True,        # подхватывать новый best от оптимизатора того же sym/tf на ходу
 }
 _auto_trade_stop   = threading.Event()
 _auto_trade_thread = None
@@ -3336,10 +3339,6 @@ input:focus,select:focus{outline:none;border-color:var(--accent)}
         <input id="atRisk" type="number" value="10" min="0.5" max="20" step="0.5" style="width:100%;background:var(--input-bg);border:1px solid var(--border);color:var(--text);padding:4px 6px;border-radius:4px;font-size:11px">
       </label>
     </div>
-    <label style="display:flex;align-items:center;gap:6px;color:var(--text2);font-size:11px;margin-bottom:6px;cursor:pointer">
-      <input id="atAutoSync" type="checkbox" onchange="toggleAutoSync()">
-      🔁 Автоматически подхватывать новый лучший конфиг от оптимизатора (того же символа/ТФ) — TP/SL уже открытой сделки не трогает, влияет только на поиск следующего сигнала
-    </label>
     <div style="display:flex;gap:6px;margin-bottom:6px">
       <button class="btn btn-sm" style="flex:1" onclick="saveGateCfg()">💾 Сохранить ключи</button>
       <button class="btn btn-sm" id="atStartBtn" style="flex:1;background:#1a5c2a;color:#0f9" onclick="startAutoTrade()">▶ Запустить</button>
@@ -3781,7 +3780,7 @@ function startAutoTrade(){
     body:JSON.stringify({sym:sym,tf:tf,days:days,risk_pct:risk,
       position_pct:parseFloat(document.getElementById('atPosPct').value)||95,
       params:params,
-      auto_sync:document.getElementById('atAutoSync').checked})})
+      auto_sync: true})})
     .then(function(r){return r.json();})
     .then(function(d){
       if(d.ok){
