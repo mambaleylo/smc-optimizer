@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.10
+- v3.52.10: фикс — сигнал авто-трейда теперь пишется в opt_state["chart"]
+  также при восстановлении позиции после рестарта (две ветки: "TP/SL уже
+  стояли на бирже" и "принятая чужая позиция с выставлением TP/SL").
+  Раньше AUTO-стрелка на графике появлялась только при новом открытии.
 SMC Optimizer v3.52.9
 - v3.52.9: фикс "Unexpected end of JSON input" на вкладке График. Причина:
   json.dumps падал с исключением после send_response(200) — клиент получал
@@ -635,7 +640,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.9"
+APP_VERSION  = "3.52.10"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -1290,6 +1295,10 @@ def _auto_trade_loop():
                                             with auto_trade_lock:
                                                 auto_trade_state["position"]      = adopted
                                                 auto_trade_state["last_entry_ts"] = entry_ts
+                                            with opt_lock:
+                                                opt_state["chart"] = {"sym": sym, "tf": tf, "days": days,
+                                                    "auto_trade_sig": {"dir": direction, "entry": entry_px,
+                                                        "sl": sl_px, "tp": tp_px, "ts": entry_ts}}
                                             emoji = "🟢" if is_long else "🔴"
                                             _send_alert(
                                                 f"{emoji} <b>{sym}</b> — принята позиция "
@@ -1345,6 +1354,10 @@ def _auto_trade_loop():
                                               with auto_trade_lock:
                                                   auto_trade_state["position"]      = adopted
                                                   auto_trade_state["last_entry_ts"] = entry_ts
+                                              with opt_lock:
+                                                  opt_state["chart"] = {"sym": sym, "tf": tf, "days": days,
+                                                      "auto_trade_sig": {"dir": direction, "entry": entry_px,
+                                                          "sl": sl_px, "tp": tp_px, "ts": entry_ts}}
                                               emoji = "🟢" if is_long else "🔴"
                                               _send_alert(
                                                   f"{emoji} <b>{sym}</b> — принята чужая позиция "
