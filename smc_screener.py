@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.6
+- v3.52.6: откат стилей окна авто-торговли — возврат к var(--...) CSS
+  переменным чтобы окно корректно менялось вместе с системной темой.
 SMC Optimizer v3.52.5
 - v3.52.5: дефолты SL=0.6%/TP=1.0% везде (opt_state, screener_state, HTML,
   fallback в /scan и /scan_all). Окно авто-торговли теперь всегда тёмное
@@ -614,7 +617,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.5"
+APP_VERSION  = "3.52.6"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -3248,38 +3251,38 @@ input:focus,select:focus{outline:none;border-color:var(--accent)}
     <button class="btn" id="atBtn" onclick="toggleAutoTrade()" style="align-self:flex-end;background:var(--accent2);color:#fff">🤖 Авто</button>
   </div>
   <!-- Панель авто-торговли (скрыта по умолчанию) -->
-  <div id="atPanel" style="display:none;background:#0d1a2a;border:1px solid #1a3a5c;border-radius:6px;padding:10px;margin-bottom:8px;font-size:12px;color:#c8d8e8">
+  <div id="atPanel" style="display:none;background:var(--card-bg);border:1px solid var(--border);border-radius:6px;padding:10px;margin-bottom:8px;font-size:12px;color:var(--text)">
     <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
       <b style="color:#3a9eff">🤖 Авто-торговля Gate.io</b>
-      <span id="atStatusBadge" style="color:#7a9ab8;font-size:11px">выкл</span>
+      <span id="atStatusBadge" style="color:var(--text4);font-size:11px">выкл</span>
     </div>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:6px">
-      <label style="color:#8aaac8;font-size:11px">API Key
-        <input id="atKey" type="password" placeholder="Gate.io API Key" style="width:100%;background:#0a1420;border:1px solid #1a3a5c;color:#c8d8e8;padding:4px 6px;border-radius:4px;font-size:11px">
+      <label style="color:var(--text2);font-size:11px">API Key
+        <input id="atKey" type="password" placeholder="Gate.io API Key" style="width:100%;background:var(--input-bg);border:1px solid var(--border);color:var(--text);padding:4px 6px;border-radius:4px;font-size:11px">
       </label>
-      <label style="color:#8aaac8;font-size:11px">API Secret
-        <input id="atSecret" type="password" placeholder="Gate.io Secret" style="width:100%;background:#0a1420;border:1px solid #1a3a5c;color:#c8d8e8;padding:4px 6px;border-radius:4px;font-size:11px">
+      <label style="color:var(--text2);font-size:11px">API Secret
+        <input id="atSecret" type="password" placeholder="Gate.io Secret" style="width:100%;background:var(--input-bg);border:1px solid var(--border);color:var(--text);padding:4px 6px;border-radius:4px;font-size:11px">
       </label>
     </div>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:6px">
-      <label style="color:#8aaac8;font-size:11px">Вход % депозита
-        <input id="atPosPct" type="number" value="95" min="1" max="100" step="1" style="width:100%;background:#0a1420;border:1px solid #1a3a5c;color:#c8d8e8;padding:4px 6px;border-radius:4px;font-size:11px">
+      <label style="color:var(--text2);font-size:11px">Вход % депозита
+        <input id="atPosPct" type="number" value="95" min="1" max="100" step="1" style="width:100%;background:var(--input-bg);border:1px solid var(--border);color:var(--text);padding:4px 6px;border-radius:4px;font-size:11px">
       </label>
-      <label style="color:#8aaac8;font-size:11px">Риск % (плечо=риск÷SL)
-        <input id="atRisk" type="number" value="10" min="0.5" max="20" step="0.5" style="width:100%;background:#0a1420;border:1px solid #1a3a5c;color:#c8d8e8;padding:4px 6px;border-radius:4px;font-size:11px">
+      <label style="color:var(--text2);font-size:11px">Риск % (плечо=риск÷SL)
+        <input id="atRisk" type="number" value="10" min="0.5" max="20" step="0.5" style="width:100%;background:var(--input-bg);border:1px solid var(--border);color:var(--text);padding:4px 6px;border-radius:4px;font-size:11px">
       </label>
     </div>
-    <label style="display:flex;align-items:center;gap:6px;color:#8aaac8;font-size:11px;margin-bottom:6px;cursor:pointer">
+    <label style="display:flex;align-items:center;gap:6px;color:var(--text2);font-size:11px;margin-bottom:6px;cursor:pointer">
       <input id="atAutoSync" type="checkbox" onchange="toggleAutoSync()">
       🔁 Автоматически подхватывать новый лучший конфиг от оптимизатора (того же символа/ТФ) — TP/SL уже открытой сделки не трогает, влияет только на поиск следующего сигнала
     </label>
     <div style="display:flex;gap:6px;margin-bottom:6px">
-      <button class="btn btn-sm" style="flex:1;background:#0a1e30;border-color:#1a3a5c;color:#8aaac8" onclick="saveGateCfg()">💾 Сохранить ключи</button>
-      <button class="btn btn-sm" id="atStartBtn" style="flex:1;background:#0a2a15;border-color:#1a5c2a;color:#0f9" onclick="startAutoTrade()">▶ Запустить</button>
-      <button class="btn btn-sm" id="atStopBtn" style="flex:1;background:#2a0a0a;border-color:#5c1a1a;color:#f45;display:none" onclick="stopAutoTrade()">⏹ Стоп</button>
+      <button class="btn btn-sm" style="flex:1" onclick="saveGateCfg()">💾 Сохранить ключи</button>
+      <button class="btn btn-sm" id="atStartBtn" style="flex:1;background:#1a5c2a;color:#0f9" onclick="startAutoTrade()">▶ Запустить</button>
+      <button class="btn btn-sm" id="atStopBtn" style="flex:1;background:#3a0a0a;color:#f45;display:none" onclick="stopAutoTrade()">⏹ Стоп</button>
     </div>
-    <button class="btn btn-sm" style="width:100%;background:#2a1a0a;border-color:#5c3a1a;color:#f0b800;margin-bottom:4px" onclick="closePosition()">📤 Закрыть позицию вручную</button>
-    <div id="atInfo" style="font-size:11px;color:#7a9ab8;line-height:1.6">—</div>
+    <button class="btn btn-sm" style="width:100%;background:#3a1a0a;color:var(--yellow);margin-bottom:4px" onclick="closePosition()">📤 Закрыть позицию вручную</button>
+    <div id="atInfo" style="font-size:11px;color:var(--text4);line-height:1.6">—</div>
   </div>
   <div id="chartStatus">Нажмите Загрузить</div>
   <div class="chart-legend">
