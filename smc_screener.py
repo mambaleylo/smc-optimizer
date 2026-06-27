@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 """
-SMC Optimizer v3.52.16
+SMC Optimizer v3.52.17
+- v3.52.17: фикс спама сигналов в Телегу (SHORT→LONG→SHORT каждые 15-30 мин).
+  Причина: для открытого (in_trade, open=True) сигнала _simulate ставит
+  entry_i = текущая свеча — она меняется каждые tf_sec. Авто-трейд и монитор
+  графика использовали candles[entry_i]["t"] как уникальный ключ сигнала →
+  каждая новая свеча давала новый entry_ts → бот считал это новым сигналом и
+  заново открывал позицию. Фикс: для open=True сигналов ключом служит
+  "{dir}_{round(entry,2)}" — стабильный пока цена в той же OB-зоне.
+  Исправлено в _auto_trade_loop и _chart_monitor_loop.
 - v3.52.16: фикс ложного «чужая позиция LONG против сигнала SHORT» когда
   позиция на самом деле своя. Причина: auto_trade_state["position"] в памяти
   безусловно обнуляется при каждом (ре)старте треда авто-трейда (рестарт
@@ -686,7 +694,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.16"
+APP_VERSION  = "3.52.17"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -1290,7 +1298,15 @@ def _auto_trade_loop():
                     sigs = result.get("signals") or []
                     if sigs:
                         sig = sigs[-1]
-                        entry_ts = candles[sig["entry_i"]]["t"]
+                        # Для открытого сигнала (open=True) entry_i — это текущая свеча,
+                        # которая меняется каждые tf_sec → новый entry_ts на каждой итерации
+                        # → бот считал каждую новую свечу новым сигналом и спамил трейдами.
+                        # Используем стабильный ключ: dir + round(entry, 2) — они не меняются
+                        # пока цена остаётся в той же OB-зоне.
+                        if sig.get("open"):
+                            entry_ts = f"{sig['dir']}_{round(sig['entry'], 2)}"
+                        else:
+                            entry_ts = candles[sig["entry_i"]]["t"]
 
                         if not armed:
                             armed         = True
@@ -2675,7 +2691,10 @@ def _chart_monitor_loop(sym, tf, days, p):
                     sigs = result.get("signals") or []
                     if sigs:
                         sig = sigs[-1]
-                        entry_ts = candles[sig["entry_i"]]["t"]
+                        if sig.get("open"):
+                            entry_ts = f"{sig['dir']}_{round(sig['entry'], 2)}"
+                        else:
+                            entry_ts = candles[sig["entry_i"]]["t"]
                         new_sig = None
                         with chart_mon_lock:
                             if not chart_mon_state["armed"]:
