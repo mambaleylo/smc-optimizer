@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """
-SMC Optimizer v3.52.17
+SMC Optimizer v3.52.18
+- v3.52.18: фикс закрытия позиции из-за авто-синка параметров. Оптимизатор
+  находил лучший конфиг без текущего сигнала → params менялись во время
+  открытой позиции → _simulate с новым конфигом не видел сигнала → sigs
+  пустой → armed сбрасывался → позиция закрывалась досрочно. Фикс: обновление
+  p из auto_trade_state["params"] заморожено пока position != None; отложенные
+  параметры применяются в трёх точках закрытия позиции (TP/SL, сигнал пропал,
+  быстрый поллинг).
 - v3.52.17: фикс спама сигналов в Телегу (SHORT→LONG→SHORT каждые 15-30 мин).
   Причина: для открытого (in_trade, open=True) сигнала _simulate ставит
   entry_i = текущая свеча — она меняется каждые tf_sec. Авто-трейд и монитор
@@ -694,7 +701,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.17"
+APP_VERSION  = "3.52.18"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -1283,10 +1290,20 @@ def _auto_trade_loop():
             with auto_trade_lock:
                 new_p        = auto_trade_state["params"]
                 risk_pct     = auto_trade_state["risk_pct"]
+                _has_pos     = auto_trade_state.get("position") is not None
             if new_p != p:
-                olog(f"🔁 Авто-трейд: параметры обновлены (синк с оптимизатором) — "
-                     f"swing={new_p.get('swing_len')} SL={new_p.get('sl_pct')}% TP={new_p.get('tp_pct')}%")
-                p = new_p
+                if _has_pos:
+                    # Позиция открыта — не меняем параметры прямо сейчас,
+                    # иначе _simulate с новым конфигом может не увидеть
+                    # текущий сигнал → sigs пустой → armed сбрасывается →
+                    # позиция закрывается досрочно. Применим после закрытия.
+                    olog(f"🔁 Авто-трейд: новые параметры получены, но позиция открыта — "
+                         f"применим после закрытия (swing={new_p.get('swing_len')} "
+                         f"SL={new_p.get('sl_pct')}% TP={new_p.get('tp_pct')}%)")
+                else:
+                    olog(f"🔁 Авто-трейд: параметры обновлены (синк с оптимизатором) — "
+                         f"swing={new_p.get('swing_len')} SL={new_p.get('sl_pct')}% TP={new_p.get('tp_pct')}%")
+                    p = new_p
             candles = _fetch_candles(sym, tf, days)
             if candles and len(candles) > 50:
                 result = _simulate(candles, p, sl_pct=p.get("sl_pct"),
@@ -1612,6 +1629,12 @@ def _auto_trade_loop():
                                 if _check_position_closed_and_alert(sym, our_pos_now):
                                     with auto_trade_lock:
                                         auto_trade_state["position"] = None
+                                        # Позиция закрылась — применяем отложенные параметры
+                                        _deferred_p = auto_trade_state["params"]
+                                    if _deferred_p != p:
+                                        olog(f"🔁 Авто-трейд: применяем отложенные параметры после закрытия позиции "
+                                             f"(swing={_deferred_p.get('swing_len')} SL={_deferred_p.get('sl_pct')}% TP={_deferred_p.get('tp_pct')}%)")
+                                        p = _deferred_p
                                     armed         = False
                                     last_entry_ts = None
                             with auto_trade_lock:
@@ -1650,6 +1673,11 @@ def _auto_trade_loop():
                                     olog(f"⚠ Проверка зависших ордеров: {_e}")
                             with auto_trade_lock:
                                 auto_trade_state["position"] = None
+                                _deferred_p = auto_trade_state["params"]
+                            if _deferred_p != p:
+                                olog(f"🔁 Авто-трейд: применяем отложенные параметры после сброса позиции "
+                                     f"(swing={_deferred_p.get('swing_len')} SL={_deferred_p.get('sl_pct')}% TP={_deferred_p.get('tp_pct')}%)")
+                                p = _deferred_p
                             armed = False
                             last_entry_ts = None
 
@@ -1687,6 +1715,11 @@ def _auto_trade_loop():
                     if _check_position_closed_and_alert(sym, tracked):
                         with auto_trade_lock:
                             auto_trade_state["position"] = None
+                            _deferred_p = auto_trade_state["params"]
+                        if _deferred_p != p:
+                            olog(f"🔁 Авто-трейд: применяем отложенные параметры после быстрого закрытия позиции "
+                                 f"(swing={_deferred_p.get('swing_len')} SL={_deferred_p.get('sl_pct')}% TP={_deferred_p.get('tp_pct')}%)")
+                            p = _deferred_p
                         armed         = False
                         last_entry_ts = None
                         break  # позиции больше нет — дальше можно сразу на новый цикл сигналов
