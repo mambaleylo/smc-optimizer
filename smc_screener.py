@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.8
+- v3.52.8: сигнал авто-трейда теперь отображается на вкладке График.
+  При открытии позиции _auto_trade_loop записывает сигнал в opt_state["chart"]
+  (dir/entry/sl/tp/ts). /chart_data возвращает его как auto_trade_sig если
+  символ совпадает. На графике рисуется жёлтой стрелкой с меткой AUTO и
+  жёлтыми пунктирными линиями AT TP / AT SL — поверх обычных бэктест-сигналов.
 SMC Optimizer v3.52.7
 - v3.52.7: вес «$100→$» (ret) добавлен в эквалайзер fitness. Компонент
   log(equity/init_deposit) добавлен в log_fit — при весе >1.0 оптимизатор
@@ -622,7 +628,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.7"
+APP_VERSION  = "3.52.8"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -1416,6 +1422,19 @@ def _auto_trade_loop():
                                         with auto_trade_lock:
                                             auto_trade_state["position"] = pos_info
                                             auto_trade_state["last_entry_ts"] = entry_ts
+                                        # Пишем сигнал в chart чтобы он отобразился
+                                        # на вкладке График при следующем открытии
+                                        with opt_lock:
+                                            opt_state["chart"] = {
+                                                "sym": sym, "tf": tf, "days": days,
+                                                "auto_trade_sig": {
+                                                    "dir": direction,
+                                                    "entry": entry_px,
+                                                    "sl": sl_px,
+                                                    "tp": tp_px,
+                                                    "ts": entry_ts,
+                                                }
+                                            }
                         else:
                             # Тот же сигнал — проверяем не закрылась ли позиция по TP/SL
                             with auto_trade_lock:
@@ -4157,6 +4176,7 @@ fetch('/opt_status').then(function(r){return r.json();}).then(function(d){
 
 /* ── Chart ── */
 var _cd=[], _sig=[], _obs_bull=[], _obs_bear=[], _fvg_bull=[], _fvg_bear=[];
+var _autoTradeSig = null;
 var _camStart=0, _camEnd=0, _drag=false, _dragX=0, _dragCam=0;
 var cv=document.getElementById('chartCanvas');
 var ctx2=cv.getContext('2d');
@@ -4194,6 +4214,7 @@ function loadChart(auto){
       // и ограниченную (а не "до конца графика") протяжённость зон.
       _obs_bull=d.bull_obs||[]; _obs_bear=d.bear_obs||[];
       _fvg_bull=d.fvg_bull||[]; _fvg_bear=d.fvg_bear||[];
+      _autoTradeSig=d.auto_trade_sig||null;
       if(!auto || anchorTs===null){
         _camStart=Math.max(0,_cd.length-80);
         _camEnd=_cd.length-1;
@@ -4413,6 +4434,48 @@ function drawChart(){
       ctx2.fillText(d.getHours().toString().padStart(2,'0')+':'+d.getMinutes().toString().padStart(2,'0'),x,H-PAD.b+20);
     }
   });
+  // ── Авто-трейд сигнал: ярко-жёлтый, поверх всего ──────────────────────────
+  if(_autoTradeSig && _autoTradeSig.ts){
+    // Ищем свечу по timestamp
+    var atIdx = -1;
+    for(var ai=0;ai<_cd.length;ai++){
+      if(_cd[ai].t === _autoTradeSig.ts){ atIdx=ai; break; }
+      // Ближайшая свеча (entry_ts может быть между барами)
+      if(ai>0 && _cd[ai-1].t<=_autoTradeSig.ts && _cd[ai].t>_autoTradeSig.ts){ atIdx=ai-1; break; }
+    }
+    if(atIdx>=s && atIdx<=e){
+      var atX=toX(atIdx), atEntry=_autoTradeSig.entry||_cd[atIdx].c;
+      var atYe=toY(atEntry);
+      var atTp=_autoTradeSig.tp, atSl=_autoTradeSig.sl;
+      var atLong=_autoTradeSig.dir==='long';
+      var atRight=W-PAD.r;
+      // TP/SL линии
+      if(atTp){
+        ctx2.strokeStyle='#f0c040';ctx2.lineWidth=1.5;ctx2.setLineDash([6,3]);
+        ctx2.beginPath();ctx2.moveTo(atX,toY(atTp));ctx2.lineTo(atRight,toY(atTp));ctx2.stroke();
+        ctx2.setLineDash([]);
+        ctx2.fillStyle='#f0c040';ctx2.font='bold 9px monospace';ctx2.textAlign='right';
+        ctx2.fillText('AT TP '+fmt(atTp),atRight-3,toY(atTp)-3);
+      }
+      if(atSl){
+        ctx2.strokeStyle='#f07040';ctx2.lineWidth=1.5;ctx2.setLineDash([6,3]);
+        ctx2.beginPath();ctx2.moveTo(atX,toY(atSl));ctx2.lineTo(atRight,toY(atSl));ctx2.stroke();
+        ctx2.setLineDash([]);
+        ctx2.fillStyle='#f07040';ctx2.font='bold 9px monospace';ctx2.textAlign='right';
+        ctx2.fillText('AT SL '+fmt(atSl),atRight-3,toY(atSl)+10);
+      }
+      // Большая стрелка входа
+      var asz=9, aoff=atLong?asz*2+4:-(asz*2+4);
+      ctx2.fillStyle='#f0e040';
+      ctx2.beginPath();
+      if(atLong){ctx2.moveTo(atX-asz,atYe+aoff);ctx2.lineTo(atX+asz,atYe+aoff);ctx2.lineTo(atX,atYe);}
+      else{ctx2.moveTo(atX-asz,atYe+aoff);ctx2.lineTo(atX+asz,atYe+aoff);ctx2.lineTo(atX,atYe);}
+      ctx2.fill();
+      // Метка AUTO
+      ctx2.fillStyle='#f0e040';ctx2.font='bold 10px monospace';ctx2.textAlign='center';
+      ctx2.fillText('AUTO',atX,atYe+(atLong?aoff+14:aoff-5));
+    }
+  }
 }
 
 function renderCM(m){
@@ -4900,7 +4963,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json({"candles": slim, "signals": result.get("signals",[]),
                         "bull_obs": result.get("bull_obs",[]), "bear_obs": result.get("bear_obs",[]),
                         "fvg_bull": result.get("fvg_bull",[]), "fvg_bear": result.get("fvg_bear",[]),
-                        "metrics": {k:result[k] for k in ("trades","winrate","profit_factor","max_dd","total_return","fitness","rr")}})
+                        "metrics": {k:result[k] for k in ("trades","winrate","profit_factor","max_dd","total_return","fitness","rr")},
+                        "auto_trade_sig": opt_state.get("chart",{}).get("auto_trade_sig") if opt_state.get("chart",{}).get("sym")==sym else None})
         elif self.path == "/gate_cfg":
             self._json({"gate_key": GATE_KEY[:4]+"***" if GATE_KEY else "",
                         "gate_secret": "***" if GATE_SECRET else "",
