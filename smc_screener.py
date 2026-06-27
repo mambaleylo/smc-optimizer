@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.12
+- v3.52.12: авто-обновление графика при улучшении fitness теперь работает
+  только если вкладка График уже активна (не прерывает работу на других
+  вкладках). При переходе на График — всегда применяется лучший конфиг.
 SMC Optimizer v3.52.11
 - v3.52.11: при переходе на вкладку График автоматически применяется лучший
   конфиг (_bestParams) если он уже найден — не нужно ждать улучшения fitness
@@ -645,7 +649,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.11"
+APP_VERSION  = "3.52.12"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -4148,7 +4152,10 @@ function poll(){
       window._lastBestResult = r;
       // Авто-применение: каждый раз когда fitness улучшился И цикл >= 30
       if((d.cycle||0) >= 30 && r.fitness > prevFit){
-        applyBestToChart();
+        // Обновляем только если вкладка График активна — иначе обновится при переходе
+        if(document.getElementById('chartPanel').classList.contains('active')){
+          applyBestToChart();
+        }
       }
       var wrC=r.winrate>=55?'green':r.winrate>=45?'yellow':'red';
       document.getElementById('bestCard').innerHTML=
