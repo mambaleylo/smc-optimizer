@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.9
+- v3.52.9: фикс "Unexpected end of JSON input" на вкладке График. Причина:
+  json.dumps падал с исключением после send_response(200) — клиент получал
+  пустое тело. Добавлен try/except вокруг _json в chart_data, float() для
+  метрик (защита от numpy types), лимит на кол-во signals/OB/FVG в ответе
+  (последние 200/50/50 — всё что нужно для отображения). Фикс opt_state
+  доступа без лока → теперь через opt_lock.
 SMC Optimizer v3.52.8
 - v3.52.8: сигнал авто-трейда теперь отображается на вкладке График.
   При открытии позиции _auto_trade_loop записывает сигнал в opt_state["chart"]
@@ -628,7 +635,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.8"
+APP_VERSION  = "3.52.9"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -4960,11 +4967,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._json({"error": "simulation failed"}); return
             # Slim down candles for transfer
             slim = [{"t":c["t"],"o":c["open"],"h":c["high"],"l":c["low"],"c":c["close"]} for c in candles]
-            self._json({"candles": slim, "signals": result.get("signals",[]),
-                        "bull_obs": result.get("bull_obs",[]), "bear_obs": result.get("bear_obs",[]),
-                        "fvg_bull": result.get("fvg_bull",[]), "fvg_bear": result.get("fvg_bear",[]),
-                        "metrics": {k:result[k] for k in ("trades","winrate","profit_factor","max_dd","total_return","fitness","rr")},
-                        "auto_trade_sig": opt_state.get("chart",{}).get("auto_trade_sig") if opt_state.get("chart",{}).get("sym")==sym else None})
+            with opt_lock:
+                chart_state = opt_state.get("chart") or {}
+            at_sig = chart_state.get("auto_trade_sig") if chart_state.get("sym") == sym else None
+            # Лимитируем кол-во объектов чтобы не генерировать гигантский JSON
+            sigs    = result.get("signals", [])[-200:]
+            b_obs   = result.get("bull_obs", [])[-50:]
+            br_obs  = result.get("bear_obs", [])[-50:]
+            fvg_b   = result.get("fvg_bull", [])[-50:]
+            fvg_br  = result.get("fvg_bear", [])[-50:]
+            try:
+                self._json({"candles": slim, "signals": sigs,
+                            "bull_obs": b_obs, "bear_obs": br_obs,
+                            "fvg_bull": fvg_b, "fvg_bear": fvg_br,
+                            "metrics": {k: float(result[k]) for k in ("trades","winrate","profit_factor","max_dd","total_return","fitness","rr") if k in result},
+                            "auto_trade_sig": at_sig})
+            except Exception as e:
+                self._json({"error": "serialize error: " + str(e)})
         elif self.path == "/gate_cfg":
             self._json({"gate_key": GATE_KEY[:4]+"***" if GATE_KEY else "",
                         "gate_secret": "***" if GATE_SECRET else "",
