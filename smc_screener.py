@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.2
+- v3.52.2: параметр «Смещение (дней назад)» в оптимизаторе. _fetch_candles
+  теперь принимает offset_days — окно свечей сдвигается в прошлое на N дней
+  (now = time.time() - offset_days*86400). Позволяет обучать на историческом
+  периоде [now-days-offset .. now-offset] вместо всегда последних N дней.
+  Честный OOS: Дней=30 Смещение=30 → учимся на [now-60д..now-30д], затем
+  в Симуляции проверяем те же параметры на [now-30д..now] (Смещение=0).
+  offset_days передаётся через /scan POST, хранится в opt_state, пробрасывается
+  в периодическое обновление свечей внутри run_optimizer.
 SMC Optimizer v3.52.1
 - v3.52.1: симуляция — sliding window OOS + кнопка «★ Лучший конфиг».
   Теперь _simulate гоняется не на [0..cursor], а на скользящем окне
@@ -587,7 +596,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.1"
+APP_VERSION  = "3.52.2"
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
@@ -661,6 +670,7 @@ opt_state  = {
     "cycle": 0, "trials": 0, "progress": 0,
     "symbol": "BTC_USDT", "tf": "15m", "days": 30,
     "sl_pct": 0.3, "tp_pct": 0.6, "risk_pct": 10.0,
+    "offset_days": 0,
     "chart": None, "fetch_pct": 0, "logs_dropped": 0,
     "eco_mode": False,
 }
@@ -1502,9 +1512,9 @@ def _fetch_all_symbols():
         olog(f"fetch_all_symbols error: {e}")
         return []
 
-def _fetch_candles(symbol, tf, days, _stop_event=None):
+def _fetch_candles(symbol, tf, days, _stop_event=None, offset_days=0):
     interval_sec = TF_SECONDS.get(tf, 3600)
-    now   = int(time.time())
+    now   = int(time.time()) - offset_days * 86400
     since = now - days * 86400
     LIMIT = 999
     all_candles = []
@@ -2527,9 +2537,10 @@ def run_optimizer():
     sl_p  = float(opt_state["sl_pct"])
     tp_p  = float(opt_state["tp_pct"])
     risk  = float(opt_state["risk_pct"])
+    offset_days = int(opt_state.get("offset_days", 0))
 
-    olog(f"▶ Старт | {sym} {tf} {days}д | SL={sl_p}% TP={tp_p}%")
-    candles = _fetch_candles(sym, tf, days)
+    olog(f"▶ Старт | {sym} {tf} {days}д | SL={sl_p}% TP={tp_p}%{f' | смещение -{offset_days}дн' if offset_days else ''}")
+    candles = _fetch_candles(sym, tf, days, offset_days=offset_days)
     if not candles or len(candles) < 100:
         olog("❌ Мало свечей, остановка")
         with opt_lock: opt_state["running"] = False
@@ -2624,7 +2635,7 @@ def run_optimizer():
                      f"(прошло ≥{tf_sec_refresh}с с последней загрузки) — "
                      f"иначе адаптация будет идти на устаревшем окне")
                 try:
-                    fresh_candles = _fetch_candles(sym, tf, days)
+                    fresh_candles = _fetch_candles(sym, tf, days, offset_days=offset_days)
                 except Exception as _fe:
                     fresh_candles = None
                     olog(f"⚠ Не удалось обновить свечи: {_fe}")
@@ -3120,6 +3131,7 @@ input:focus,select:focus{outline:none;border-color:var(--accent)}
       <option>30m</option><option>1h</option><option>4h</option><option>1d</option>
     </select>
     <label>Дней истории</label><input id="days" type="number" value="30" min="7" max="365">
+    <label title="Смещение окна в прошлое: 0 = последние N дней, 30 = N дней заканчивающихся 30 дней назад. Используй для OOS: обучи на [now-60д..now-30д] поставив Дней=30 Смещение=30, затем проверь в Симуляции на [now-30д..now].">Смещение (дней назад)</label><input id="offset_days" type="number" value="0" min="0" max="365" title="0 = последние N дней. N = окно заканчивается N дней назад.">
     <label>SL %</label><input id="sl_pct" type="number" value="0.3" step="0.05">
     <label>TP %</label><input id="tp_pct" type="number" value="0.6" step="0.05">
     <label>Риск на сделку %</label><input id="risk_pct" type="number" value="10" step="1">
@@ -3961,6 +3973,7 @@ function startOpt(){
     sl_pct:parseFloat(document.getElementById('sl_pct').value),
     tp_pct:parseFloat(document.getElementById('tp_pct').value),
     risk_pct:parseFloat(document.getElementById('risk_pct').value),
+    offset_days:parseInt(document.getElementById('offset_days').value)||0,
   };
   // Сразу показываем что идёт загрузка — не ждём ответа сервера
   _autoAppliedAt30 = false;
@@ -3977,7 +3990,8 @@ function startOpt(){
   var lb=document.getElementById('logBox');
   var div=document.createElement('div'); div.className='log-line';
   div.innerHTML='<span style="color:#555">[--:--:--]</span> ▶ Запускаем оптимизатор: '
-    +body.symbol+' '+body.tf+' '+body.days+'д SL='+body.sl_pct+'% TP='+body.tp_pct+'%';
+    +body.symbol+' '+body.tf+' '+body.days+'д'+(body.offset_days?(' смещ.-'+body.offset_days+'дн'):'')
+    +' SL='+body.sl_pct+'% TP='+body.tp_pct+'%';
   lb.appendChild(div); lb.scrollTop=lb.scrollHeight;
 
   fetch('/scan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
@@ -4924,6 +4938,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "sl_pct": body.get("sl_pct",0.6),
                     "tp_pct": body.get("tp_pct",1.2),
                     "risk_pct": body.get("risk_pct",10.0),
+                    "offset_days": int(body.get("offset_days", 0)),
                 })
             _save_last_symbol(_scan_symbol)  # v3.50: запоминаем последнюю прогоняемую пару
             _opt_thread = threading.Thread(target=run_optimizer, daemon=True)
