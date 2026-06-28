@@ -1,5 +1,23 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.22
+- v3.52.22: два фикса по заявке "что улучшит торговлю".
+  (1) Комиссия Gate.io (round-trip, ROUNDTRIP_FEE_PCT=0.10%) теперь
+  вычитается из pnl каждой сделки в _simulate — раньше fitness вообще не
+  знал о комиссии, и оптимизатор спокойно выбирал tight SL/TP (0.3-0.5%),
+  где round-trip комиссия съедает 20-30% движения и сливает бэктестовую
+  прибыль в реале. Комиссия считается от РЕАЛЬНОГО нотионала — той же
+  формулой, что в _gate_open_position (margin=equity*risk_pct%,
+  leverage=round(risk_pct/sl_pct)), а не от условного risk_pct.
+  (2) MIN_CYCLES_BEFORE_TRADE (150 циклов) был ошибочно подписан в логах
+  как "walk-forward проверка", хотя проверяет только число итераций НА ТОМ
+  ЖЕ (in-sample) окне. Добавлена реальная OOS-проверка (_wf_validate):
+  перед открытием сделки params прогоняются через _simulate на окне СРАЗУ
+  ПЕРЕД тренировочным (offset_days+days — оптимизатор его не видел). Если
+  PF<1 на этом незнакомом окне — сигнал отфильтрован, алерт в Telegram.
+  Если данных недостаточно для проверки (молодой символ) — fail-open с
+  пометкой в логе, а не блокировка навсегда. Результат кэшируется по
+  params, пересчёт только при их смене.
 SMC Optimizer v3.52.21
 - v3.52.21: top20 при периодическом обновлении свечей (раз в tf_sec_refresh,
   ~раз в свечу ТФ) больше не сбрасывается целиком в []. Раньше все найденные
@@ -726,7 +744,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.21"
+APP_VERSION  = "3.52.22"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -779,6 +797,12 @@ TF_SECONDS = {
 # для них всё ещё подставляются внутри _simulate через p.get(...,default) —
 # старые сохранённые конфиги (best.json/top20 с этими ключами) не ломаются,
 # просто эти ключи больше не тюнятся и не генерируются заново.
+# v3.52.22: комиссия Gate.io за вход+выход (round-trip). Вход — IOC, TP/SL —
+# price_orders с price="0" (маркет при триггере) — оба тейкерские. Базовый
+# тейкер на фьюч ~0.05% за сторону (зависит от VIP); 0.10 — консервативная
+# оценка round-trip. Подвинуть под свой реальный VIP-тир в Gate, если он ниже.
+ROUNDTRIP_FEE_PCT = 0.10
+
 PARAM_SPACE = {
     "sl_pct":        {"min":0.3,  "max":2.0,  "step":0.05, "type":"float"},
     "tp_pct":        {"min":0.5,  "max":4.0,  "step":0.05, "type":"float"},
@@ -1304,6 +1328,51 @@ def _save_gate_cfg():
     except Exception as e:
         olog(f"⚠ Не удалось сохранить gate cfg: {e}")
 
+# v3.52.22: реальная walk-forward (OOS) проверка перед тем, как авто-трейд
+# получит право торговать конкретными params. MIN_CYCLES_BEFORE_TRADE ниже
+# проверяет только то, что поиск прошёл достаточно итераций НА ТОМ ЖЕ окне
+# (in-sample) — это не OOS, хотя в логах раньше называлось "walk-forward".
+# Здесь берём окно СРАЗУ ПЕРЕД тренировочным (offset_days+days — не
+# пересекается с тем, что видел оптимизатор) и гоняем те же params на нём
+# через _simulate. Кэш по params — пересчитываем только когда они реально
+# меняются (новый фетч+симуляция на каждой свече был бы лишней нагрузкой).
+_wf_cache = {"key": None, "passed": None, "detail": ""}
+
+def _wf_validate(sym, tf, params, risk_pct):
+    """Возвращает (passed, detail). passed: True/False — проверка прошла/не
+    прошла, None — не удалось проверить (мало OOS-данных/ошибка фетча, в
+    этом случае сделку лучше не блокировать навсегда — fail-open с пометкой
+    в логе, а не fail-closed по причине нехватки истории)."""
+    global _wf_cache
+    key = (sym, tf, tuple(sorted((k, str(v)) for k, v in params.items())))
+    if _wf_cache["key"] == key:
+        return _wf_cache["passed"], _wf_cache["detail"]
+    with opt_lock:
+        train_days   = int(opt_state.get("days", 30))
+        train_offset = int(opt_state.get("offset_days", 0))
+    oos_offset = train_offset + train_days
+    try:
+        oos_candles = _fetch_candles(sym, tf, train_days, offset_days=oos_offset)
+    except Exception as e:
+        detail = f"OOS-фетч не удался: {e}"
+        _wf_cache = {"key": key, "passed": None, "detail": detail}
+        return None, detail
+    if not oos_candles or len(oos_candles) < 100:
+        detail = "недостаточно OOS-данных (символ молодой / короткая история)"
+        _wf_cache = {"key": key, "passed": None, "detail": detail}
+        return None, detail
+    oos_result = _simulate(oos_candles, params, risk_pct=risk_pct)
+    if not oos_result:
+        detail = "на OOS-окне <5 сделок — недостаточно для оценки"
+        _wf_cache = {"key": key, "passed": None, "detail": detail}
+        return None, detail
+    passed = oos_result["profit_factor"] >= 1.0
+    detail = (f"OOS[{train_days}д, смещ.-{oos_offset}дн]: "
+              f"PF={oos_result['profit_factor']} WR={oos_result['winrate']}% "
+              f"trades={oos_result['trades']}")
+    _wf_cache = {"key": key, "passed": passed, "detail": detail}
+    return passed, detail
+
 # ─── Поток авто-торговли ────────────────────────────────────────────────────
 def _auto_trade_loop():
     """
@@ -1329,6 +1398,7 @@ def _auto_trade_loop():
     # циклов — параметры на малом числе циклов недостаточно проверены.
     MIN_CYCLES_BEFORE_TRADE = 150
     cycle_gate_alerted = False  # чтобы не спамить алертом каждую свечу
+    wf_gate_alerted    = False  # отдельный алерт-флаг для провала OOS walk-forward (п.2)
 
     while not _auto_trade_stop.is_set():
         try:
@@ -1349,6 +1419,7 @@ def _auto_trade_loop():
                     olog(f"🔁 Авто-трейд: параметры обновлены (синк с оптимизатором) — "
                          f"swing={new_p.get('swing_len')} SL={new_p.get('sl_pct')}% TP={new_p.get('tp_pct')}%")
                     p = new_p
+                    wf_gate_alerted = False  # новые params — провал старых не должен душить алерт новых
             candles = _fetch_candles(sym, tf, days)
             if candles and len(candles) > 50:
                 result = _simulate(candles, p, sl_pct=p.get("sl_pct"),
@@ -1613,8 +1684,8 @@ def _auto_trade_loop():
                                     if cur_cycle < MIN_CYCLES_BEFORE_TRADE:
                                         olog(f"🚫 Сигнал {direction.upper()} отфильтрован — "
                                              f"оптимизатор прошёл только {cur_cycle}/"
-                                             f"{MIN_CYCLES_BEFORE_TRADE} циклов, стратегия ещё не "
-                                             f"проверена walk-forward'ом. Сигнал помечается "
+                                             f"{MIN_CYCLES_BEFORE_TRADE} циклов на тренировочном "
+                                             f"окне — рано, поиск ещё не сошёлся. Сигнал помечается "
                                              f"обработанным и НЕ откроет сделку, даже когда порог "
                                              f"будет пройден — только следующий новый сигнал.")
                                         if not cycle_gate_alerted:
@@ -1633,7 +1704,31 @@ def _auto_trade_loop():
                                         # достаточно оптимизированы.
                                         with auto_trade_lock:
                                             auto_trade_state["last_entry_ts"] = entry_ts
+                                    elif _wf_validate(sym, tf, p, risk_pct)[0] is False:
+                                        # v3.52.22: настоящая OOS-проверка — params прогнаны через
+                                        # _simulate на окне, которое оптимизатор НЕ видел во время
+                                        # поиска. None (мало OOS-данных/ошибка фетча) не блокирует —
+                                        # это проблема данных, а не качества стратегии; блокирует
+                                        # только явный False (PF<1 на незнакомых данных).
+                                        _wf_passed, _wf_detail = _wf_validate(sym, tf, p, risk_pct)
+                                        olog(f"🚫 Сигнал {direction.upper()} отфильтрован — "
+                                             f"провалена walk-forward проверка на OOS-окне: "
+                                             f"{_wf_detail}. Сделка не открыта, ждём следующий сигнал.")
+                                        if not wf_gate_alerted:
+                                            _send_alert(
+                                                f"🚫 <b>{sym}</b> — сигнал {direction.upper()} "
+                                                f"отфильтрован walk-forward'ом: {_wf_detail}. "
+                                                f"Текущие params не подтвердились на данных, которые "
+                                                f"оптимизатор не видел — торговать ими рискованно."
+                                            )
+                                            wf_gate_alerted = True
+                                        with auto_trade_lock:
+                                            auto_trade_state["last_entry_ts"] = entry_ts
                                     else:
+                                        _wf_passed, _wf_detail = _wf_validate(sym, tf, p, risk_pct)
+                                        if _wf_detail:
+                                            olog(f"✅ Walk-forward: {_wf_detail}"
+                                                 + ("" if _wf_passed else " (не проверено, торгуем дальше)"))
                                         olog(f"🤖 Новый сигнал: {direction.upper()} "
                                              f"entry={_fmt_px(entry_px)} sl={_fmt_px(sl_px)} tp={_fmt_px(tp_px)}")
 
@@ -1929,6 +2024,14 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
     if sl_pct is None: sl_pct = p["sl_pct"]
     if tp_pct is None: tp_pct = p["tp_pct"]
 
+    # v3.52.22: комиссия за круг (вход+выход), от РЕАЛЬНОГО нотионала —
+    # та же формула, что в _gate_open_position: margin=equity*risk_pct%,
+    # leverage=round(risk_pct/sl_pct), notional=margin*leverage. Раньше
+    # fitness/pnl вообще не знал о комиссии — оптимизатор спокойно выбирал
+    # tight SL/TP (0.3-0.5%), где round-trip комиссия съедает 20-30% движения.
+    _fee_lev  = max(1, round(risk_pct / sl_pct)) if sl_pct > 0 else 1
+    _fee_mult = (risk_pct / 100.0) * _fee_lev * (ROUNDTRIP_FEE_PCT / 100.0)
+
     swing_len     = int(p["swing_len"])
     internal_len  = int(p.get("internal_len", 5))
     ob_filter     = p.get("ob_filter","atr")
@@ -2155,27 +2258,27 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
                     sl_hit = abs(open_i - sl_price) <= abs(open_i - tp_price)
                     tp_hit = not sl_hit
                 if sl_hit:
-                    pnl = equity * (risk_pct/100.0) * (-1.0)
+                    fee = equity * _fee_mult
+                    pnl = equity * (risk_pct/100.0) * (-1.0) - fee
                     equity += pnl
                     trades.append({"dir":"long","entry":entry_px,"exit":sl_price,
-                                   "pnl_pct":-sl_pct,"pnl":pnl,"win":False,"i":i})
+                                   "pnl_pct":-sl_pct,"pnl":pnl,"fee":round(fee,4),"win":False,"i":i})
                     if _collect:
-                        _lev = max(1, round(risk_pct / sl_pct))
                         signals.append({"dir":"long","entry_i":entry_i,"exit_i":i,
                                         "entry":entry_px,"tp":tp_price,"sl":sl_price,"win":False,
-                                        "dep_pct": round(-risk_pct, 1), "lev": _lev})
+                                        "dep_pct": round(-risk_pct, 1), "lev": _fee_lev})
                     in_trade = False
                 elif tp_hit:
-                    rr = tp_pct / sl_pct
-                    pnl = equity * (risk_pct/100.0) * rr
+                    rr  = tp_pct / sl_pct
+                    fee = equity * _fee_mult
+                    pnl = equity * (risk_pct/100.0) * rr - fee
                     equity += pnl
                     trades.append({"dir":"long","entry":entry_px,"exit":tp_price,
-                                   "pnl_pct":tp_pct,"pnl":pnl,"win":True,"i":i})
+                                   "pnl_pct":tp_pct,"pnl":pnl,"fee":round(fee,4),"win":True,"i":i})
                     if _collect:
-                        _lev = max(1, round(risk_pct / sl_pct))
                         signals.append({"dir":"long","entry_i":entry_i,"exit_i":i,
                                         "entry":entry_px,"tp":tp_price,"sl":sl_price,"win":True,
-                                        "dep_pct": round(risk_pct * (tp_pct/sl_pct), 1), "lev": _lev})
+                                        "dep_pct": round(risk_pct * (tp_pct/sl_pct), 1), "lev": _fee_lev})
                     in_trade = False
             else:  # short
                 sl_hit = (high_i >= sl_price)
@@ -2184,27 +2287,27 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
                     sl_hit = abs(open_i - sl_price) <= abs(open_i - tp_price)
                     tp_hit = not sl_hit
                 if sl_hit:
-                    pnl = equity * (risk_pct/100.0) * (-1.0)
+                    fee = equity * _fee_mult
+                    pnl = equity * (risk_pct/100.0) * (-1.0) - fee
                     equity += pnl
                     trades.append({"dir":"short","entry":entry_px,"exit":sl_price,
-                                   "pnl_pct":-sl_pct,"pnl":pnl,"win":False,"i":i})
+                                   "pnl_pct":-sl_pct,"pnl":pnl,"fee":round(fee,4),"win":False,"i":i})
                     if _collect:
-                        _lev = max(1, round(risk_pct / sl_pct))
                         signals.append({"dir":"short","entry_i":entry_i,"exit_i":i,
                                         "entry":entry_px,"tp":tp_price,"sl":sl_price,"win":False,
-                                        "dep_pct": round(-risk_pct, 1), "lev": _lev})
+                                        "dep_pct": round(-risk_pct, 1), "lev": _fee_lev})
                     in_trade = False
                 elif tp_hit:
-                    rr = tp_pct / sl_pct
-                    pnl = equity * (risk_pct/100.0) * rr
+                    rr  = tp_pct / sl_pct
+                    fee = equity * _fee_mult
+                    pnl = equity * (risk_pct/100.0) * rr - fee
                     equity += pnl
                     trades.append({"dir":"short","entry":entry_px,"exit":tp_price,
-                                   "pnl_pct":tp_pct,"pnl":pnl,"win":True,"i":i})
+                                   "pnl_pct":tp_pct,"pnl":pnl,"fee":round(fee,4),"win":True,"i":i})
                     if _collect:
-                        _lev = max(1, round(risk_pct / sl_pct))
                         signals.append({"dir":"short","entry_i":entry_i,"exit_i":i,
                                         "entry":entry_px,"tp":tp_price,"sl":sl_price,"win":True,
-                                        "dep_pct": round(risk_pct * (tp_pct/sl_pct), 1), "lev": _lev})
+                                        "dep_pct": round(risk_pct * (tp_pct/sl_pct), 1), "lev": _fee_lev})
                     in_trade = False
             if in_trade: continue
 
