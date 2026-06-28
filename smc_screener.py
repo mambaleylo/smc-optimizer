@@ -707,6 +707,23 @@ except ImportError:
     import requests
 
 APP_VERSION  = "3.52.19"
+
+# ── Проверка консистентности версии (защита от забытого обновления) ──────────
+def _check_version():
+    import re as _re
+    _src = open(__file__).read()
+    _m1  = _re.search(r'APP_VERSION\s+=\s+"([^"]+)"', _src)
+    _m2  = _re.search(r'SMC \w+ v([\d.]+)', _src)
+    if not _m1 or not _m2:
+        raise RuntimeError("VERSION CHECK: не найдены строки версии в файле!")
+    if _m1.group(1) != _m2.group(1):
+        raise RuntimeError(
+            f"VERSION MISMATCH: APP_VERSION={_m1.group(1)} "
+            f"но docstring={_m2.group(1)} — обновите оба!"
+        )
+_check_version()
+# ─────────────────────────────────────────────────────────────────────────────
+
 GATE_API     = "https://api.gateio.ws/api/v4"
 NUM_WORKERS  = max(1, (multiprocessing.cpu_count() or 2) - 1)
 
