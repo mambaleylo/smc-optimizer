@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.21
+- v3.52.21: top20 при периодическом обновлении свечей (раз в tf_sec_refresh,
+  ~раз в свечу ТФ) больше не сбрасывается целиком в []. Раньше все найденные
+  за прогон params выбрасывались и поиск стартовал с нуля каждые ~15 мин на
+  15m ТФ — часы поиска терялись зря. Теперь старые top20-params лениво
+  пере-оцениваются (_simulate) на новом окне свечей — сами params остаются
+  валидными отправными точками, меняется только fitness под новые данные.
+  top20 пересобирается из пере-оценённых записей (с дедупом по fitness),
+  best_params/best_result берутся из вершины пере-оценённого списка.
 SMC Optimizer v3.52.20
 - v3.52.20: трендлайны LuxAlgo теперь не только рисуются, но и опционально
   фильтруют входы (по аналогии с smc-luxtrend). Добавлен tl_filter в
@@ -717,7 +726,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.20"
+APP_VERSION  = "3.52.21"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -3016,19 +3025,39 @@ def run_optimizer():
                         initargs=(candles, risk)
                     )
                     # best/топ-20 посчитаны на старом окне свечей — несравнимы
-                    # с новым окном напрямую. Пересчитываем best на свежих
-                    # данных (чтобы UI показывал честную метрику) и сбрасываем
-                    # топ-20/стагнацию, чтобы не путать оценки с разных окон.
-                    best_result = _simulate(candles, best_params, risk_pct=risk)
-                    best_fit    = best_result["fitness"] if best_result else 0.0
-                    top20       = []
+                    # с новым окном напрямую (та же стратегия даст другой fitness).
+                    # v3.52.21: вместо полного сброса top20=[] лениво пере-оцениваем
+                    # те же params на новом окне — params остаются валидными
+                    # отправными точками поиска, меняется только их fitness.
+                    rescored = []
+                    for entry in top20:
+                        r = _simulate(candles, entry["params"], risk_pct=risk)
+                        if r:
+                            rescored.append({"params": entry["params"], "result": r})
+                    br = _simulate(candles, best_params, risk_pct=risk)
+                    if br:
+                        rescored.append({"params": best_params, "result": br})
+                    rescored.sort(key=lambda x: x["result"]["fitness"], reverse=True)
+                    deduped = []
+                    for e in rescored:
+                        if not any(abs(e["result"]["fitness"] - d["result"]["fitness"]) < 0.001
+                                   for d in deduped):
+                            deduped.append(e)
+                    top20 = deduped[:20]
+                    if top20:
+                        best_params = top20[0]["params"]
+                        best_result = top20[0]["result"]
+                        best_fit    = best_result["fitness"]
+                    else:
+                        best_result = None
+                        best_fit    = 0.0
                     no_improve  = 0
                     with opt_lock:
-                        opt_state["top20"] = []
+                        opt_state["top20"] = top20
                         opt_state["best"]  = ({"params": best_params, "result": best_result}
                                                if best_result else None)
-                    olog(f"✔ Свечи обновлены: {len(candles)} шт. best пересчитан "
-                         f"на новом окне: fit={best_fit:.4f}")
+                    olog(f"✔ Свечи обновлены: {len(candles)} шт. top20 пере-оценён "
+                         f"на новом окне ({len(top20)} записей), best fit={best_fit:.4f}")
                 else:
                     olog("⚠ Обновление свечей пропущено — данных мало/ошибка, "
                          "продолжаю на текущем наборе")
