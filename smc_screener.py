@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.19
+- v3.52.19: визуализация трендлайнов LuxAlgo на графике.
+  tl_mult/tl_method добавлены в PARAM_SPACE — оптимизатор перебирает их.
+  На графике: красная пунктирная = down-trendline, зелёная = up-trendline,
+  метки "B" на пробоях. Логика 1:1 из smc-luxtrend (no lookahead).
 SMC Optimizer v3.52.18
 - v3.52.18: фикс закрытия позиции из-за авто-синка параметров. Оптимизатор
   находил лучший конфиг без текущего сигнала → params менялись во время
@@ -747,6 +752,8 @@ PARAM_SPACE = {
     "choch_only":    {"values":[False, True],               "type":"bool"},
     "min_ob_size":   {"min":0.5,  "max":3.0,  "step":0.1,  "type":"float"},
     "require_fvg_confirm": {"values":[False,True],          "type":"bool"},
+    "tl_mult":   {"min":0.5,  "max":3.0,  "step":0.1, "type":"float"},
+    "tl_method": {"values":["atr","stdev","linreg"],        "type":"cat"},
 }
 
 # ─── Глобальное состояние ───────────────────────────────────────────────────
@@ -1894,6 +1901,8 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
     use_internal  = p.get("use_internal", True)
     min_ob_size   = p.get("min_ob_size", 1.0)
     req_fvg       = p.get("require_fvg_confirm", False)
+    tl_mult       = float(p.get("tl_mult", 1.0))
+    tl_method     = p.get("tl_method", "atr")
 
     n = len(candles)
     min_bars = swing_len*2 + 20
@@ -1911,6 +1920,61 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
     ph = _pivot_high(candles, swing_len)
     pl = _pivot_low(candles, swing_len)
     # internal_len/use_internal зарезервированы для будущей internal structure логики
+
+    # ── Trendlines (LuxAlgo "Trendlines with Breaks", 1:1 порт) ────────────────
+    atr_tl_arr = _atr(candles, swing_len)
+    tl_upper = [0.0] * n
+    tl_lower = [0.0] * n
+    tl_upos  = [0] * n
+    tl_dnos  = [0] * n
+    _upper = 0.0; _lower = 0.0
+    _sph   = 0.0; _spl   = 0.0
+    _upos  = 0;   _dnos  = 0
+    for i in range(n):
+        c = candles[i]
+        atr_i = atr_tl_arr[i] or 0.001
+        confirmed_i = i - swing_len
+        ph_val = ph[confirmed_i] if confirmed_i >= 0 else None
+        pl_val = pl[confirmed_i] if confirmed_i >= 0 else None
+        closes_slice = [candles[j]["close"] for j in range(max(0,i-swing_len+1), i+1)]
+        ns = len(closes_slice)
+        if tl_method == "stdev":
+            mean_c = sum(closes_slice)/ns if ns else c["close"]
+            var_c  = sum((x-mean_c)**2 for x in closes_slice)/ns if ns > 1 else 0
+            slope_i = (var_c**0.5) / swing_len * tl_mult
+        elif tl_method == "linreg":
+            if ns > 1:
+                idx_slice = list(range(i-ns+1, i+1))
+                sma_cn = sum(closes_slice[j]*idx_slice[j] for j in range(ns)) / ns
+                sma_c  = sum(closes_slice) / ns
+                sma_n  = sum(idx_slice) / ns
+                var_n  = sum((x-sma_n)**2 for x in idx_slice) / ns
+                slope_i = abs(sma_cn - sma_c*sma_n) / max(var_n, 1e-9) / 2 * tl_mult
+            else:
+                slope_i = atr_i / swing_len * tl_mult
+        else:
+            slope_i = atr_i / swing_len * tl_mult
+        if ph_val is not None:
+            _sph = slope_i; _upper = ph_val
+        else:
+            _upper -= _sph
+        if pl_val is not None:
+            _spl = slope_i; _lower = pl_val
+        else:
+            _lower += _spl
+        tl_upper[i] = _upper - _sph * swing_len
+        tl_lower[i] = _lower + _spl * swing_len
+        if ph_val is not None:
+            _upos = 0
+        elif c["close"] > tl_upper[i]:
+            _upos = 1
+        if pl_val is not None:
+            _dnos = 0
+        elif c["close"] < tl_lower[i]:
+            _dnos = 1
+        tl_upos[i] = _upos
+        tl_dnos[i] = _dnos
+    # ── конец trendline precompute ───────────────────────────────────────────
 
     # Order blocks: ищем последний бычий/медвежий OB
     # Бычий OB = последняя медвежья свеча перед пробитием вверх swing high
@@ -2273,6 +2337,10 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
         result["bear_obs"] = _box_end(coll_bear_obs, "bear")
         result["fvg_bull"] = _fvg_end(fvg_bull, "bull")
         result["fvg_bear"] = _fvg_end(fvg_bear, "bear")
+        result["tl_upper"] = tl_upper
+        result["tl_lower"] = tl_lower
+        result["tl_upos"]  = tl_upos
+        result["tl_dnos"]  = tl_dnos
 
     return result
 
@@ -3567,7 +3635,7 @@ var _bestParams = null;
 var _autoAppliedAt30 = false;
 var _chartExtra = {internal_len:5, ob_filter:'atr', ob_mitigation:'highlow',
   fvg_enabled:true, fvg_threshold:0.1, choch_only:false, use_internal:true,
-  min_ob_size:1.0, require_fvg_confirm:false};
+  min_ob_size:1.0, require_fvg_confirm:false, tl_mult:1.0, tl_method:'atr'};
 var TF_SEC = {"1m":60,"5m":300,"15m":900,"30m":1800,"1h":3600,"4h":14400,"1d":86400};
 var _chartAutoTimer = null;
 var _monitorActive = false;
@@ -3866,6 +3934,8 @@ function applyBestToChart(){
     use_internal:       p.use_internal       != null ? p.use_internal       : true,
     min_ob_size:        p.min_ob_size        != null ? p.min_ob_size        : 1.0,
     require_fvg_confirm:p.require_fvg_confirm!= null ? p.require_fvg_confirm: false,
+  tl_mult:    p.tl_mult   != null ? p.tl_mult   : 1.0,
+  tl_method:  p.tl_method != null ? p.tl_method : 'atr',
   };
   // Применяем конфиг к графику без переключения вкладки
   setTimeout(function(){ loadChart(); }, 80);
@@ -4436,6 +4506,7 @@ fetch('/opt_status').then(function(r){return r.json();}).then(function(d){
 
 /* ── Chart ── */
 var _cd=[], _sig=[], _obs_bull=[], _obs_bear=[], _fvg_bull=[], _fvg_bear=[];
+var _tl_upper=[], _tl_lower=[], _tl_upos=[], _tl_dnos=[];
 var _autoTradeSig = null;
 var _camStart=0, _camEnd=0, _drag=false, _dragX=0, _dragCam=0;
 var cv=document.getElementById('chartCanvas');
@@ -4463,7 +4534,7 @@ function loadChart(auto){
     +'&internal_len='+ex.internal_len+'&ob_filter='+ex.ob_filter+'&ob_mitigation='+ex.ob_mitigation
     +'&fvg_enabled='+ex.fvg_enabled+'&fvg_threshold='+ex.fvg_threshold+'&choch_only='+ex.choch_only
     +'&use_internal='+ex.use_internal+'&min_ob_size='+ex.min_ob_size
-    +'&require_fvg_confirm='+ex.require_fvg_confirm;
+    +'&require_fvg_confirm='+ex.require_fvg_confirm+'&tl_mult='+ex.tl_mult+'&tl_method='+ex.tl_method;
   fetch(url)
     .then(function(r){return r.json();}).then(function(d){
       if(d.error){cStatus('Ошибка: '+d.error);return;}
@@ -4473,6 +4544,8 @@ function loadChart(auto){
       // что и оптимизатор — это гарантирует совпадение с лучшим конфигом
       // и ограниченную (а не "до конца графика") протяжённость зон.
       _obs_bull=d.bull_obs||[]; _obs_bear=d.bear_obs||[];
+      _tl_upper=d.tl_upper||[]; _tl_lower=d.tl_lower||[];
+      _tl_upos=d.tl_upos||[]; _tl_dnos=d.tl_dnos||[];
       _fvg_bull=d.fvg_bull||[]; _fvg_bear=d.fvg_bear||[];
       _autoTradeSig=d.auto_trade_sig||null;
       if(!auto || anchorTs===null){
@@ -4550,6 +4623,7 @@ function drawChart(){
       if(sg.sl<mn)mn=sg.sl;if(sg.sl>mx)mx=sg.sl;
     }
   });
+  if(_tl_upper.length){for(var _i=s;_i<=e;_i++){var _vu=_tl_upper[_i],_vl=_tl_lower[_i];if(_vu&&_vu>0){if(_vu<mn)mn=_vu;if(_vu>mx)mx=_vu;}if(_vl&&_vl>0){if(_vl<mn)mn=_vl;if(_vl>mx)mx=_vl;}}}
   var rng=mx-mn||1, pad2=rng*0.06;
   mn-=pad2;mx+=pad2;
   function toY(p){return PAD.t+cH*(1-(p-mn)/(mx-mn));}
@@ -4610,6 +4684,26 @@ function drawChart(){
     ctx2.fillStyle=bull?'rgba(38,166,154,0.85)':'rgba(239,83,80,0.85)';
     ctx2.fillRect(x-candleW/2,y1,candleW,Math.max(1,y2-y1));
   });
+  // ── Trendlines (LuxAlgo) ────────────────────────────────────────────────────
+  if(_tl_upper.length>e){
+    ctx2.setLineDash([6,3]);
+    ctx2.strokeStyle='rgba(242,54,69,0.7)';ctx2.lineWidth=1.2;
+    ctx2.beginPath();var _st=false;
+    for(var _i=s;_i<=e;_i++){var _v=_tl_upper[_i];if(!_v||_v<=0){_st=false;continue;}var _x=toX(_i),_y=toY(_v);if(!_st){ctx2.moveTo(_x,_y);_st=true;}else{ctx2.lineTo(_x,_y);}}
+    ctx2.stroke();
+    ctx2.strokeStyle='rgba(8,153,129,0.7)';ctx2.lineWidth=1.2;
+    ctx2.beginPath();_st=false;
+    for(var _i=s;_i<=e;_i++){var _v=_tl_lower[_i];if(!_v||_v<=0){_st=false;continue;}var _x=toX(_i),_y=toY(_v);if(!_st){ctx2.moveTo(_x,_y);_st=true;}else{ctx2.lineTo(_x,_y);}}
+    ctx2.stroke();
+    ctx2.setLineDash([]);
+    for(var _i=s;_i<=e;_i++){
+      var _up=_tl_upos[_i],_dn=_tl_dnos[_i];
+      var _up0=_i>0?_tl_upos[_i-1]:0,_dn0=_i>0?_tl_dnos[_i-1]:0;
+      var _x=toX(_i);
+      if(_up>_up0){var _y=toY(_cd[_i].l)-10;ctx2.fillStyle='rgba(8,153,129,0.9)';ctx2.fillRect(_x-7,_y-10,14,14);ctx2.fillStyle='#fff';ctx2.font='bold 8px monospace';ctx2.textAlign='center';ctx2.fillText('B',_x,_y);}
+      if(_dn>_dn0){var _y=toY(_cd[_i].h)+20;ctx2.fillStyle='rgba(242,54,69,0.9)';ctx2.fillRect(_x-7,_y-10,14,14);ctx2.fillStyle='#fff';ctx2.font='bold 8px monospace';ctx2.textAlign='center';ctx2.fillText('B',_x,_y);}
+    }
+  }
   // ── Сигналы: только последний виден полностью, остальные — точка + тонкие линии
   var visibleSigs = _sig.filter(function(sg){return sg.entry_i>=s&&sg.entry_i<=e;});
   visibleSigs.forEach(function(sg, si){
@@ -5214,6 +5308,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                  "use_internal": qb("use_internal", True),
                  "min_ob_size": float(qf("min_ob_size", 1.0)),
                  "require_fvg_confirm": qb("require_fvg_confirm", False),
+                 "tl_mult": float(qf("tl_mult", 1.0)),
+                 "tl_method": qf("tl_method", "atr"),
                  "sl_pct": sl_p, "tp_pct": tp_p}
             result = _simulate(candles, p, sl_pct=sl_p, tp_pct=tp_p, _collect=True)
             if not result:
@@ -5233,6 +5329,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._json({"candles": slim, "signals": sigs,
                             "bull_obs": b_obs, "bear_obs": br_obs,
                             "fvg_bull": fvg_b, "fvg_bear": fvg_br,
+                            "tl_upper": result.get("tl_upper",[]), "tl_lower": result.get("tl_lower",[]),
+                            "tl_upos": result.get("tl_upos",[]), "tl_dnos": result.get("tl_dnos",[]),
                             "metrics": {k: float(result[k]) for k in ("trades","winrate","profit_factor","max_dd","total_return","fitness","rr") if k in result},
                             "auto_trade_sig": at_sig})
             except Exception as e:
