@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.20
+- v3.52.20: трендлайны LuxAlgo теперь не только рисуются, но и опционально
+  фильтруют входы (по аналогии с smc-luxtrend). Добавлен tl_filter в
+  PARAM_SPACE (bool). В _simulate: tl_bull_ok/tl_bear_ok вычисляются перед
+  проверкой OB — при tl_filter=True бычий вход разрешён только если цена
+  пробила нижнюю трендлайн снизу вверх (tl_upos==1), медвежий — только при
+  пробое верхней трендлайн сверху вниз (tl_dnos==1); при tl_filter=False
+  фильтр не действует (поведение как в v3.52.19, обратная совместимость).
+  tl_filter прокинут через /chart_data, applyBestToChart и _chartExtra —
+  график и авто-трейд видят тот же фильтр, что и оптимизатор. В лучшем
+  конфиге (левая панель) добавлена строка "TL фильтр: вкл/выкл".
 SMC Optimizer v3.52.19
 - v3.52.19: визуализация трендлайнов LuxAlgo на графике.
   tl_mult/tl_method добавлены в PARAM_SPACE — оптимизатор перебирает их.
@@ -706,7 +717,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.19"
+APP_VERSION  = "3.52.20"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -771,6 +782,7 @@ PARAM_SPACE = {
     "require_fvg_confirm": {"values":[False,True],          "type":"bool"},
     "tl_mult":   {"min":0.5,  "max":3.0,  "step":0.1, "type":"float"},
     "tl_method": {"values":["atr","stdev","linreg"],        "type":"cat"},
+    "tl_filter": {"values":[False, True],                   "type":"bool"},
 }
 
 # ─── Глобальное состояние ───────────────────────────────────────────────────
@@ -1920,6 +1932,7 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
     req_fvg       = p.get("require_fvg_confirm", False)
     tl_mult       = float(p.get("tl_mult", 1.0))
     tl_method     = p.get("tl_method", "atr")
+    tl_filter     = bool(p.get("tl_filter", False))
 
     n = len(candles)
     min_bars = swing_len*2 + 20
@@ -2194,6 +2207,14 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
         if sw_trend == 0:
             continue
 
+        # ── Trendline filter (опционально, см. tl_filter в PARAM_SPACE) ────────
+        # При tl_filter=True бычий вход разрешён только если цена пробила
+        # нижнюю трендлайн снизу вверх (tl_upos==1); медвежий — только при
+        # пробое верхней трендлайн сверху вниз (tl_dnos==1), как в smc-luxtrend.
+        # При tl_filter=False фильтр не действует (поведение как в v3.52.19).
+        tl_bull_ok = (not tl_filter) or (tl_upos[i] == 1)
+        tl_bear_ok = (not tl_filter) or (tl_dnos[i] == 1)
+
         # Бычий сигнал: цена возвращается в бычий OB
         # choch_only=False: торгуем и BOS и CHoCH OBs
         # choch_only=True: торгуем только OB которые были активированы через CHoCH
@@ -2203,7 +2224,7 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
                 trend_ok = (ob.get("type") == "choch")
             else:
                 trend_ok = True
-            if in_ob and trend_ok:
+            if in_ob and trend_ok and tl_bull_ok:
                 fvg_ok = True
                 if req_fvg and fvg_enabled:
                     fvg_ok = any(f[0] > ob["i"] and f[0] <= i and
@@ -2221,7 +2242,7 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
                     trend_ok = (ob.get("type") == "choch")
                 else:
                     trend_ok = True
-                if in_ob and trend_ok:
+                if in_ob and trend_ok and tl_bear_ok:
                     fvg_ok = True
                     if req_fvg and fvg_enabled:
                         fvg_ok = any(f[0] > ob["i"] and f[0] <= i and
@@ -3652,7 +3673,7 @@ var _bestParams = null;
 var _autoAppliedAt30 = false;
 var _chartExtra = {internal_len:5, ob_filter:'atr', ob_mitigation:'highlow',
   fvg_enabled:true, fvg_threshold:0.1, choch_only:false, use_internal:true,
-  min_ob_size:1.0, require_fvg_confirm:false, tl_mult:1.0, tl_method:'atr'};
+  min_ob_size:1.0, require_fvg_confirm:false, tl_mult:1.0, tl_method:'atr', tl_filter:false};
 var TF_SEC = {"1m":60,"5m":300,"15m":900,"30m":1800,"1h":3600,"4h":14400,"1d":86400};
 var _chartAutoTimer = null;
 var _monitorActive = false;
@@ -3953,6 +3974,7 @@ function applyBestToChart(){
     require_fvg_confirm:p.require_fvg_confirm!= null ? p.require_fvg_confirm: false,
   tl_mult:    p.tl_mult   != null ? p.tl_mult   : 1.0,
   tl_method:  p.tl_method != null ? p.tl_method : 'atr',
+  tl_filter:  p.tl_filter != null ? p.tl_filter : false,
   };
   // Применяем конфиг к графику без переключения вкладки
   setTimeout(function(){ loadChart(); }, 80);
@@ -4471,7 +4493,8 @@ function poll(){
         '<div class="stat-row"><span class="stat-label">Swing len</span><span class="stat-val">'+p.swing_len+'</span></div>'+
         '<div class="stat-row"><span class="stat-label">OB mitigation</span><span class="stat-val">'+p.ob_mitigation+'</span></div>'+
         '<div class="stat-row"><span class="stat-label">FVG</span><span class="stat-val">'+(p.fvg_enabled?'вкл':'выкл')+'</span></div>'+
-        '<div class="stat-row"><span class="stat-label">CHoCH only</span><span class="stat-val">'+(p.choch_only?'да':'нет')+'</span></div>';
+        '<div class="stat-row"><span class="stat-label">CHoCH only</span><span class="stat-val">'+(p.choch_only?'да':'нет')+'</span></div>'+
+        '<div class="stat-row"><span class="stat-label">TL фильтр</span><span class="stat-val">'+(p.tl_filter?'вкл':'выкл')+'</span></div>';
     }
 
     var top=(d.top20||[]);
@@ -4551,7 +4574,8 @@ function loadChart(auto){
     +'&internal_len='+ex.internal_len+'&ob_filter='+ex.ob_filter+'&ob_mitigation='+ex.ob_mitigation
     +'&fvg_enabled='+ex.fvg_enabled+'&fvg_threshold='+ex.fvg_threshold+'&choch_only='+ex.choch_only
     +'&use_internal='+ex.use_internal+'&min_ob_size='+ex.min_ob_size
-    +'&require_fvg_confirm='+ex.require_fvg_confirm+'&tl_mult='+ex.tl_mult+'&tl_method='+ex.tl_method;
+    +'&require_fvg_confirm='+ex.require_fvg_confirm+'&tl_mult='+ex.tl_mult+'&tl_method='+ex.tl_method
+    +'&tl_filter='+ex.tl_filter;
   fetch(url)
     .then(function(r){return r.json();}).then(function(d){
       if(d.error){cStatus('Ошибка: '+d.error);return;}
@@ -5327,6 +5351,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                  "require_fvg_confirm": qb("require_fvg_confirm", False),
                  "tl_mult": float(qf("tl_mult", 1.0)),
                  "tl_method": qf("tl_method", "atr"),
+                 "tl_filter": qb("tl_filter", False),
                  "sl_pct": sl_p, "tp_pct": tp_p}
             result = _simulate(candles, p, sl_pct=sl_p, tp_pct=tp_p, _collect=True)
             if not result:
