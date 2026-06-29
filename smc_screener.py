@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.30
+- v3.52.30: убраны OB и FVG блоки с графика окончательно.
+  На графике: только свечи + зоны сделок (TP/SL заливка + линии + стрелки).
 SMC Optimizer v3.52.29
 - v3.52.29: убраны трендлинии LuxAlgo (tl_upper/tl_lower/B-маркеры) с графика,
   OB и FVG блоки возвращены обратно. Заливка зон сделок оригинальная зелёная/красная.
@@ -794,7 +797,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.29"
+APP_VERSION  = "3.52.30"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -4957,34 +4960,6 @@ function drawChart(){
     ctx2.fillStyle=axisCol;ctx2.font='9px monospace';ctx2.textAlign='right';
     ctx2.fillText(fmt(p),PAD.l-4,y+3);
   }
-  // ── FVG — очень прозрачно, только штрих по левому краю ──────────────────
-  _fvg_bull.filter(function(f){return f.end_i>=s&&f.i<=e;}).forEach(function(f){
-    var x1=toX(Math.max(f.i,s))-barW/2, x2=toX(Math.min(f.end_i,e))+barW/2;
-    var y1=toY(f.hi),y2=toY(f.lo);
-    ctx2.fillStyle='rgba(8,153,129,0.06)';ctx2.fillRect(x1,y1,x2-x1,y2-y1);
-    ctx2.fillStyle='rgba(8,153,129,0.5)';ctx2.fillRect(x1,y1,2,y2-y1);
-  });
-  _fvg_bear.filter(function(f){return f.end_i>=s&&f.i<=e;}).forEach(function(f){
-    var x1=toX(Math.max(f.i,s))-barW/2, x2=toX(Math.min(f.end_i,e))+barW/2;
-    var y1=toY(f.hi),y2=toY(f.lo);
-    ctx2.fillStyle='rgba(242,54,69,0.06)';ctx2.fillRect(x1,y1,x2-x1,y2-y1);
-    ctx2.fillStyle='rgba(242,54,69,0.5)';ctx2.fillRect(x1,y1,2,y2-y1);
-  });
-  // ── OB — тонкая рамка без заливки, метка только если широко ─────────────
-  _obs_bull.filter(function(o){return o.end_i>=s&&o.i<=e;}).forEach(function(o){
-    var x1=toX(Math.max(o.i,s))-barW/2, x2=toX(Math.min(o.end_i,e))+barW/2;
-    var y1=toY(o.hi),y2=toY(o.lo);
-    ctx2.fillStyle='rgba(49,121,245,0.07)';ctx2.fillRect(x1,y1,x2-x1,y2-y1);
-    ctx2.strokeStyle='rgba(49,121,245,0.35)';ctx2.lineWidth=0.8;ctx2.strokeRect(x1,y1,x2-x1,y2-y1);
-    if(x2-x1>30){ctx2.fillStyle='rgba(49,121,245,0.45)';ctx2.font='8px monospace';ctx2.textAlign='left';ctx2.fillText('OB',x1+3,y1+8);}
-  });
-  _obs_bear.filter(function(o){return o.end_i>=s&&o.i<=e;}).forEach(function(o){
-    var x1=toX(Math.max(o.i,s))-barW/2, x2=toX(Math.min(o.end_i,e))+barW/2;
-    var y1=toY(o.hi),y2=toY(o.lo);
-    ctx2.fillStyle='rgba(242,54,69,0.07)';ctx2.fillRect(x1,y1,x2-x1,y2-y1);
-    ctx2.strokeStyle='rgba(242,54,69,0.35)';ctx2.lineWidth=0.8;ctx2.strokeRect(x1,y1,x2-x1,y2-y1);
-    if(x2-x1>30){ctx2.fillStyle='rgba(242,54,69,0.45)';ctx2.font='8px monospace';ctx2.textAlign='left';ctx2.fillText('OB',x1+3,y1+8);}
-  });
   // ── Свечи ────────────────────────────────────────────────────────────────
   vis.forEach(function(c,idx){
     var xi=s+idx,x=toX(xi),bull=c.c>=c.o;
