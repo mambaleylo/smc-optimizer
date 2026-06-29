@@ -3704,7 +3704,7 @@ input:focus,select:focus{outline:none;border-color:var(--accent)}
 #amoledContent .as-row b{font-size:1.5rem;font-weight:600;display:block;color:inherit;line-height:1.1}
 #amoledContent .as-row span{font-size:.68rem;opacity:.55;display:block;margin-top:4px;letter-spacing:.1em;text-transform:uppercase}
 #amoledContent .as-status{margin-top:14px;font-size:.78rem;opacity:.6;letter-spacing:.05em}
-#amoledContent.night{color:rgba(255,255,255,.10)}
+#amoledContent.night{color:rgba(255,255,255,.40)}
 #amoledContent.night .as-time{color:inherit;font-weight:400}
 @media(max-width:480px){
   #amoledContent .as-time{font-size:3rem}
