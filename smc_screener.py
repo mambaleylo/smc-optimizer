@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.29
+- v3.52.29: убраны трендлинии LuxAlgo (tl_upper/tl_lower/B-маркеры) с графика,
+  OB и FVG блоки возвращены обратно. Заливка зон сделок оригинальная зелёная/красная.
 SMC Optimizer v3.52.28
 - v3.52.28: убраны OB и FVG блоки с графика — мешали читать сделки.
   Заливка зон TP/SL сделок возвращена к оригинальным цветам (зелёный/красный).
@@ -791,7 +794,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.28"
+APP_VERSION  = "3.52.29"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -4954,6 +4957,34 @@ function drawChart(){
     ctx2.fillStyle=axisCol;ctx2.font='9px monospace';ctx2.textAlign='right';
     ctx2.fillText(fmt(p),PAD.l-4,y+3);
   }
+  // ── FVG — очень прозрачно, только штрих по левому краю ──────────────────
+  _fvg_bull.filter(function(f){return f.end_i>=s&&f.i<=e;}).forEach(function(f){
+    var x1=toX(Math.max(f.i,s))-barW/2, x2=toX(Math.min(f.end_i,e))+barW/2;
+    var y1=toY(f.hi),y2=toY(f.lo);
+    ctx2.fillStyle='rgba(8,153,129,0.06)';ctx2.fillRect(x1,y1,x2-x1,y2-y1);
+    ctx2.fillStyle='rgba(8,153,129,0.5)';ctx2.fillRect(x1,y1,2,y2-y1);
+  });
+  _fvg_bear.filter(function(f){return f.end_i>=s&&f.i<=e;}).forEach(function(f){
+    var x1=toX(Math.max(f.i,s))-barW/2, x2=toX(Math.min(f.end_i,e))+barW/2;
+    var y1=toY(f.hi),y2=toY(f.lo);
+    ctx2.fillStyle='rgba(242,54,69,0.06)';ctx2.fillRect(x1,y1,x2-x1,y2-y1);
+    ctx2.fillStyle='rgba(242,54,69,0.5)';ctx2.fillRect(x1,y1,2,y2-y1);
+  });
+  // ── OB — тонкая рамка без заливки, метка только если широко ─────────────
+  _obs_bull.filter(function(o){return o.end_i>=s&&o.i<=e;}).forEach(function(o){
+    var x1=toX(Math.max(o.i,s))-barW/2, x2=toX(Math.min(o.end_i,e))+barW/2;
+    var y1=toY(o.hi),y2=toY(o.lo);
+    ctx2.fillStyle='rgba(49,121,245,0.07)';ctx2.fillRect(x1,y1,x2-x1,y2-y1);
+    ctx2.strokeStyle='rgba(49,121,245,0.35)';ctx2.lineWidth=0.8;ctx2.strokeRect(x1,y1,x2-x1,y2-y1);
+    if(x2-x1>30){ctx2.fillStyle='rgba(49,121,245,0.45)';ctx2.font='8px monospace';ctx2.textAlign='left';ctx2.fillText('OB',x1+3,y1+8);}
+  });
+  _obs_bear.filter(function(o){return o.end_i>=s&&o.i<=e;}).forEach(function(o){
+    var x1=toX(Math.max(o.i,s))-barW/2, x2=toX(Math.min(o.end_i,e))+barW/2;
+    var y1=toY(o.hi),y2=toY(o.lo);
+    ctx2.fillStyle='rgba(242,54,69,0.07)';ctx2.fillRect(x1,y1,x2-x1,y2-y1);
+    ctx2.strokeStyle='rgba(242,54,69,0.35)';ctx2.lineWidth=0.8;ctx2.strokeRect(x1,y1,x2-x1,y2-y1);
+    if(x2-x1>30){ctx2.fillStyle='rgba(242,54,69,0.45)';ctx2.font='8px monospace';ctx2.textAlign='left';ctx2.fillText('OB',x1+3,y1+8);}
+  });
   // ── Свечи ────────────────────────────────────────────────────────────────
   vis.forEach(function(c,idx){
     var xi=s+idx,x=toX(xi),bull=c.c>=c.o;
@@ -4964,26 +4995,6 @@ function drawChart(){
     ctx2.fillStyle=bull?'rgba(38,166,154,0.85)':'rgba(239,83,80,0.85)';
     ctx2.fillRect(x-candleW/2,y1,candleW,Math.max(1,y2-y1));
   });
-  // ── Trendlines (LuxAlgo) ────────────────────────────────────────────────────
-  if(_tl_upper.length>e){
-    ctx2.setLineDash([6,3]);
-    ctx2.strokeStyle='rgba(242,54,69,0.7)';ctx2.lineWidth=1.2;
-    ctx2.beginPath();var _st=false;
-    for(var _i=s;_i<=e;_i++){var _v=_tl_upper[_i];if(!_v||_v<=0){_st=false;continue;}var _x=toX(_i),_y=toY(_v);if(!_st){ctx2.moveTo(_x,_y);_st=true;}else{ctx2.lineTo(_x,_y);}}
-    ctx2.stroke();
-    ctx2.strokeStyle='rgba(8,153,129,0.7)';ctx2.lineWidth=1.2;
-    ctx2.beginPath();_st=false;
-    for(var _i=s;_i<=e;_i++){var _v=_tl_lower[_i];if(!_v||_v<=0){_st=false;continue;}var _x=toX(_i),_y=toY(_v);if(!_st){ctx2.moveTo(_x,_y);_st=true;}else{ctx2.lineTo(_x,_y);}}
-    ctx2.stroke();
-    ctx2.setLineDash([]);
-    for(var _i=s;_i<=e;_i++){
-      var _up=_tl_upos[_i],_dn=_tl_dnos[_i];
-      var _up0=_i>0?_tl_upos[_i-1]:0,_dn0=_i>0?_tl_dnos[_i-1]:0;
-      var _x=toX(_i);
-      if(_up>_up0){var _y=toY(_cd[_i].l)-10;ctx2.fillStyle='rgba(8,153,129,0.9)';ctx2.fillRect(_x-7,_y-10,14,14);ctx2.fillStyle='#fff';ctx2.font='bold 8px monospace';ctx2.textAlign='center';ctx2.fillText('B',_x,_y);}
-      if(_dn>_dn0){var _y=toY(_cd[_i].h)+20;ctx2.fillStyle='rgba(242,54,69,0.9)';ctx2.fillRect(_x-7,_y-10,14,14);ctx2.fillStyle='#fff';ctx2.font='bold 8px monospace';ctx2.textAlign='center';ctx2.fillText('B',_x,_y);}
-    }
-  }
   // ── Сигналы: только последний виден полностью, остальные — точка + тонкие линии
   var visibleSigs = _sig.filter(function(sg){return sg.entry_i>=s&&sg.entry_i<=e;});
   visibleSigs.forEach(function(sg, si){
