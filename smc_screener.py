@@ -1,5 +1,22 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.23
+- v3.52.23: два пункта по заявке "что ещё можно придумать".
+  (1) Объёмный фильтр подтверждения BOS-пробоя: новые params vol_filter
+  (bool) и vol_mult (0.5-2.5) в PARAM_SPACE. Раньше поле "vol" парсилось из
+  свечи и нигде не использовалось. Теперь, если vol_filter включён, свеча,
+  пробивающая уровень и активирующая OB, должна иметь объём >= vol_mult *
+  SMA(vol,20) (причинная, без lookahead, _vol_sma) — иначе пробой считается
+  слабым и OB не активируется. /chart_data, /sim_candles, /sim_step
+  прокинуты, чтобы объём не терялся в ручном UI-симуляторе.
+  (2) Bootstrap-ресэмплинг вместо точечной оценки PF: _bootstrap_ci(trades,
+  n_resamples=1000, ci=0.80) пересчитывает PF/return на ресэмплах сделок с
+  повторами и даёт доверительный интервал. Подключён в _wf_validate —
+  раньше OOS-гейт пропускал по PF>=1.0 на одном проходе (легко обмануть
+  малой выборкой), теперь требуется нижняя граница 80% ДИ по PF >= 1.0 —
+  заметно строже на 5-15 сделках, не душит при 30+. _simulate получил флаг
+  return_trades (по умолчанию False) — сырой trades[] не таскается в
+  горячем цикле оптимизатора, только когда явно запрошен.
 SMC Optimizer v3.52.22
 - v3.52.22: два фикса по заявке "что улучшит торговлю".
   (1) Комиссия Gate.io (round-trip, ROUNDTRIP_FEE_PCT=0.10%) теперь
@@ -744,7 +761,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.22"
+APP_VERSION  = "3.52.23"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -816,6 +833,8 @@ PARAM_SPACE = {
     "tl_mult":   {"min":0.5,  "max":3.0,  "step":0.1, "type":"float"},
     "tl_method": {"values":["atr","stdev","linreg"],        "type":"cat"},
     "tl_filter": {"values":[False, True],                   "type":"bool"},
+    "vol_filter": {"values":[False, True],                  "type":"bool"},
+    "vol_mult":   {"min":0.5,  "max":2.5,  "step":0.1, "type":"float"},
 }
 
 # ─── Глобальное состояние ───────────────────────────────────────────────────
@@ -1328,6 +1347,41 @@ def _save_gate_cfg():
     except Exception as e:
         olog(f"⚠ Не удалось сохранить gate cfg: {e}")
 
+# v3.52.23: bootstrap-ресэмплинг сделок — одна точечная оценка PF/return на
+# одном проходе истории легко обманывает: конфиг с 8 сделками может выглядеть
+# отлично просто потому что выехал на 2-3 удачных входах. Ресэмплинг с
+# повторами (n_resamples прогонов) даёт доверительный интервал — насколько
+# устойчив результат к перестановке порядка/состава сделок.
+def _bootstrap_ci(trades, n_resamples=1000, ci=0.80):
+    """trades: список dict с ключом 'pnl' (и опц. 'win'). Возвращает dict с
+    медианой и [lo,hi] доверительным интервалом для PF и суммарного pnl,
+    либо None если сделок <5 (бутстрап на таком количестве не информативен)."""
+    n = len(trades)
+    if n < 5:
+        return None
+    pnls = [t["pnl"] for t in trades]
+    pf_samples  = []
+    ret_samples = []
+    for _ in range(n_resamples):
+        sample = [pnls[random.randrange(n)] for _ in range(n)]
+        gp = sum(x for x in sample if x > 0)
+        gl = abs(sum(x for x in sample if x < 0)) or 1e-9
+        pf_samples.append(gp / gl)
+        ret_samples.append(sum(sample))
+    pf_samples.sort(); ret_samples.sort()
+    lo_i = max(0, int((1-ci)/2 * n_resamples))
+    hi_i = min(n_resamples-1, int((1-(1-ci)/2) * n_resamples))
+    mid  = n_resamples // 2
+    return {
+        "pf_median":  round(pf_samples[mid], 3),
+        "pf_lo":      round(pf_samples[lo_i], 3),
+        "pf_hi":      round(pf_samples[hi_i], 3),
+        "ret_median": round(ret_samples[mid], 2),
+        "ret_lo":     round(ret_samples[lo_i], 2),
+        "ret_hi":     round(ret_samples[hi_i], 2),
+        "ci": ci, "n_trades": n, "n_resamples": n_resamples,
+    }
+
 # v3.52.22: реальная walk-forward (OOS) проверка перед тем, как авто-трейд
 # получит право торговать конкретными params. MIN_CYCLES_BEFORE_TRADE ниже
 # проверяет только то, что поиск прошёл достаточно итераций НА ТОМ ЖЕ окне
@@ -1336,6 +1390,10 @@ def _save_gate_cfg():
 # пересекается с тем, что видел оптимизатор) и гоняем те же params на нём
 # через _simulate. Кэш по params — пересчитываем только когда они реально
 # меняются (новый фетч+симуляция на каждой свече был бы лишней нагрузкой).
+# v3.52.23: проходной критерий — НЕ точечный PF>=1.0 (один бросок кости на
+# том, что сколько-то трейдов на OOS-окне набралось), а нижняя граница 80%
+# бутстрап-ДИ по PF >= 1.0 — статистически устойчивое подтверждение, а не
+# "повезло на этом конкретном наборе сделок".
 _wf_cache = {"key": None, "passed": None, "detail": ""}
 
 def _wf_validate(sym, tf, params, risk_pct):
@@ -1361,14 +1419,20 @@ def _wf_validate(sym, tf, params, risk_pct):
         detail = "недостаточно OOS-данных (символ молодой / короткая история)"
         _wf_cache = {"key": key, "passed": None, "detail": detail}
         return None, detail
-    oos_result = _simulate(oos_candles, params, risk_pct=risk_pct)
+    oos_result = _simulate(oos_candles, params, risk_pct=risk_pct, return_trades=True)
     if not oos_result:
         detail = "на OOS-окне <5 сделок — недостаточно для оценки"
         _wf_cache = {"key": key, "passed": None, "detail": detail}
         return None, detail
-    passed = oos_result["profit_factor"] >= 1.0
+    boot = _bootstrap_ci(oos_result["trades_raw"])
+    if boot is None:
+        detail = "на OOS-окне <5 сделок — бутстрап не информативен"
+        _wf_cache = {"key": key, "passed": None, "detail": detail}
+        return None, detail
+    passed = boot["pf_lo"] >= 1.0
     detail = (f"OOS[{train_days}д, смещ.-{oos_offset}дн]: "
-              f"PF={oos_result['profit_factor']} WR={oos_result['winrate']}% "
+              f"PF={oos_result['profit_factor']} (бутстрап {int(boot['ci']*100)}% ДИ: "
+              f"{boot['pf_lo']}-{boot['pf_hi']}) WR={oos_result['winrate']}% "
               f"trades={oos_result['trades']}")
     _wf_cache = {"key": key, "passed": passed, "detail": detail}
     return passed, detail
@@ -1992,6 +2056,19 @@ def _atr(candles, period=14):
         result[i] = s
     return result
 
+def _vol_sma(candles, period=20):
+    """Причинная SMA объёма (только прошлые бары, без lookahead) —
+    для фильтра объёмного подтверждения BOS-пробоя (v3.52.23)."""
+    n = len(candles)
+    result = [None]*n
+    if n < period: return result
+    window_sum = sum(c.get("vol", 0) for c in candles[:period])
+    result[period-1] = window_sum/period
+    for i in range(period, n):
+        window_sum += candles[i].get("vol", 0) - candles[i-period].get("vol", 0)
+        result[i] = window_sum/period
+    return result
+
 def _pivot_high(candles, length):
     """Возвращает массив pivot high цен (None если не пивот)"""
     n = len(candles)
@@ -2016,7 +2093,8 @@ def _pivot_low(candles, length):
 
 # ─── SMC симуляция ──────────────────────────────────────────────────────────
 def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
-              init_deposit=1000.0, _collect=False, fitness_weights=None):
+              init_deposit=1000.0, _collect=False, fitness_weights=None,
+              return_trades=False):
     """
     Симуляция SMC стратегии по параметрам p.
     Возвращает dict с метриками или None если мало данных.
@@ -2045,6 +2123,8 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
     tl_mult       = float(p.get("tl_mult", 1.0))
     tl_method     = p.get("tl_method", "atr")
     tl_filter     = bool(p.get("tl_filter", False))
+    vol_filter    = bool(p.get("vol_filter", False))
+    vol_mult      = float(p.get("vol_mult", 1.0))
 
     n = len(candles)
     min_bars = swing_len*2 + 20
@@ -2057,6 +2137,9 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
         h=candles[i]["high"]; l=candles[i]["low"]; pc=candles[i-1]["close"]
         cum_tr += max(h-l, abs(h-pc), abs(l-pc))
         cum_atr_range.append(cum_tr / i)
+
+    # v3.52.23: причинная SMA объёма для фильтра подтверждения BOS-пробоя
+    vol_ma_arr = _vol_sma(candles, 20) if vol_filter else None
 
     # Пивоты
     ph = _pivot_high(candles, swing_len)
@@ -2216,20 +2299,29 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
                 ob_lo_bar -= 1
 
         # BOS подтверждение → активируем pending OB + запоминаем тип (CHoCH или BOS)
+        # v3.52.23: если vol_filter включён — пробойная свеча (close_i) должна
+        # иметь объём >= vol_mult * SMA(vol,20), иначе пробой без объёма
+        # считается слабым/ложным и OB не активируется (pending сбрасывается).
+        vol_ok = True
+        if vol_filter and vol_ma_arr is not None and vol_ma_arr[i] is not None and vol_ma_arr[i] > 0:
+            vol_ok = c.get("vol", 0) >= vol_mult * vol_ma_arr[i]
+
         if pending_bull_ob is not None and close_i > pending_bull_ob["level"]:
-            last_bull_ob_type = "choch" if sw_trend == -1 else "bos"
-            bull_obs.append({"dir": +1, "hi": pending_bull_ob["hi"], "lo": pending_bull_ob["lo"], "i": pending_bull_ob["i"], "type": last_bull_ob_type})
-            if len(bull_obs) > 10: bull_obs.pop(0)
-            if _collect:
-                coll_bull_obs.append({"hi": pending_bull_ob["hi"], "lo": pending_bull_ob["lo"], "i": pending_bull_ob["i"]})
+            if vol_ok:
+                last_bull_ob_type = "choch" if sw_trend == -1 else "bos"
+                bull_obs.append({"dir": +1, "hi": pending_bull_ob["hi"], "lo": pending_bull_ob["lo"], "i": pending_bull_ob["i"], "type": last_bull_ob_type})
+                if len(bull_obs) > 10: bull_obs.pop(0)
+                if _collect:
+                    coll_bull_obs.append({"hi": pending_bull_ob["hi"], "lo": pending_bull_ob["lo"], "i": pending_bull_ob["i"]})
             pending_bull_ob = None
 
         if pending_bear_ob is not None and close_i < pending_bear_ob["level"]:
-            last_bear_ob_type = "choch" if sw_trend == +1 else "bos"
-            bear_obs.append({"dir": -1, "hi": pending_bear_ob["hi"], "lo": pending_bear_ob["lo"], "i": pending_bear_ob["i"], "type": last_bear_ob_type})
-            if len(bear_obs) > 10: bear_obs.pop(0)
-            if _collect:
-                coll_bear_obs.append({"hi": pending_bear_ob["hi"], "lo": pending_bear_ob["lo"], "i": pending_bear_ob["i"]})
+            if vol_ok:
+                last_bear_ob_type = "choch" if sw_trend == +1 else "bos"
+                bear_obs.append({"dir": -1, "hi": pending_bear_ob["hi"], "lo": pending_bear_ob["lo"], "i": pending_bear_ob["i"], "type": last_bear_ob_type})
+                if len(bear_obs) > 10: bear_obs.pop(0)
+                if _collect:
+                    coll_bear_obs.append({"hi": pending_bear_ob["hi"], "lo": pending_bear_ob["lo"], "i": pending_bear_ob["i"]})
             pending_bear_ob = None
 
         # OB митигация: удаляем пробитые OB
@@ -2491,6 +2583,12 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
         result["tl_lower"] = tl_lower
         result["tl_upos"]  = tl_upos
         result["tl_dnos"]  = tl_dnos
+
+    if return_trades:
+        # v3.52.23: сырой список сделок для бутстрап-ресэмплинга (_bootstrap_ci) —
+        # отдельный флаг, не включён по умолчанию, чтобы не таскать лишние данные
+        # в горячем цикле оптимизатора (тысячи вызовов _simulate на цикл).
+        result["trades_raw"] = trades
 
     return result
 
@@ -5484,12 +5582,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                  "tl_mult": float(qf("tl_mult", 1.0)),
                  "tl_method": qf("tl_method", "atr"),
                  "tl_filter": qb("tl_filter", False),
+                 "vol_filter": qb("vol_filter", False),
+                 "vol_mult": float(qf("vol_mult", 1.0)),
                  "sl_pct": sl_p, "tp_pct": tp_p}
             result = _simulate(candles, p, sl_pct=sl_p, tp_pct=tp_p, _collect=True)
             if not result:
                 self._json({"error": "simulation failed"}); return
             # Slim down candles for transfer
-            slim = [{"t":c["t"],"o":c["open"],"h":c["high"],"l":c["low"],"c":c["close"]} for c in candles]
+            slim = [{"t":c["t"],"o":c["open"],"h":c["high"],"l":c["low"],"c":c["close"],"v":c.get("vol",0)} for c in candles]
             with opt_lock:
                 chart_state = opt_state.get("chart") or {}
             at_sig = chart_state.get("auto_trade_sig") if chart_state.get("sym") == sym else None
@@ -5524,7 +5624,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             candles = _fetch_candles(sym, tf, days)
             if not candles:
                 self._json({"error": "no data"}); return
-            slim = [{"t":c["t"],"o":c["open"],"h":c["high"],"l":c["low"],"c":c["close"]} for c in candles]
+            slim = [{"t":c["t"],"o":c["open"],"h":c["high"],"l":c["low"],"c":c["close"],"v":c.get("vol",0)} for c in candles]
             self._json({"candles": slim, "sym": sym, "tf": tf})
         elif self.path == "/gate_equity":
             if not GATE_KEY or not GATE_SECRET:
@@ -5793,7 +5893,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 p   = body.get("params", {})
                 if not raw or not p:
                     self._json({"error": "candles or params missing"}); return
-                candles = [{"t":c["t"],"open":c["o"],"high":c["h"],"low":c["l"],"close":c["c"]} for c in raw]
+                candles = [{"t":c["t"],"open":c["o"],"high":c["h"],"low":c["l"],"close":c["c"],
+                            "vol":c.get("v",0)} for c in raw]
                 sl_p = float(p.get("sl_pct", 0.8))
                 tp_p = float(p.get("tp_pct", 1.6))
                 result = _simulate(candles, p, sl_pct=sl_p, tp_pct=tp_p, _collect=True)
