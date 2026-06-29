@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.25
+- v3.52.25: фикс — заливка зон TP/SL на графике теперь рисуется для всех
+  сделок, а не только для последней в видимом диапазоне. Ранее isLast (индекс
+  в visibleSigs) сбрасывался при прокрутке влево, и все сделки кроме крайней
+  теряли fillRect. Теперь fillRect + линии общие для всех; у последней
+  дополнительно рисуется entry-линия и метки TP/SL справа.
 SMC Optimizer v3.52.24
 - v3.52.24: добавлены параметры «Макс SL %» и «Макс TP %» (max_sl_pct /
   max_tp_pct) — верхние границы диапазона поиска по аналогии с нижними
@@ -769,7 +775,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.24"
+APP_VERSION  = "3.52.25"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -4999,19 +5005,19 @@ function drawChart(){
     var ye=toY(sg.entry), yt=toY(sg.tp), ys=toY(sg.sl);
     var isLong=sg.dir==='long';
     var clrTP='#26a69a', clrSL='#ef5350';
+    // Зоны — для всех сделок
+    ctx2.fillStyle='rgba(38,166,154,0.07)';
+    ctx2.fillRect(xe,Math.min(yt,ye),Math.max(0,xe2-xe),Math.abs(yt-ye));
+    ctx2.fillStyle='rgba(239,83,80,0.07)';
+    ctx2.fillRect(xe,Math.min(ys,ye),Math.max(0,xe2-xe),Math.abs(ys-ye));
+    // TP / SL линии — для всех сделок
+    ctx2.lineWidth=isLast?1:0.7; ctx2.setLineDash([6,4]);
+    ctx2.strokeStyle=isLast?clrTP:'rgba(38,166,154,0.4)';
+    ctx2.beginPath();ctx2.moveTo(xe,yt);ctx2.lineTo(xe2,yt);ctx2.stroke();
+    ctx2.strokeStyle=isLast?clrSL:'rgba(239,83,80,0.4)';
+    ctx2.beginPath();ctx2.moveTo(xe,ys);ctx2.lineTo(xe2,ys);ctx2.stroke();
     if(isLast){
-      // Зоны — лёгкие
-      ctx2.fillStyle='rgba(38,166,154,0.08)';
-      ctx2.fillRect(xe,Math.min(yt,ye),Math.max(0,xe2-xe),Math.abs(yt-ye));
-      ctx2.fillStyle='rgba(239,83,80,0.08)';
-      ctx2.fillRect(xe,Math.min(ys,ye),Math.max(0,xe2-xe),Math.abs(ys-ye));
-      // TP линия
-      ctx2.strokeStyle=clrTP;ctx2.lineWidth=1;ctx2.setLineDash([6,4]);
-      ctx2.beginPath();ctx2.moveTo(xe,yt);ctx2.lineTo(xe2,yt);ctx2.stroke();
-      // SL линия
-      ctx2.strokeStyle=clrSL;
-      ctx2.beginPath();ctx2.moveTo(xe,ys);ctx2.lineTo(xe2,ys);ctx2.stroke();
-      // Entry линия
+      // Entry линия — только у последней
       ctx2.strokeStyle=entryCol;ctx2.lineWidth=0.8;ctx2.setLineDash([3,5]);
       ctx2.beginPath();ctx2.moveTo(xe,ye);ctx2.lineTo(xe2,ye);ctx2.stroke();
       ctx2.setLineDash([]);
@@ -5020,11 +5026,6 @@ function drawChart(){
       ctx2.fillStyle=clrTP;ctx2.textAlign='right';ctx2.fillText('TP '+fmt(sg.tp),xe2-3,yt-3);
       ctx2.fillStyle=clrSL;ctx2.textAlign='right';ctx2.fillText('SL '+fmt(sg.sl),xe2-3,ys+10);
     } else {
-      // Старые сигналы — только тонкие TP/SL линии без заливки
-      ctx2.strokeStyle='rgba(38,166,154,0.25)';ctx2.lineWidth=0.8;ctx2.setLineDash([4,4]);
-      ctx2.beginPath();ctx2.moveTo(xe,yt);ctx2.lineTo(xe2,yt);ctx2.stroke();
-      ctx2.strokeStyle='rgba(239,83,80,0.25)';
-      ctx2.beginPath();ctx2.moveTo(xe,ys);ctx2.lineTo(xe2,ys);ctx2.stroke();
       ctx2.setLineDash([]);
     }
     // Точка выхода + метка PnL
