@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.28
+- v3.52.28: убраны OB и FVG блоки с графика — мешали читать сделки.
+  Заливка зон TP/SL сделок возвращена к оригинальным цветам (зелёный/красный).
+  На графике теперь только свечи + сигналы сделок + трендлинии.
 SMC Optimizer v3.52.27
 - v3.52.27: убрана заливка зон TP/SL сделок на графике — при большом числе
   сигналов (57+) overlapping заливки создавали визуальную кашу и сливались
@@ -787,7 +791,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.27"
+APP_VERSION  = "3.52.28"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -4950,34 +4954,6 @@ function drawChart(){
     ctx2.fillStyle=axisCol;ctx2.font='9px monospace';ctx2.textAlign='right';
     ctx2.fillText(fmt(p),PAD.l-4,y+3);
   }
-  // ── FVG — очень прозрачно, только штрих по левому краю ──────────────────
-  _fvg_bull.filter(function(f){return f.end_i>=s&&f.i<=e;}).forEach(function(f){
-    var x1=toX(Math.max(f.i,s))-barW/2, x2=toX(Math.min(f.end_i,e))+barW/2;
-    var y1=toY(f.hi),y2=toY(f.lo);
-    ctx2.fillStyle='rgba(8,153,129,0.06)';ctx2.fillRect(x1,y1,x2-x1,y2-y1);
-    ctx2.fillStyle='rgba(8,153,129,0.5)';ctx2.fillRect(x1,y1,2,y2-y1);
-  });
-  _fvg_bear.filter(function(f){return f.end_i>=s&&f.i<=e;}).forEach(function(f){
-    var x1=toX(Math.max(f.i,s))-barW/2, x2=toX(Math.min(f.end_i,e))+barW/2;
-    var y1=toY(f.hi),y2=toY(f.lo);
-    ctx2.fillStyle='rgba(242,54,69,0.06)';ctx2.fillRect(x1,y1,x2-x1,y2-y1);
-    ctx2.fillStyle='rgba(242,54,69,0.5)';ctx2.fillRect(x1,y1,2,y2-y1);
-  });
-  // ── OB — тонкая рамка без заливки, метка только если широко ─────────────
-  _obs_bull.filter(function(o){return o.end_i>=s&&o.i<=e;}).forEach(function(o){
-    var x1=toX(Math.max(o.i,s))-barW/2, x2=toX(Math.min(o.end_i,e))+barW/2;
-    var y1=toY(o.hi),y2=toY(o.lo);
-    ctx2.fillStyle='rgba(49,121,245,0.07)';ctx2.fillRect(x1,y1,x2-x1,y2-y1);
-    ctx2.strokeStyle='rgba(49,121,245,0.35)';ctx2.lineWidth=0.8;ctx2.strokeRect(x1,y1,x2-x1,y2-y1);
-    if(x2-x1>30){ctx2.fillStyle='rgba(49,121,245,0.45)';ctx2.font='8px monospace';ctx2.textAlign='left';ctx2.fillText('OB',x1+3,y1+8);}
-  });
-  _obs_bear.filter(function(o){return o.end_i>=s&&o.i<=e;}).forEach(function(o){
-    var x1=toX(Math.max(o.i,s))-barW/2, x2=toX(Math.min(o.end_i,e))+barW/2;
-    var y1=toY(o.hi),y2=toY(o.lo);
-    ctx2.fillStyle='rgba(242,54,69,0.07)';ctx2.fillRect(x1,y1,x2-x1,y2-y1);
-    ctx2.strokeStyle='rgba(242,54,69,0.35)';ctx2.lineWidth=0.8;ctx2.strokeRect(x1,y1,x2-x1,y2-y1);
-    if(x2-x1>30){ctx2.fillStyle='rgba(242,54,69,0.45)';ctx2.font='8px monospace';ctx2.textAlign='left';ctx2.fillText('OB',x1+3,y1+8);}
-  });
   // ── Свечи ────────────────────────────────────────────────────────────────
   vis.forEach(function(c,idx){
     var xi=s+idx,x=toX(xi),bull=c.c>=c.o;
@@ -5017,7 +4993,12 @@ function drawChart(){
     var ye=toY(sg.entry), yt=toY(sg.tp), ys=toY(sg.sl);
     var isLong=sg.dir==='long';
     var clrTP='#26a69a', clrSL='#ef5350';
-    // Зоны без заливки — только штриховые линии TP/SL
+    // Зоны — для всех сделок
+    ctx2.fillStyle='rgba(38,166,154,0.08)';
+    ctx2.fillRect(xe,Math.min(yt,ye),Math.max(0,xe2-xe),Math.abs(yt-ye));
+    ctx2.fillStyle='rgba(239,83,80,0.08)';
+    ctx2.fillRect(xe,Math.min(ys,ye),Math.max(0,xe2-xe),Math.abs(ys-ye));
+    // TP / SL линии — для всех сделок
     ctx2.lineWidth=isLast?1:0.6; ctx2.setLineDash([6,4]);
     ctx2.strokeStyle=isLast?clrTP:'rgba(38,166,154,0.45)';
     ctx2.beginPath();ctx2.moveTo(xe,yt);ctx2.lineTo(xe2,yt);ctx2.stroke();
