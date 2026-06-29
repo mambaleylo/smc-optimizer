@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.27
+- v3.52.27: убрана заливка зон TP/SL сделок на графике — при большом числе
+  сигналов (57+) overlapping заливки создавали визуальную кашу и сливались
+  с OB/FVG блоками. Теперь сделки обозначены только штриховыми линиями
+  (зелёная TP, красная SL) — привычные цвета, не перекрывают фон.
 SMC Optimizer v3.52.26
 - v3.52.26: зоны TP/SL сделок на графике перекрашены в жёлтый (#f5c842) и
   фиолетовый (#a78bfa) — раньше они были зелёными/красными как OB/FVG и
@@ -782,7 +787,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.26"
+APP_VERSION  = "3.52.27"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -5011,18 +5016,12 @@ function drawChart(){
     var xe2=(sg.exit_i!==undefined&&sg.exit_i<=e)?toX(sg.exit_i):W-PAD.r;
     var ye=toY(sg.entry), yt=toY(sg.tp), ys=toY(sg.sl);
     var isLong=sg.dir==='long';
-    // Цвета сделок — жёлтый (TP) и фиолетовый (SL), не пересекаются с OB/FVG
-    var clrTP='#f5c842', clrSL='#a78bfa';
-    // Зоны — для всех сделок
-    ctx2.fillStyle='rgba(245,200,66,0.09)';
-    ctx2.fillRect(xe,Math.min(yt,ye),Math.max(0,xe2-xe),Math.abs(yt-ye));
-    ctx2.fillStyle='rgba(167,139,250,0.09)';
-    ctx2.fillRect(xe,Math.min(ys,ye),Math.max(0,xe2-xe),Math.abs(ys-ye));
-    // TP / SL линии — для всех сделок
-    ctx2.lineWidth=isLast?1:0.7; ctx2.setLineDash([6,4]);
-    ctx2.strokeStyle=isLast?clrTP:'rgba(245,200,66,0.45)';
+    var clrTP='#26a69a', clrSL='#ef5350';
+    // Зоны без заливки — только штриховые линии TP/SL
+    ctx2.lineWidth=isLast?1:0.6; ctx2.setLineDash([6,4]);
+    ctx2.strokeStyle=isLast?clrTP:'rgba(38,166,154,0.45)';
     ctx2.beginPath();ctx2.moveTo(xe,yt);ctx2.lineTo(xe2,yt);ctx2.stroke();
-    ctx2.strokeStyle=isLast?clrSL:'rgba(167,139,250,0.45)';
+    ctx2.strokeStyle=isLast?clrSL:'rgba(239,83,80,0.45)';
     ctx2.beginPath();ctx2.moveTo(xe,ys);ctx2.lineTo(xe2,ys);ctx2.stroke();
     if(isLast){
       // Entry линия — только у последней
