@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.24
+- v3.52.24: добавлены параметры «Макс SL %» и «Макс TP %» (max_sl_pct /
+  max_tp_pct) — верхние границы диапазона поиска по аналогии с нижними
+  (sl_pct / tp_pct). Передаются в /scan_start и /scan_all, сохраняются в
+  opt_state/screener_state. В run_optimizer и run_screener применяются как
+  PARAM_SPACE["sl_pct"]["max"] и PARAM_SPACE["tp_pct"]["max"] перед запуском
+  Basin Hopping — оптимизатор не выйдет за указанный потолок. UI: два новых
+  инпута «Макс SL %» / «Макс TP %» рядом с существующими минимумами.
 SMC Optimizer v3.52.23
 - v3.52.23: два пункта по заявке "что ещё можно придумать".
   (1) Объёмный фильтр подтверждения BOS-пробоя: новые params vol_filter
@@ -761,7 +769,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.23"
+APP_VERSION  = "3.52.24"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -3111,6 +3119,8 @@ def run_optimizer():
     days  = int(opt_state["days"])
     sl_p  = float(opt_state["sl_pct"])
     tp_p  = float(opt_state["tp_pct"])
+    max_sl_p = float(opt_state.get("max_sl_pct", 2.0))
+    max_tp_p = float(opt_state.get("max_tp_pct", 4.0))
     risk  = float(opt_state["risk_pct"])
     offset_days = int(opt_state.get("offset_days", 0))
 
@@ -3133,11 +3143,9 @@ def run_optimizer():
     # v3.50.2: SL/TP из UI — минимальные границы оптимизатора
     PARAM_SPACE["sl_pct"]["min"] = sl_p
     PARAM_SPACE["tp_pct"]["min"] = tp_p
-    # max не должен быть меньше min
-    if PARAM_SPACE["sl_pct"]["max"] < sl_p:
-        PARAM_SPACE["sl_pct"]["max"] = sl_p
-    if PARAM_SPACE["tp_pct"]["max"] < tp_p:
-        PARAM_SPACE["tp_pct"]["max"] = tp_p
+    # v3.52.24: максимальные границы из UI (max_sl_pct / max_tp_pct)
+    PARAM_SPACE["sl_pct"]["max"] = max(sl_p, max_sl_p)
+    PARAM_SPACE["tp_pct"]["max"] = max(tp_p, max_tp_p)
 
     best_params  = _random_params()
     best_params["sl_pct"] = sl_p; best_params["tp_pct"] = tp_p
@@ -3397,14 +3405,15 @@ def run_optimizer():
     olog("⏹ Остановлено")
     with opt_lock: opt_state["running"] = False
 
-def _run_one_sym_screener(sym, tf, days, sl_p, tp_p, risk, max_cycles=100, on_cycle=None):
+def _run_one_sym_screener(sym, tf, days, sl_p, tp_p, risk, max_sl_p=2.0, max_tp_p=4.0, max_cycles=100, on_cycle=None):
     candles = _fetch_candles(sym, tf, days, _stop_event=_screener_stop)
     if not candles or len(candles) < 100: return None
     # v3.50.2: sl_p/tp_p — минимальные границы
     PARAM_SPACE["sl_pct"]["min"] = sl_p
     PARAM_SPACE["tp_pct"]["min"] = tp_p
-    if PARAM_SPACE["sl_pct"]["max"] < sl_p: PARAM_SPACE["sl_pct"]["max"] = sl_p
-    if PARAM_SPACE["tp_pct"]["max"] < tp_p: PARAM_SPACE["tp_pct"]["max"] = tp_p
+    # v3.52.24: максимальные границы из UI
+    PARAM_SPACE["sl_pct"]["max"] = max(sl_p, max_sl_p)
+    PARAM_SPACE["tp_pct"]["max"] = max(tp_p, max_tp_p)
     best_params = _random_params()
     best_params["sl_pct"] = sl_p; best_params["tp_pct"] = tp_p
     best_result = _simulate(candles, best_params, sl_pct=sl_p, tp_pct=tp_p, risk_pct=risk)
@@ -3449,9 +3458,9 @@ def _worker_simulate(p, fw=None):
 
 def _screener_worker(args):
     """Воркер для ProcessPoolExecutor — обрабатывает одну монету."""
-    sym, tf, days, sl_p, tp_p, risk = args
+    sym, tf, days, sl_p, tp_p, risk, max_sl_p, max_tp_p = args
     try:
-        return _run_one_sym_screener(sym, tf, days, sl_p, tp_p, risk)
+        return _run_one_sym_screener(sym, tf, days, sl_p, tp_p, risk, max_sl_p=max_sl_p, max_tp_p=max_tp_p)
     except Exception:
         return None
 
@@ -3461,6 +3470,8 @@ def run_screener():
     days = screener_state["days"]
     sl_p = screener_state["sl_pct"]
     tp_p = screener_state["tp_pct"]
+    max_sl_p = float(screener_state.get("max_sl_pct", 2.0))
+    max_tp_p = float(screener_state.get("max_tp_pct", 4.0))
     risk = screener_state["risk_pct"]
     with screener_lock:
         screener_state.update({"results":[],"done":False,"sym_index":0,"sym_total":0,"current_sym":"","active_workers":{},"sym_list":[]})
@@ -3489,7 +3500,7 @@ def run_screener():
                 screener_state["active_workers"] = {sym: {"cycle": c, "max_cycles": mx, "phase": "opt"}}
 
         try:
-            res = _run_one_sym_screener(sym, tf, days, sl_p, tp_p, risk, on_cycle=_on_cycle)
+            res = _run_one_sym_screener(sym, tf, days, sl_p, tp_p, risk, max_sl_p=max_sl_p, max_tp_p=max_tp_p, on_cycle=_on_cycle)
         except Exception:
             res = None
 
@@ -3726,8 +3737,10 @@ input:focus,select:focus{outline:none;border-color:var(--accent)}
     </select>
     <label>Дней истории</label><input id="days" type="number" value="30" min="7" max="365">
     <label title="Смещение окна в прошлое: 0 = последние N дней, 30 = N дней заканчивающихся 30 дней назад. Используй для OOS: обучи на [now-60д..now-30д] поставив Дней=30 Смещение=30, затем проверь в Симуляции на [now-30д..now].">Смещение (дней назад)</label><input id="offset_days" type="number" value="0" min="0" max="365" title="0 = последние N дней. N = окно заканчивается N дней назад.">
-    <label>SL %</label><input id="sl_pct" type="number" value="0.6" step="0.05">
-    <label>TP %</label><input id="tp_pct" type="number" value="1.0" step="0.05">
+    <label>SL % (мин)</label><input id="sl_pct" type="number" value="0.6" step="0.05">
+    <label>SL % (макс)</label><input id="max_sl_pct" type="number" value="2.0" step="0.05">
+    <label>TP % (мин)</label><input id="tp_pct" type="number" value="1.0" step="0.05">
+    <label>TP % (макс)</label><input id="max_tp_pct" type="number" value="4.0" step="0.05">
     <label>Риск на сделку %</label><input id="risk_pct" type="number" value="10" step="1">
   </div>
   <div class="card">
@@ -4621,6 +4634,8 @@ function startOpt(){
     days:parseInt(document.getElementById('days').value),
     sl_pct:parseFloat(document.getElementById('sl_pct').value),
     tp_pct:parseFloat(document.getElementById('tp_pct').value),
+    max_sl_pct:parseFloat(document.getElementById('max_sl_pct').value),
+    max_tp_pct:parseFloat(document.getElementById('max_tp_pct').value),
     risk_pct:parseFloat(document.getElementById('risk_pct').value),
     offset_days:parseInt(document.getElementById('offset_days').value)||0,
   };
@@ -5186,6 +5201,8 @@ startOpt=function(){
       days:parseInt(document.getElementById('days').value),
       sl_pct:parseFloat(document.getElementById('sl_pct').value),
       tp_pct:parseFloat(document.getElementById('tp_pct').value),
+      max_sl_pct:parseFloat(document.getElementById('max_sl_pct').value),
+      max_tp_pct:parseFloat(document.getElementById('max_tp_pct').value),
       risk_pct:parseFloat(document.getElementById('risk_pct').value)};
     document.getElementById('btnStart').style.display='none';
     document.getElementById('btnStop').style.display='';
@@ -5689,6 +5706,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "days":   body.get("days",30),
                     "sl_pct": body.get("sl_pct",0.6),
                     "tp_pct": body.get("tp_pct",1.0),
+                    "max_sl_pct": body.get("max_sl_pct",2.0),
+                    "max_tp_pct": body.get("max_tp_pct",4.0),
                     "risk_pct": body.get("risk_pct",10.0),
                     "offset_days": int(body.get("offset_days", 0)),
                 })
@@ -5713,6 +5732,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         "days":int(body.get("days",30)),
                         "sl_pct":float(body.get("sl_pct",0.6)),
                         "tp_pct":float(body.get("tp_pct",1.0)),
+                        "max_sl_pct":float(body.get("max_sl_pct",2.0)),
+                        "max_tp_pct":float(body.get("max_tp_pct",4.0)),
                         "risk_pct":float(body.get("risk_pct",10.0)),
                         "current_sym":"",
                     })
