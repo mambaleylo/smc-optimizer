@@ -1,5 +1,28 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.35
+- v3.52.35: добавлен SuperTrend как опциональный режимный фильтр входов
+  (по присланному Pine v4 скрипту KivancOzbilgic, 1:1 порт логики: hl2 src,
+  ATR(period) через ту же причинную RMA, что и существующая _atr(), полосы
+  up/dn с nz()-преемственностью, переключение trend по close[1] vs up1/dn1).
+  Новая функция _supertrend(candles, period, multiplier) — без lookahead,
+  бар за баром. Параметры в PARAM_SPACE: st_filter (bool, по умолчанию
+  выкл — обратная совместимость), st_period (7-21), st_mult (1.5-5.0) —
+  оптимизатор перебирает их наравне с остальными (генерик-функции
+  _random_params/_shake уже работают по PARAM_SPACE.keys(), правок не
+  потребовалось). При st_filter=True вход в long разрешён только если
+  SuperTrend в восходящем тренде на баре сигнала, short — только в
+  нисходящем; комбинируется с уже существующими choch_only/tl_filter/
+  vol_filter через and (все фильтры сужают, ни один не расширяет).
+  Проброшено по всей цепочке symbol+tf-приложения лучшего конфига к
+  графику: _chartExtra defaults, applyBestToChart, query string
+  /chart_data, серверный парсинг qb/qf, карточка результата (новая
+  строка "ST фильтр: вкл (period/mult)" рядом с "TL фильтр").
+  Протестировано: synthetic up/down-тренд (_supertrend даёt trend==1 в
+  100% случаев на восходящем участке, trend==-1 в 100% на нисходящем,
+  ровно 1 переключение на стыке); 10 случайных seed-прогонов _simulate
+  с st_filter on/off — фильтр ни разу не увеличил число сделок (строго
+  отсекающий, как и задумано).
 SMC Optimizer v3.52.34
 - v3.52.34: аудит и фиксы найденных багов.
   1) Тёплый старт (v3.52.32): если PARAM_SPACE получал новый параметр ПОСЛЕ
@@ -846,7 +869,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.34"
+APP_VERSION  = "3.52.35"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -921,6 +944,9 @@ PARAM_SPACE = {
     "tl_filter": {"values":[False, True],                   "type":"bool"},
     "vol_filter": {"values":[False, True],                  "type":"bool"},
     "vol_mult":   {"min":0.5,  "max":2.5,  "step":0.1, "type":"float"},
+    "st_filter":  {"values":[False, True],                  "type":"bool"},
+    "st_period":  {"min":7,    "max":21,   "step":1,   "type":"int"},
+    "st_mult":    {"min":1.5,  "max":5.0,  "step":0.1, "type":"float"},
 }
 
 # ─── Глобальное состояние ───────────────────────────────────────────────────
@@ -2142,6 +2168,48 @@ def _atr(candles, period=14):
         result[i] = s
     return result
 
+def _supertrend(candles, period=10, multiplier=3.0):
+    """Порт TradingView Supertrend (Pine v4, KivancOzbilgic) — причинный расчёт,
+    без lookahead, бар за баром, как в оригинале. v3.52.35.
+    Возвращает массив trend[i] ∈ {1,-1,None} — направление тренда на каждом баре
+    (None, пока недостаточно данных для ATR — первые `period` баров).
+    src = hl2 (как в оригинальном скрипте, src=input(hl2)).
+    atr = RMA(TR, period) — то же сглаживание, что Pine ta.atr()/atr(), совпадает
+    с уже имеющейся в файле _atr() (Wilder's RMA), поэтому переиспользуем её.
+    """
+    n = len(candles)
+    atr_arr = _atr(candles, period)
+    trend = [None]*n
+    up_band = [None]*n   # "up" в Pine
+    dn_band = [None]*n   # "dn" в Pine
+    cur_trend = 1
+    for i in range(n):
+        a = atr_arr[i]
+        if a is None:
+            continue
+        c = candles[i]
+        src = (c["high"] + c["low"]) / 2.0  # hl2
+        up = src - multiplier * a
+        dn = src + multiplier * a
+        # nz(up[1], up) / nz(dn[1], dn) — берём предыдущее значение полосы,
+        # если оно уже считалось, иначе текущее (как в Pine при первом баре)
+        prev_up = up_band[i-1] if (i > 0 and up_band[i-1] is not None) else up
+        prev_dn = dn_band[i-1] if (i > 0 and dn_band[i-1] is not None) else dn
+        prev_close = candles[i-1]["close"] if i > 0 else c["close"]
+        # up := close[1] > up1 ? max(up, up1) : up
+        up = max(up, prev_up) if prev_close > prev_up else up
+        # dn := close[1] < dn1 ? min(dn, dn1) : dn
+        dn = min(dn, prev_dn) if prev_close < prev_dn else dn
+        up_band[i] = up
+        dn_band[i] = dn
+        # trend := trend==-1 and close>dn1 ? 1 : trend==1 and close<up1 ? -1 : trend
+        if cur_trend == -1 and c["close"] > prev_dn:
+            cur_trend = 1
+        elif cur_trend == 1 and c["close"] < prev_up:
+            cur_trend = -1
+        trend[i] = cur_trend
+    return trend
+
 def _vol_sma(candles, period=20):
     """Причинная SMA объёма (только прошлые бары, без lookahead) —
     для фильтра объёмного подтверждения BOS-пробоя (v3.52.23)."""
@@ -2211,6 +2279,9 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
     tl_filter     = bool(p.get("tl_filter", False))
     vol_filter    = bool(p.get("vol_filter", False))
     vol_mult      = float(p.get("vol_mult", 1.0))
+    st_filter     = bool(p.get("st_filter", False))
+    st_period     = int(p.get("st_period", 10))
+    st_mult       = float(p.get("st_mult", 3.0))
 
     n = len(candles)
     min_bars = swing_len*2 + 20
@@ -2226,6 +2297,8 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
 
     # v3.52.23: причинная SMA объёма для фильтра подтверждения BOS-пробоя
     vol_ma_arr = _vol_sma(candles, 20) if vol_filter else None
+    # v3.52.35: SuperTrend-фильтр — считаем один раз на весь массив свечей
+    st_arr = _supertrend(candles, st_period, st_mult) if st_filter else None
 
     # Пивоты
     ph = _pivot_high(candles, swing_len)
@@ -2505,6 +2578,15 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
         tl_bull_ok = (not tl_filter) or (tl_upos[i] == 1)
         tl_bear_ok = (not tl_filter) or (tl_dnos[i] == 1)
 
+        # ── SuperTrend filter (опционально, см. st_filter в PARAM_SPACE) ───────
+        # При st_filter=True бычий вход разрешён только если SuperTrend на
+        # этом баре в восходящем тренде (trend==1), медвежий — только при
+        # нисходящем (trend==-1). Это классический режимный фильтр: торгуем
+        # только OB-сигналы, согласованные с направлением SuperTrend, отсекая
+        # контр-трендовые входы. При st_filter=False фильтр не действует.
+        st_bull_ok = (not st_filter) or (st_arr is not None and st_arr[i] == 1)
+        st_bear_ok = (not st_filter) or (st_arr is not None and st_arr[i] == -1)
+
         # Бычий сигнал: цена возвращается в бычий OB
         # choch_only=False: торгуем и BOS и CHoCH OBs
         # choch_only=True: торгуем только OB которые были активированы через CHoCH
@@ -2514,7 +2596,7 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
                 trend_ok = (ob.get("type") == "choch")
             else:
                 trend_ok = True
-            if in_ob and trend_ok and tl_bull_ok:
+            if in_ob and trend_ok and tl_bull_ok and st_bull_ok:
                 fvg_ok = True
                 if req_fvg and fvg_enabled:
                     fvg_ok = any(f[0] > ob["i"] and f[0] <= i and
@@ -2532,7 +2614,7 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
                     trend_ok = (ob.get("type") == "choch")
                 else:
                     trend_ok = True
-                if in_ob and trend_ok and tl_bear_ok:
+                if in_ob and trend_ok and tl_bear_ok and st_bear_ok:
                     fvg_ok = True
                     if req_fvg and fvg_enabled:
                         fvg_ok = any(f[0] > ob["i"] and f[0] <= i and
@@ -4102,7 +4184,8 @@ var _bestParams = null;
 var _autoAppliedAt30 = false;
 var _chartExtra = {internal_len:5, ob_filter:'atr', ob_mitigation:'highlow',
   fvg_enabled:true, fvg_threshold:0.1, choch_only:false, use_internal:true,
-  min_ob_size:1.0, require_fvg_confirm:false, tl_mult:1.0, tl_method:'atr', tl_filter:false};
+  min_ob_size:1.0, require_fvg_confirm:false, tl_mult:1.0, tl_method:'atr', tl_filter:false,
+  st_filter:false, st_period:10, st_mult:3.0};
 var TF_SEC = {"1m":60,"5m":300,"15m":900,"30m":1800,"1h":3600,"4h":14400,"1d":86400};
 var _chartAutoTimer = null;
 var _monitorActive = false;
@@ -4404,6 +4487,9 @@ function applyBestToChart(){
   tl_mult:    p.tl_mult   != null ? p.tl_mult   : 1.0,
   tl_method:  p.tl_method != null ? p.tl_method : 'atr',
   tl_filter:  p.tl_filter != null ? p.tl_filter : false,
+  st_filter:  p.st_filter != null ? p.st_filter : false,
+  st_period:  p.st_period != null ? p.st_period : 10,
+  st_mult:    p.st_mult   != null ? p.st_mult   : 3.0,
   };
   // Применяем конфиг к графику без переключения вкладки
   setTimeout(function(){ loadChart(); }, 80);
@@ -4947,7 +5033,8 @@ function poll(){
         '<div class="stat-row"><span class="stat-label">OB mitigation</span><span class="stat-val">'+p.ob_mitigation+'</span></div>'+
         '<div class="stat-row"><span class="stat-label">FVG</span><span class="stat-val">'+(p.fvg_enabled?'вкл':'выкл')+'</span></div>'+
         '<div class="stat-row"><span class="stat-label">CHoCH only</span><span class="stat-val">'+(p.choch_only?'да':'нет')+'</span></div>'+
-        '<div class="stat-row"><span class="stat-label">TL фильтр</span><span class="stat-val">'+(p.tl_filter?'вкл':'выкл')+'</span></div>';
+        '<div class="stat-row"><span class="stat-label">TL фильтр</span><span class="stat-val">'+(p.tl_filter?'вкл':'выкл')+'</span></div>'+
+        '<div class="stat-row"><span class="stat-label">ST фильтр</span><span class="stat-val">'+(p.st_filter?('вкл ('+p.st_period+'/'+p.st_mult+')'):'выкл')+'</span></div>';
     }
 
     var top=(d.top20||[]);
@@ -5028,7 +5115,8 @@ function loadChart(auto){
     +'&fvg_enabled='+ex.fvg_enabled+'&fvg_threshold='+ex.fvg_threshold+'&choch_only='+ex.choch_only
     +'&use_internal='+ex.use_internal+'&min_ob_size='+ex.min_ob_size
     +'&require_fvg_confirm='+ex.require_fvg_confirm+'&tl_mult='+ex.tl_mult+'&tl_method='+ex.tl_method
-    +'&tl_filter='+ex.tl_filter;
+    +'&tl_filter='+ex.tl_filter
+    +'&st_filter='+ex.st_filter+'&st_period='+ex.st_period+'&st_mult='+ex.st_mult;
   fetch(url)
     .then(function(r){return r.json();}).then(function(d){
       if(d.error){cStatus('Ошибка: '+d.error);return;}
@@ -5754,6 +5842,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                  "tl_filter": qb("tl_filter", False),
                  "vol_filter": qb("vol_filter", False),
                  "vol_mult": float(qf("vol_mult", 1.0)),
+                 "st_filter": qb("st_filter", False),
+                 "st_period": int(float(qf("st_period", 10))),
+                 "st_mult": float(qf("st_mult", 3.0)),
                  "sl_pct": sl_p, "tp_pct": tp_p}
             result = _simulate(candles, p, sl_pct=sl_p, tp_pct=tp_p, _collect=True)
             if not result:
