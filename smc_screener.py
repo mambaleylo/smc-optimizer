@@ -1,5 +1,28 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.34
+- v3.52.34: аудит и фиксы найденных багов.
+  1) Тёплый старт (v3.52.32): если PARAM_SPACE получал новый параметр ПОСЛЕ
+     сохранения конфига, старый _sp не содержал ключ → _simulate() падал
+     KeyError (прямая индексация p["key"]). Фикс: дозаполняем отсутствующие
+     ключи случайным значением перед стартом (и в одиночном оптимизаторе,
+     и в скринере). Также добавлена валидация cat/bool значений — если
+     будущая версия сузит список values, невалидное старое значение
+     заменяется случайным вместо использования напрямую.
+  2) _save_best_config: result=None или не-dict больше не ловится только
+     try/except — теперь явная защита в начале функции.
+  3) ~/.smc_best_configs.json рос бесконечно (скринер проходит сотни монет
+     без чистки) — добавлена обрезка записей старше 30 дней при каждой записи.
+  4) График: после удаления отрисовки трендлиний (v3.52.29) их данные
+     (_tl_upper/_tl_lower) всё ещё участвовали в автомасштабе Y-оси —
+     невидимые точки растягивали диапазон цены, сжимая свечи визуально.
+     Убрано из autoscale.
+  5) Легенда главного графика показывала «Bull OB / Bear OB / FVG Bull /
+     FVG Bear», хотя эти блоки убраны с графика ещё в v3.52.30 — легенда
+     врала. Убраны неактуальные пункты (легенда вкладки «Симуляция» не
+     трогалась — там OB рисуется отдельной функцией simDrawCanvas).
+  6) Мёртвая переменная isLong в отрисовке зон сделок (осталась после
+     рефакторинга v3.52.25-27, больше не используется) — убрана.
 SMC Optimizer v3.52.33
 - v3.52.33: кнопка «Сбросить сохранённый конфиг» в панели «Параметры запуска» —
   удаляет лучший сохранённый params для текущего symbol+tf из
@@ -823,7 +846,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.33"
+APP_VERSION  = "3.52.34"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -2871,9 +2894,11 @@ def _load_best_config_for(symbol, tf):
 def _save_best_config(symbol, tf, params, result):
     """Сохраняет params+result, если они лучше уже сохранённых для этого symbol+tf
     (сравнение по fitness). Атомарная запись через .tmp + os.replace()."""
+    if not result or not isinstance(result, dict):
+        return
     try:
         key = _best_cfg_key(symbol, tf)
-        new_fit = float(result.get("fitness", 0.0)) if result else 0.0
+        new_fit = float(result.get("fitness", 0.0))
         with _best_cfg_lock:
             data = _load_best_configs()
             old = data.get(key)
@@ -2887,6 +2912,11 @@ def _save_best_config(symbol, tf, params, result):
                              "profit_factor", "max_dd", "rr") if k in result},
                 "ts": time.time(),
             }
+            # v3.52.34: скринер прогоняет сотни монет — без чистки файл растёт
+            # бесконечно. Чистим записи старше 30 дней при каждой записи.
+            _cutoff = time.time() - 30*86400
+            data = {k: v for k, v in data.items()
+                    if k == key or (isinstance(v, dict) and v.get("ts", 0) >= _cutoff)}
             tmp = BEST_CFG_PATH + ".tmp"
             with open(tmp, "w") as f:
                 json.dump(data, f, indent=1)
@@ -3265,11 +3295,23 @@ def run_optimizer():
     _saved_cfg = _load_best_config_for(sym, tf)
     if _saved_cfg and isinstance(_saved_cfg.get("params"), dict):
         _sp = dict(_saved_cfg["params"])
+        # v3.52.34: если в PARAM_SPACE появились новые ключи ПОСЛЕ того, как
+        # этот конфиг был сохранён (новая версия добавила параметр стратегии),
+        # старый _sp их не содержит — _simulate() делает p["key"] напрямую и
+        # упадёт KeyError. Дозаполняем недостающие ключи случайным значением.
+        for _k, _spec in PARAM_SPACE.items():
+            if _k not in _sp:
+                _sp[_k] = _random_params()[_k]
         _sp["sl_pct"] = sl_p; _sp["tp_pct"] = tp_p
         # клампим в текущие границы PARAM_SPACE (могли поменяться max_sl/max_tp)
+        # + проверяем, что cat/bool значения всё ещё допустимы (на случай если
+        # будущая версия сузила список values)
         for _k, _spec in PARAM_SPACE.items():
-            if _k in _sp and _spec["type"] in ("float","int"):
+            if _k not in _sp: continue
+            if _spec["type"] in ("float","int"):
                 _sp[_k] = max(_spec["min"], min(_spec["max"], _sp[_k]))
+            elif _spec["type"] in ("cat","bool") and _sp[_k] not in _spec["values"]:
+                _sp[_k] = random.choice(_spec["values"])
         _saved_fit = _saved_cfg.get("result",{}).get("fitness","?")
         olog(f"♻ Найден сохранённый конфиг для {sym} {tf} (fitness={_saved_fit}) — стартуем от него")
         best_params = _sp
@@ -3547,10 +3589,18 @@ def _run_one_sym_screener(sym, tf, days, sl_p, tp_p, risk, max_sl_p=2.0, max_tp_
     _saved_cfg = _load_best_config_for(sym, tf)
     if _saved_cfg and isinstance(_saved_cfg.get("params"), dict):
         _sp = dict(_saved_cfg["params"])
+        # v3.52.34: дозаполняем ключи, появившиеся в PARAM_SPACE после
+        # сохранения этого конфига — иначе _simulate() упадёт KeyError
+        for _k, _spec in PARAM_SPACE.items():
+            if _k not in _sp:
+                _sp[_k] = _random_params()[_k]
         _sp["sl_pct"] = sl_p; _sp["tp_pct"] = tp_p
         for _k, _spec in PARAM_SPACE.items():
-            if _k in _sp and _spec["type"] in ("float","int"):
+            if _k not in _sp: continue
+            if _spec["type"] in ("float","int"):
                 _sp[_k] = max(_spec["min"], min(_spec["max"], _sp[_k]))
+            elif _spec["type"] in ("cat","bool") and _sp[_k] not in _spec["values"]:
+                _sp[_k] = random.choice(_spec["values"])
         best_params = _sp
     best_result = _simulate(candles, best_params, sl_pct=sl_p, tp_pct=tp_p, risk_pct=risk)
     best_fit    = best_result["fitness"] if best_result else 0.0
@@ -4005,10 +4055,6 @@ input:focus,select:focus{outline:none;border-color:var(--accent)}
   <div class="chart-legend">
     <span><i style="background:#089981"></i>Long</span>
     <span><i style="background:#F23645"></i>Short</span>
-    <span><i style="background:rgba(49,121,245,0.3);border:1px solid #3179f5"></i>Bull OB</span>
-    <span><i style="background:rgba(247,124,128,0.3);border:1px solid #f77c80"></i>Bear OB</span>
-    <span><i style="background:rgba(0,255,104,0.2);border:1px solid #0f9"></i>FVG Bull</span>
-    <span><i style="background:rgba(255,0,8,0.15);border:1px solid #f45"></i>FVG Bear</span>
   </div>
   <canvas id="chartCanvas"></canvas>
   <div id="chartMetrics"></div>
@@ -5071,7 +5117,6 @@ function drawChart(){
       if(sg.sl<mn)mn=sg.sl;if(sg.sl>mx)mx=sg.sl;
     }
   });
-  if(_tl_upper.length){for(var _i=s;_i<=e;_i++){var _vu=_tl_upper[_i],_vl=_tl_lower[_i];if(_vu&&_vu>0){if(_vu<mn)mn=_vu;if(_vu>mx)mx=_vu;}if(_vl&&_vl>0){if(_vl<mn)mn=_vl;if(_vl>mx)mx=_vl;}}}
   var rng=mx-mn||1, pad2=rng*0.06;
   mn-=pad2;mx+=pad2;
   function toY(p){return PAD.t+cH*(1-(p-mn)/(mx-mn));}
@@ -5111,7 +5156,6 @@ function drawChart(){
     var xe=toX(sg.entry_i);
     var xe2=(sg.exit_i!==undefined&&sg.exit_i<=e)?toX(sg.exit_i):W-PAD.r;
     var ye=toY(sg.entry), yt=toY(sg.tp), ys=toY(sg.sl);
-    var isLong=sg.dir==='long';
     var clrTP='#26a69a', clrSL='#ef5350';
     // Зоны — для всех сделок
     ctx2.fillStyle='rgba(38,166,154,0.08)';
