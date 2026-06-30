@@ -1,5 +1,21 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.32
+- v3.52.32: «тёплый старт» оптимизатора. Раньше каждый запуск перебора
+  (как одиночный, так и скринер) стартовал с полностью случайной точки
+  PARAM_SPACE — все предыдущие наработки терялись при остановке/перезапуске.
+  Теперь: лучший найденный конфиг (params + fitness/winrate/return/...)
+  персистится на диск в ~/.smc_best_configs.json по ключу symbol|tf при
+  КАЖДОМ реальном улучшении best_fit (не только в конце прогона — если
+  процесс убьют посреди работы, прогресс не теряется). При следующем
+  запуске для того же symbol+tf оптимизатор стартует не с _random_params(),
+  а от сохранённого конфига (с клампом под актуальные PARAM_SPACE min/max,
+  на случай если SL%/TP%/границы поменялись) — и дальше работает как
+  обычно: case-старты, shake, Metropolis, top20 — всё это никуда не делось,
+  просто отправная точка лучше нуля. Старая логика полностью случайных
+  стартов внутри цикла (_random_params() как один из стартов на цикл)
+  сохранена для разнообразия — тёплый старт не убирает исследование,
+  а просто не выкидывает накопленный прогресс.
 SMC Optimizer v3.52.31
 - v3.52.31: AMOLED ночной режим (22:00-07:00) — яркость поднята с 10% до 35%.
   При 10% на AMOLED экране текст был практически невидим.
@@ -800,7 +816,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.31"
+APP_VERSION  = "3.52.32"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -834,6 +850,7 @@ ALERT_CFG_PATH   = os.path.expanduser("~/.smc_alert_cfg.json")
 FITNESS_W_PATH   = os.path.expanduser("~/.smc_fitness_weights.json")
 GATE_CFG_PATH    = os.path.expanduser("~/.smc_gate_cfg.json")
 LAST_SYMBOL_PATH = os.path.expanduser("~/.smc_last_symbol.json")
+BEST_CFG_PATH    = os.path.expanduser("~/.smc_best_configs.json")
 GATE_KEY         = os.environ.get("GATE_KEY", "")
 GATE_SECRET      = os.environ.get("GATE_SECRET", "")
 
@@ -2816,6 +2833,60 @@ def _save_fitness_weights():
     except Exception as e:
         olog(f"⚠ Не удалось сохранить {FITNESS_W_PATH}: {e}")
 
+# v3.52.32: лучшие найденные конфиги — по ключу symbol|tf, чтобы следующий
+# запуск перебора стартовал не со случайной точки, а от того, что уже
+# доказало свою эффективность на этом инструменте/таймфрейме.
+_best_cfg_lock = threading.Lock()
+
+def _best_cfg_key(symbol, tf):
+    return f"{symbol}|{tf}"
+
+def _load_best_configs():
+    """Возвращает весь словарь сохранённых лучших конфигов {symbol|tf: {...}}."""
+    for path in [BEST_CFG_PATH, BEST_CFG_PATH + ".tmp"]:
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+        except FileNotFoundError:
+            continue
+        except Exception as e:
+            olog(f"⚠ Не удалось прочитать {path}: {e}")
+            continue
+    return {}
+
+def _load_best_config_for(symbol, tf):
+    """Лучший сохранённый конфиг для конкретного symbol+tf, либо None."""
+    data = _load_best_configs()
+    return data.get(_best_cfg_key(symbol, tf))
+
+def _save_best_config(symbol, tf, params, result):
+    """Сохраняет params+result, если они лучше уже сохранённых для этого symbol+tf
+    (сравнение по fitness). Атомарная запись через .tmp + os.replace()."""
+    try:
+        key = _best_cfg_key(symbol, tf)
+        new_fit = float(result.get("fitness", 0.0)) if result else 0.0
+        with _best_cfg_lock:
+            data = _load_best_configs()
+            old = data.get(key)
+            old_fit = float(old["result"].get("fitness", 0.0)) if old else -1e18
+            if old is not None and new_fit <= old_fit:
+                return  # не лучше — не перезаписываем
+            data[key] = {
+                "params": params,
+                "result": {k: result.get(k) for k in
+                            ("fitness", "winrate", "total_return", "trades",
+                             "profit_factor", "max_dd", "rr") if k in result},
+                "ts": time.time(),
+            }
+            tmp = BEST_CFG_PATH + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(data, f, indent=1)
+            os.replace(tmp, BEST_CFG_PATH)
+    except Exception as e:
+        olog(f"⚠ Не удалось сохранить {BEST_CFG_PATH}: {e}")
+
 def _wtlog(msg):
     """Лог в weight_tune_state."""
     with weight_tune_lock:
@@ -3180,6 +3251,21 @@ def run_optimizer():
 
     best_params  = _random_params()
     best_params["sl_pct"] = sl_p; best_params["tp_pct"] = tp_p
+    # v3.52.32: если для этого symbol+tf уже есть сохранённый лучший конфиг —
+    # стартуем от него (slight shake, чтобы не зациклиться на старом локальном
+    # оптимуме), а не с нуля. Случайные старты в цикле ниже всё равно
+    # подмешиваются для разнообразия.
+    _saved_cfg = _load_best_config_for(sym, tf)
+    if _saved_cfg and isinstance(_saved_cfg.get("params"), dict):
+        _sp = dict(_saved_cfg["params"])
+        _sp["sl_pct"] = sl_p; _sp["tp_pct"] = tp_p
+        # клампим в текущие границы PARAM_SPACE (могли поменяться max_sl/max_tp)
+        for _k, _spec in PARAM_SPACE.items():
+            if _k in _sp and _spec["type"] in ("float","int"):
+                _sp[_k] = max(_spec["min"], min(_spec["max"], _sp[_k]))
+        _saved_fit = _saved_cfg.get("result",{}).get("fitness","?")
+        olog(f"♻ Найден сохранённый конфиг для {sym} {tf} (fitness={_saved_fit}) — стартуем от него")
+        best_params = _sp
     best_result  = _simulate(candles, best_params, sl_pct=sl_p, tp_pct=tp_p, risk_pct=risk)
     best_fit     = best_result["fitness"] if best_result else 0.0
     top20        = []
@@ -3395,6 +3481,9 @@ def run_optimizer():
                             with opt_lock:
                                 opt_state["best"] = {"params": nb_p, "result": nb_r}
                             _pending_announce = (nb_p, nb_r)
+                            # v3.52.32: персистим лучший конфиг для symbol+tf на диск —
+                            # следующий запуск перебора стартует от него.
+                            _save_best_config(sym, tf, nb_p, nb_r)
 
                             # Опционально подкидываем новые параметры живой авто-торговле
                             # того же символа/ТФ, если включён чекбокс синхронизации.
@@ -3447,6 +3536,15 @@ def _run_one_sym_screener(sym, tf, days, sl_p, tp_p, risk, max_sl_p=2.0, max_tp_
     PARAM_SPACE["tp_pct"]["max"] = max(tp_p, max_tp_p)
     best_params = _random_params()
     best_params["sl_pct"] = sl_p; best_params["tp_pct"] = tp_p
+    # v3.52.32: подхватываем сохранённый лучший конфиг для этого symbol+tf
+    _saved_cfg = _load_best_config_for(sym, tf)
+    if _saved_cfg and isinstance(_saved_cfg.get("params"), dict):
+        _sp = dict(_saved_cfg["params"])
+        _sp["sl_pct"] = sl_p; _sp["tp_pct"] = tp_p
+        for _k, _spec in PARAM_SPACE.items():
+            if _k in _sp and _spec["type"] in ("float","int"):
+                _sp[_k] = max(_spec["min"], min(_spec["max"], _sp[_k]))
+        best_params = _sp
     best_result = _simulate(candles, best_params, sl_pct=sl_p, tp_pct=tp_p, risk_pct=risk)
     best_fit    = best_result["fitness"] if best_result else 0.0
     for cycle in range(1, max_cycles + 1):
@@ -3541,6 +3639,8 @@ def run_screener():
             all_results.sort(key=lambda x: x["result"]["fitness"], reverse=True)
             with screener_lock:
                 screener_state["results"] = all_results[:20]
+            # v3.52.32: персистим лучший конфиг символа на диск для следующего прогона
+            _save_best_config(sym, tf, res["params"], res["result"])
 
     with screener_lock:
         screener_state["results"]       = all_results[:20]
