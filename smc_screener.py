@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.31
+- v3.52.31: AMOLED ночной режим (22:00-07:00) — яркость поднята с 10% до 35%.
+  При 10% на AMOLED экране текст был практически невидим.
 SMC Optimizer v3.52.30
 - v3.52.30: убраны OB и FVG блоки с графика окончательно.
   На графике: только свечи + зоны сделок (TP/SL заливка + линии + стрелки).
@@ -797,7 +800,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.30"
+APP_VERSION  = "3.52.31"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -3704,7 +3707,7 @@ input:focus,select:focus{outline:none;border-color:var(--accent)}
 #amoledContent .as-row b{font-size:1.5rem;font-weight:600;display:block;color:inherit;line-height:1.1}
 #amoledContent .as-row span{font-size:.68rem;opacity:.55;display:block;margin-top:4px;letter-spacing:.1em;text-transform:uppercase}
 #amoledContent .as-status{margin-top:14px;font-size:.78rem;opacity:.6;letter-spacing:.05em}
-#amoledContent.night{color:rgba(255,255,255,.40)}
+#amoledContent.night{color:rgba(255,255,255,.35)}
 #amoledContent.night .as-time{color:inherit;font-weight:400}
 @media(max-width:480px){
   #amoledContent .as-time{font-size:3rem}
