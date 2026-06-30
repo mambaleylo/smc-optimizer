@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.33
+- v3.52.33: кнопка «Сбросить сохранённый конфиг» в панели «Параметры запуска» —
+  удаляет лучший сохранённый params для текущего symbol+tf из
+  ~/.smc_best_configs.json (с подтверждением). Полезно, если рыночный режим
+  поменялся и старый «тёплый старт» из v3.52.32 стал вредным якорем.
+  Эндпоинты: GET /best_config?symbol=&tf= (проверка наличия), POST
+  /best_config_reset {symbol,tf} (удаление, атомарная запись через .tmp).
 SMC Optimizer v3.52.32
 - v3.52.32: «тёплый старт» оптимизатора. Раньше каждый запуск перебора
   (как одиночный, так и скринер) стартовал с полностью случайной точки
@@ -816,7 +823,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.32"
+APP_VERSION  = "3.52.33"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -3873,6 +3880,8 @@ input:focus,select:focus{outline:none;border-color:var(--accent)}
     <label>TP % (мин)</label><input id="tp_pct" type="number" value="1.0" step="0.05">
     <label>TP % (макс)</label><input id="max_tp_pct" type="number" value="4.0" step="0.05">
     <label>Риск на сделку %</label><input id="risk_pct" type="number" value="10" step="1">
+    <button class="btn btn-sm" style="width:100%;margin-top:4px" onclick="resetBestCfg()" title="Удаляет сохранённый лучший конфиг для текущего символа+ТФ — следующий перебор стартует с нуля, а не от старого якоря">↺ Сбросить сохранённый конфиг</button>
+    <div id="bestCfgStatus" style="font-size:10px;color:var(--text3);margin-top:4px;min-height:14px"></div>
   </div>
   <div class="card">
     <h3>🎛 Эквалайзер fitness <span style="color:var(--text4);font-size:10px;font-weight:400">(на ходу)</span></h3>
@@ -4626,6 +4635,28 @@ function resetEq(){
     document.getElementById('eqVal_'+k).textContent = '1.00';
   });
   saveEqWeights();
+}
+function resetBestCfg(){
+  var sym=document.getElementById('sym').value.trim();
+  var tf=document.getElementById('tf').value;
+  var st=document.getElementById('bestCfgStatus');
+  if(!sym){ if(st) st.textContent='Укажи символ'; return; }
+  if(!confirm('Удалить сохранённый лучший конфиг для '+sym+' '+tf+'? Следующий перебор стартует заново.')) return;
+  fetch('/best_config_reset',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({symbol:sym, tf:tf})})
+    .then(function(r){return r.json();})
+    .then(function(d){
+      if(!st) return;
+      if(d.ok){
+        st.textContent = d.existed ? ('✔ Конфиг для '+sym+' '+tf+' удалён') : ('Конфига для '+sym+' '+tf+' и не было');
+        st.style.color='var(--green,#0a8)';
+      } else {
+        st.textContent = '⚠ '+(d.error||'ошибка');
+        st.style.color='#f45';
+      }
+      setTimeout(function(){ if(st) st.textContent=''; }, 4000);
+    })
+    .catch(function(){ if(st){ st.textContent='⚠ сеть недоступна'; st.style.color='#f45'; } });
 }
 function loadEqWeights(){
   fetch('/fitness_weights').then(function(r){return r.json();}).then(function(d){
@@ -5749,11 +5780,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 snap = dict(weight_tune_state)
                 snap["logs"] = list(weight_tune_state["logs"])
             self._json(snap)
-        elif self.path == "/scan_all_status":
-            with screener_lock:
-                snap = dict(screener_state)
-                snap["active_workers"] = {k: dict(v) for k, v in screener_state["active_workers"].items()}
-            self._json(snap)
+        elif self.path.startswith("/best_config"):
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            sym = (qs.get("symbol", [""])[0] or "").strip()
+            tf  = (qs.get("tf", [""])[0] or "").strip()
+            cfg = _load_best_config_for(sym, tf) if sym and tf else None
+            self._json({"found": cfg is not None, "config": cfg})
         else:
             self.send_response(404); self.end_headers()
       except Exception as e:
@@ -5902,6 +5934,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif self.path == "/weight_tune_stop":
             _weight_tune_stop.set()
             self._json({"ok": True})
+
+        elif self.path == "/best_config_reset":
+            sym = (body.get("symbol") or "").strip()
+            tf  = (body.get("tf") or "").strip()
+            if not sym or not tf:
+                self._json({"ok": False, "error": "symbol/tf обязательны"})
+            else:
+                try:
+                    with _best_cfg_lock:
+                        data = _load_best_configs()
+                        key = _best_cfg_key(sym, tf)
+                        existed = key in data
+                        if existed:
+                            del data[key]
+                            tmp = BEST_CFG_PATH + ".tmp"
+                            with open(tmp, "w") as f:
+                                json.dump(data, f, indent=1)
+                            os.replace(tmp, BEST_CFG_PATH)
+                    if existed:
+                        olog(f"↺ Сохранённый конфиг для {sym} {tf} удалён")
+                    self._json({"ok": True, "existed": existed})
+                except Exception as e:
+                    self._json({"ok": False, "error": str(e)})
 
         elif self.path == "/alert_test":
             ok, err = _test_alert()
