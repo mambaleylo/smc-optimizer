@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.42
+- v3.52.42: три бага в логике перебора.
+  1) Элиты (_elite_wr/_elite_dd/_elite_pf) не пере-оценивались при обновлении
+     окна свечей — их fitness из старого окна несравним с текущим best, кросс-
+     овер с ними давал некорректные гибриды. Фикс: при обновлении свечей
+     элиты пересчитываются из уже пере-оценённого top20.
+  2) При полном рестарте элиты не сбрасывались — crossover(случайный_best,
+     старая_elite) давал бессмысленный гибрид вместо честного нового поиска.
+     Фикс: _elite_wr = _elite_dd = _elite_pf = None при рестарте.
+  3) top20 дедупликация вытесняла ВСЕ записи с |fit-nfit|<=0.001, включая
+     лучшие — новый кандидат мог заменить конфиг с чуть бо́льшим fitness
+     почти-дубликатом с чуть меньшим. Фикс: удаляем при дедупликации только
+     те записи, которые строго хуже нового кандидата.
 SMC Optimizer v3.52.41
 - v3.52.41: фикс — найденный конфиг не применялся к графику автоматически.
   Причина: авто-применение срабатывало ТОЛЬКО если вкладка «График» была
@@ -932,7 +945,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.41"
+APP_VERSION  = "3.52.42"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -3642,6 +3655,17 @@ def run_optimizer():
                         best_result = None
                         best_fit    = 0.0
                     no_improve  = 0
+                    # v3.52.42: при смене окна свечей элиты пере-оцениваем
+                    # на новом окне — иначе их fitness несравним с текущим best
+                    _elite_wr = _elite_dd = _elite_pf = None
+                    for _e in top20[:5]:
+                        _er = _e["result"]; _ep = _e["params"]
+                        if _elite_wr is None or _er.get("winrate",0) > _elite_wr["result"].get("winrate",0):
+                            _elite_wr = _e
+                        if _elite_dd is None or _er.get("max_dd",100) < _elite_dd["result"].get("max_dd",100):
+                            _elite_dd = _e
+                        if _elite_pf is None or _er.get("profit_factor",0) > _elite_pf["result"].get("profit_factor",0):
+                            _elite_pf = _e
                     with opt_lock:
                         opt_state["top20"] = top20
                         opt_state["best"]  = ({"params": best_params, "result": best_result}
@@ -3675,6 +3699,10 @@ def run_optimizer():
                 best_params["sl_pct"] = sl_p; best_params["tp_pct"] = tp_p
                 _temp_origin = cycle   # v3.52.38: сбрасываем температуру
                 no_improve  = 0
+                # v3.52.42: при рестарте сбрасываем элиты — иначе
+                # crossover(случайный_best, старая_elite) даёт бессмысленный
+                # гибрид вместо честного нового поиска
+                _elite_wr = _elite_dd = _elite_pf = None
             elif no_improve >= SHAKE_AFTER:
                 strength = 0.5 + 0.05 * (no_improve - SHAKE_AFTER)  # 0.5→0.75
                 olog(f"⚡ Цикл {cycle}: встряска strength={strength:.2f} (стагнация {no_improve})")
@@ -3752,7 +3780,14 @@ def run_optimizer():
                             with opt_lock:
                                 top20 = opt_state["top20"]
                                 entry = {"params": nb_p, "result": nb_r}
-                                top20 = [e for e in top20 if abs(e["result"]["fitness"] - nfit) > 0.001]
+                                # v3.52.42: дедупликация — удаляем только те
+                                # записи, которые ХУЖЕ нового кандидата.
+                                # Раньше удалялось всё с |fit-nfit|<=0.001 —
+                                # это могло вытеснить лучший конфиг почти-
+                                # дубликатом с чуть меньшим fitness.
+                                top20 = [e for e in top20
+                                         if abs(e["result"]["fitness"] - nfit) > 0.001
+                                         or e["result"]["fitness"] > nfit]
                                 top20.append(entry)
                                 top20.sort(key=lambda x: x["result"]["fitness"], reverse=True)
                                 opt_state["top20"] = top20[:20]
