@@ -1,5 +1,20 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.37
+- v3.52.37: улучшена вариативность поиска (Basin Hopping exploration).
+  1) _neighbour: адаптивная мутация по температуре — горячая фаза (temp>0.6,
+     ранние циклы) меняет 4 параметра с дельтой ±3-10 шагов; холодная фаза
+     (temp<0.1, поздние циклы) — 1 параметр с ±1 шагом. Ранее было всегда
+     ровно 2 параметра с ±1-2 шагами (слепо к температуре).
+     bool/cat: детерминированный flip/cycle вместо random.choice — guaranteed
+     смена значения (random.choice мог выбрать то же самое).
+  2) _crossover(p1, p2): новая функция uniform crossover двух конфигов.
+     Каждый ключ берётся случайно от одного из двух родителей. Добавляется
+     в starts когда top20 >= 4 (скрещиваем два случайных из лучших).
+  3) diversity-старт: раз в 7 циклов добавляется полностью случайная точка
+     независимо от best/top20 — защита от застревания в одной зоне.
+  4) temp передаётся в _neighbour из основного цикла (раньше temp=0.1 был
+     хардкодированным дефолтом — температура не использовалась в мутации).
 SMC Optimizer v3.52.36
 - v3.52.36: изменены дефолты SL%(макс) с 2.0→1 и TP%(макс) с 4.0→2
   во всех местах: HTML-инпуты, серверные fallback в opt_state/screener_state,
@@ -873,7 +888,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.36"
+APP_VERSION  = "3.52.37"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -2797,17 +2812,43 @@ def _shake(p, strength=0.3):
     return q
 
 def _neighbour(p, temp=0.1):
-    """Малое отклонение одного-двух параметров"""
+    """Адаптивная мутация: при высокой temp — широкий прыжок (2-4 параметра,
+    большая дельта), при низкой — точечная подстройка (1-2 параметра, ±1 шаг).
+    bool/cat — детерминированный flip вместо random.choice, чтобы гарантированно
+    менять значение (random.choice мог выбрать то же самое). v3.52.37."""
     q = dict(p)
-    keys = [k for k,sp in PARAM_SPACE.items() if sp["type"] in ("float","int")]
-    for k in random.sample(keys, min(2, len(keys))):
+    # Количество изменяемых параметров зависит от температуры
+    n_mut = 4 if temp > 0.6 else (3 if temp > 0.3 else (2 if temp > 0.1 else 1))
+    # Берём числовые и категориальные отдельно — гарантируем хоть одно числовое
+    num_keys = [k for k,sp in PARAM_SPACE.items() if sp["type"] in ("float","int")]
+    cat_keys = [k for k,sp in PARAM_SPACE.items() if sp["type"] in ("cat","bool")]
+    chosen = random.sample(num_keys, min(max(1, n_mut-1), len(num_keys)))
+    if cat_keys and n_mut > 1:
+        chosen.append(random.choice(cat_keys))
+    for k in chosen:
         sp = PARAM_SPACE[k]
         if sp["type"] == "float":
-            delta = random.choice([-2,-1,1,2]) * sp["step"]
+            # Дельта пропорциональна temp: горячо → ±5-10 шагов, холодно → ±1-2
+            max_delta = max(1, int(2 + temp * 8))
+            delta = random.choice([-1,1]) * random.randint(1, max_delta) * sp["step"]
             q[k] = round(max(sp["min"], min(sp["max"], p[k]+delta)), 4)
         elif sp["type"] == "int":
-            delta = random.choice([-2,-1,1,2]) * sp["step"]
+            max_delta = max(1, int(2 + temp * 8))
+            delta = random.choice([-1,1]) * random.randint(1, max_delta) * sp["step"]
             q[k] = int(max(sp["min"], min(sp["max"], p[k]+delta)))
+        elif sp["type"] in ("cat","bool"):
+            # Детерминированный cycle — гарантированно другое значение
+            vals = sp["values"]
+            q[k] = vals[(vals.index(p[k]) + 1) % len(vals)]
+    return q
+
+def _crossover(p1, p2):
+    """Uniform crossover двух конфигов из top20 — каждый ключ берётся
+    случайно от одного из родителей. Иногда лучший WinRate-конфиг + лучший
+    Return-конфиг дают вместе что-то лучше любого из них. v3.52.37."""
+    q = {}
+    for k in PARAM_SPACE:
+        q[k] = p1[k] if random.random() < 0.5 else p2[k]
     return q
 
 # ─── GitHub ─────────────────────────────────────────────────────────────────
@@ -3554,6 +3595,18 @@ def run_optimizer():
                       _random_params()]
             if len(top20) > 2:
                 starts.append(_shake(random.choice(top20)["params"], 0.3))
+            # v3.52.37: кросс-овер двух случайных конфигов из top20 — гибрид
+            # может найти область пространства, до которой BH доползал бы долго
+            if len(top20) >= 4:
+                p1, p2 = random.sample(top20, 2)
+                starts.append(_crossover(p1["params"], p2["params"]))
+            # v3.52.37: diversity-старт — раз в 7 циклов добавляем точку
+            # максимально далёкую от best (анти-эксплуатация): полностью
+            # случайная конфигурация, но с фиксированными SL/TP из UI
+            if cycle % 7 == 0:
+                _div = _random_params()
+                _div["sl_pct"] = sl_p; _div["tp_pct"] = tp_p
+                starts.append(_div)
             if no_improve >= SHAKE_AFTER:
                 strength = 0.5 + 0.05 * (no_improve - SHAKE_AFTER)
                 starts.append(_shake(best_params, min(strength, 0.9)))
@@ -3572,7 +3625,7 @@ def run_optimizer():
                 while steps_done < STEPS and not _stop_flag.is_set():
                     workers_now = max(1, n_workers // ECO_WORKERS_DIV) if eco_mode else n_workers
                     batch_size = min(workers_now * 2, STEPS - steps_done)
-                    neighbours = [_neighbour(current_p) for _ in range(batch_size)]
+                    neighbours = [_neighbour(current_p, temp) for _ in range(batch_size)]
                     # Свежий снэпшот эквалайзера на каждую пачку — позволяет
                     # тюнить веса "на ходу" во время работы оптимизатора
                     with fitness_w_lock:
