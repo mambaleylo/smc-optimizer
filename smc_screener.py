@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.36
+- v3.52.36: изменены дефолты SL%(макс) с 2.0→1 и TP%(макс) с 4.0→2
+  во всех местах: HTML-инпуты, серверные fallback в opt_state/screener_state,
+  тело POST /scan и /scan_all, сигнатура _run_one_sym_screener.
 SMC Optimizer v3.52.35
 - v3.52.35: добавлен SuperTrend как опциональный режимный фильтр входов
   (по присланному Pine v4 скрипту KivancOzbilgic, 1:1 порт логики: hl2 src,
@@ -869,7 +873,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.35"
+APP_VERSION  = "3.52.36"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -3340,8 +3344,8 @@ def run_optimizer():
     days  = int(opt_state["days"])
     sl_p  = float(opt_state["sl_pct"])
     tp_p  = float(opt_state["tp_pct"])
-    max_sl_p = float(opt_state.get("max_sl_pct", 2.0))
-    max_tp_p = float(opt_state.get("max_tp_pct", 4.0))
+    max_sl_p = float(opt_state.get("max_sl_pct", 1.0))
+    max_tp_p = float(opt_state.get("max_tp_pct", 2.0))
     risk  = float(opt_state["risk_pct"])
     offset_days = int(opt_state.get("offset_days", 0))
 
@@ -3656,7 +3660,7 @@ def run_optimizer():
     olog("⏹ Остановлено")
     with opt_lock: opt_state["running"] = False
 
-def _run_one_sym_screener(sym, tf, days, sl_p, tp_p, risk, max_sl_p=2.0, max_tp_p=4.0, max_cycles=100, on_cycle=None):
+def _run_one_sym_screener(sym, tf, days, sl_p, tp_p, risk, max_sl_p=1.0, max_tp_p=2.0, max_cycles=100, on_cycle=None):
     candles = _fetch_candles(sym, tf, days, _stop_event=_screener_stop)
     if not candles or len(candles) < 100: return None
     # v3.50.2: sl_p/tp_p — минимальные границы
@@ -3738,8 +3742,8 @@ def run_screener():
     days = screener_state["days"]
     sl_p = screener_state["sl_pct"]
     tp_p = screener_state["tp_pct"]
-    max_sl_p = float(screener_state.get("max_sl_pct", 2.0))
-    max_tp_p = float(screener_state.get("max_tp_pct", 4.0))
+    max_sl_p = float(screener_state.get("max_sl_pct", 1.0))
+    max_tp_p = float(screener_state.get("max_tp_pct", 2.0))
     risk = screener_state["risk_pct"]
     with screener_lock:
         screener_state.update({"results":[],"done":False,"sym_index":0,"sym_total":0,"current_sym":"","active_workers":{},"sym_list":[]})
@@ -4008,9 +4012,9 @@ input:focus,select:focus{outline:none;border-color:var(--accent)}
     <label>Дней истории</label><input id="days" type="number" value="30" min="7" max="365">
     <label title="Смещение окна в прошлое: 0 = последние N дней, 30 = N дней заканчивающихся 30 дней назад. Используй для OOS: обучи на [now-60д..now-30д] поставив Дней=30 Смещение=30, затем проверь в Симуляции на [now-30д..now].">Смещение (дней назад)</label><input id="offset_days" type="number" value="0" min="0" max="365" title="0 = последние N дней. N = окно заканчивается N дней назад.">
     <label>SL % (мин)</label><input id="sl_pct" type="number" value="0.6" step="0.05">
-    <label>SL % (макс)</label><input id="max_sl_pct" type="number" value="2.0" step="0.05">
+    <label>SL % (макс)</label><input id="max_sl_pct" type="number" value="1" step="0.05">
     <label>TP % (мин)</label><input id="tp_pct" type="number" value="1.0" step="0.05">
-    <label>TP % (макс)</label><input id="max_tp_pct" type="number" value="4.0" step="0.05">
+    <label>TP % (макс)</label><input id="max_tp_pct" type="number" value="2" step="0.05">
     <label>Риск на сделку %</label><input id="risk_pct" type="number" value="10" step="1">
     <button class="btn btn-sm" style="width:100%;margin-top:4px" onclick="resetBestCfg()" title="Удаляет сохранённый лучший конфиг для текущего символа+ТФ — следующий перебор стартует с нуля, а не от старого якоря">↺ Сбросить сохранённый конфиг</button>
     <div id="bestCfgStatus" style="font-size:10px;color:var(--text3);margin-top:4px;min-height:14px"></div>
@@ -5951,8 +5955,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "days":   body.get("days",30),
                     "sl_pct": body.get("sl_pct",0.6),
                     "tp_pct": body.get("tp_pct",1.0),
-                    "max_sl_pct": body.get("max_sl_pct",2.0),
-                    "max_tp_pct": body.get("max_tp_pct",4.0),
+                    "max_sl_pct": body.get("max_sl_pct",1.0),
+                    "max_tp_pct": body.get("max_tp_pct",2.0),
                     "risk_pct": body.get("risk_pct",10.0),
                     "offset_days": int(body.get("offset_days", 0)),
                 })
@@ -5977,8 +5981,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         "days":int(body.get("days",30)),
                         "sl_pct":float(body.get("sl_pct",0.6)),
                         "tp_pct":float(body.get("tp_pct",1.0)),
-                        "max_sl_pct":float(body.get("max_sl_pct",2.0)),
-                        "max_tp_pct":float(body.get("max_tp_pct",4.0)),
+                        "max_sl_pct":float(body.get("max_sl_pct",1.0)),
+                        "max_tp_pct":float(body.get("max_tp_pct",2.0)),
                         "risk_pct":float(body.get("risk_pct",10.0)),
                         "current_sym":"",
                     })
