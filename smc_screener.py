@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.45
+- v3.52.45: тёмная тема — синий акцент (--accent/--accent2, использовался
+  в заголовке, вкладках, кнопках, ползунке эквалайзера) заменён на
+  пепельно-оранжевый в стиле подсветки приборной панели BMW: #7ab3e0→#d99a5c,
+  #5a93c8→#b87a3f. Заодно найден и убран последний хардкод старого синего
+  (box-shadow ползунка эквалайзера rgba(77,159,255,.5) не был переведён на
+  CSS-переменную ещё в v3.51.5 — точечно заменён на новый акцентный цвет).
+  --green осветлён #00dd88→#2eeb96 — плохо читался на чёрном фоне ночью.
+  Светлая тема не тронута (проблема только в тёмной/ночной).
 SMC Optimizer v3.52.44
 - v3.52.44: фикс несогласованности fitness между стартовым best и воркерами.
   Стартовый best_result (строки инициализации) вычислялся с явным
@@ -968,7 +977,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.44"
+APP_VERSION  = "3.52.45"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -4035,9 +4044,9 @@ HTML = """<!DOCTYPE html><html lang="ru"><head>
   --text2:     #aaaaaa;
   --text3:     #666666;
   --text4:     #555555;
-  --accent:    #7ab3e0;
-  --accent2:   #5a93c8;
-  --green:     #00dd88;
+  --accent:    #d99a5c;
+  --accent2:   #b87a3f;
+  --green:     #2eeb96;
   --red:       #ff4455;
   --yellow:    #f0b800;
   --pill-bg:   #161616;
@@ -4150,7 +4159,7 @@ input:focus,select:focus{outline:none;border-color:var(--accent)}
   pointer-events:none}
 .eq-slider::-webkit-slider-runnable-track{height:5px;background:var(--eq-track);border-radius:3px}
 .eq-slider::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;border-radius:50%;
-  background:var(--accent);border:2px solid var(--bg);margin-top:-5.5px;box-shadow:0 0 4px rgba(77,159,255,.5)}
+  background:var(--accent);border:2px solid var(--bg);margin-top:-5.5px;box-shadow:0 0 4px rgba(217,154,92,.5)}
 .eq-slider::-moz-range-track{height:5px;background:var(--eq-track);border-radius:3px}
 .eq-slider::-moz-range-thumb{width:16px;height:16px;border-radius:50%;background:var(--accent);border:2px solid var(--bg)}
 .eq-lbl{font-size:9.5px;color:var(--text3);text-align:center;line-height:1.2}
