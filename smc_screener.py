@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.40
+- v3.52.40: КРИТИЧНО — при закрытии позиции по SL оставался висеть TP-ордер
+  на бирже (и наоборот). Причина: _check_position_closed_and_alert()
+  обнаруживала закрытие и обнуляла position=None, но _gate_cancel_orders()
+  не вызывалась — парный price_order зависал. Фикс добавлен в оба пути
+  обнаружения: основной цикл сигналов (раз в свечу) и быстрый poll
+  (каждые POS_POLL_SEC секунд). Теперь сразу после подтверждения закрытия
+  позиции отменяются все открытые ордера по символу (и /orders, и
+  /price_orders).
 SMC Optimizer v3.52.39
 - v3.52.39: фикс — значок «⚡ офлайн» висел постоянно на Android.
   Причина: navigator.onLine на Android WebView/Termux часто возвращает false
@@ -911,7 +920,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.39"
+APP_VERSION  = "3.52.40"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -1987,8 +1996,17 @@ def _auto_trade_loop():
                                 if _check_position_closed_and_alert(sym, our_pos_now):
                                     with auto_trade_lock:
                                         auto_trade_state["position"] = None
-                                        # Позиция закрылась — применяем отложенные параметры
                                         _deferred_p = auto_trade_state["params"]
+                                    # v3.52.40: позиция закрылась по TP или SL —
+                                    # отменяем оставшийся парный ордер (если SL
+                                    # сработал, TP-price_order остаётся висеть и
+                                    # наоборот). _gate_cancel_orders чистит оба
+                                    # эндпоинта: /orders и /price_orders.
+                                    try:
+                                        _gate_cancel_orders(sym)
+                                        olog(f"🧹 Позиция закрыта — отменены зависшие TP/SL ордера по {sym}")
+                                    except Exception as _ce:
+                                        olog(f"⚠ Не удалось отменить ордера после закрытия позиции: {_ce}")
                                     if _deferred_p != p:
                                         olog(f"🔁 Авто-трейд: применяем отложенные параметры после закрытия позиции "
                                              f"(swing={_deferred_p.get('swing_len')} SL={_deferred_p.get('sl_pct')}% TP={_deferred_p.get('tp_pct')}%)")
@@ -2074,6 +2092,12 @@ def _auto_trade_loop():
                         with auto_trade_lock:
                             auto_trade_state["position"] = None
                             _deferred_p = auto_trade_state["params"]
+                        # v3.52.40: отменяем парный зависший TP/SL ордер
+                        try:
+                            _gate_cancel_orders(sym)
+                            olog(f"🧹 (fast poll) Позиция закрыта — отменены зависшие TP/SL ордера по {sym}")
+                        except Exception as _ce:
+                            olog(f"⚠ (fast poll) Не удалось отменить ордера: {_ce}")
                         if _deferred_p != p:
                             olog(f"🔁 Авто-трейд: применяем отложенные параметры после быстрого закрытия позиции "
                                  f"(swing={_deferred_p.get('swing_len')} SL={_deferred_p.get('sl_pct')}% TP={_deferred_p.get('tp_pct')}%)")
