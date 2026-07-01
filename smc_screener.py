@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.43
+- v3.52.43: два критических бага в авто-трейде.
+  1) _wf_validate вызывался ТРИЖДЫ подряд (строки 1959→1965→1980) — каждый
+     вызов делает HTTP-запрос к Gate.io за свечами OOS-окна. При нестабильной
+     сети в Termux второй/третий вызов мог вернуть None вместо сохранённого
+     False — сигнал-мусор проходил в торговлю несмотря на провал WF-проверки.
+     Фикс: один вызов через walrus-оператор (:=), результат переиспользуется.
+  2) pnl_pct в Telegram-алертах о закрытии позиции был завышен в 100 раз
+     (530% вместо 5.3%). Причина: Gate.io /position_close уже возвращает
+     значение в процентах (5.3 = 5.3%), а код умножал на 100 считая что
+     это доля. Фикс: убрано умножение * 100.
 SMC Optimizer v3.52.42
 - v3.52.42: три бага в логике перебора.
   1) Элиты (_elite_wr/_elite_dd/_elite_pf) не пере-оценивались при обновлении
@@ -945,7 +956,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.42"
+APP_VERSION  = "3.52.43"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -1302,7 +1313,10 @@ def _gate_get_last_pnl(symbol):
             return None
         rec = data[0]
         pnl       = float(rec.get("pnl",       0))
-        pnl_pct   = float(rec.get("pnl_pct",   0)) * 100  # Gate отдаёт как доля, не %
+        # v3.52.43: Gate.io /position_close возвращает pnl_pct УЖЕ в процентах
+        # (например 5.3 = 5.3%), не как долю. Умножение на 100 давало x100
+        # завышение в Telegram-алертах (530% вместо 5.3%).
+        pnl_pct   = float(rec.get("pnl_pct",   0))
         close_px  = float(rec.get("close_price", 0))
         return {"pnl": pnl, "pnl_pct": pnl_pct, "close_price": close_px}
     except Exception as e:
@@ -1956,13 +1970,17 @@ def _auto_trade_loop():
                                         # достаточно оптимизированы.
                                         with auto_trade_lock:
                                             auto_trade_state["last_entry_ts"] = entry_ts
-                                    elif _wf_validate(sym, tf, p, risk_pct)[0] is False:
+                                    elif (_wf_result := _wf_validate(sym, tf, p, risk_pct))[0] is False:
                                         # v3.52.22: настоящая OOS-проверка — params прогнаны через
                                         # _simulate на окне, которое оптимизатор НЕ видел во время
                                         # поиска. None (мало OOS-данных/ошибка фетча) не блокирует —
                                         # это проблема данных, а не качества стратегии; блокирует
                                         # только явный False (PF<1 на незнакомых данных).
-                                        _wf_passed, _wf_detail = _wf_validate(sym, tf, p, risk_pct)
+                                        # v3.52.43: вызываем ОДИН раз, результат сохраняем —
+                                        # раньше было 3 вызова: каждый делал отдельный HTTP-запрос
+                                        # за свечами, при нестабильной сети второй/третий мог
+                                        # вернуть None вместо False и пропустить сигнал-мусор.
+                                        _wf_passed, _wf_detail = _wf_result
                                         olog(f"🚫 Сигнал {direction.upper()} отфильтрован — "
                                              f"провалена walk-forward проверка на OOS-окне: "
                                              f"{_wf_detail}. Сделка не открыта, ждём следующий сигнал.")
@@ -1977,7 +1995,7 @@ def _auto_trade_loop():
                                         with auto_trade_lock:
                                             auto_trade_state["last_entry_ts"] = entry_ts
                                     else:
-                                        _wf_passed, _wf_detail = _wf_validate(sym, tf, p, risk_pct)
+                                        _wf_passed, _wf_detail = _wf_result
                                         if _wf_detail:
                                             olog(f"✅ Walk-forward: {_wf_detail}"
                                                  + ("" if _wf_passed else " (не проверено, торгуем дальше)"))
