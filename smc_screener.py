@@ -1,5 +1,22 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.38
+- v3.52.38: улучшена вариативность перебора (Basin Hopping).
+  1) Температура теперь считается от момента ПОСЛЕДНЕГО РЕСТАРТА (_temp_origin),
+     а не от цикла 0. Раньше к циклу 50 temp≈0.08 и алгоритм переставал
+     прыгать навсегда — даже после полного рестарта температура не
+     восстанавливалась. Теперь каждый рестарт возвращает temp=1.0.
+  2) STEPS адаптируется к температуре: при temp=1.0 (горячо) STEPS=30 —
+     широкое покрытие без застревания в одной точке; при temp≈0 (холодно)
+     STEPS=80 — глубокая эксплуатация найденного региона.
+  3) Элиты по метрикам: параллельно с best_fitness хранятся _elite_wr
+     (лучший winrate), _elite_dd (минимальный drawdown), _elite_pf
+     (лучший profit_factor). В каждом цикле скрещиваются с текущим best —
+     это позволяет найти конфиги, сочетающие несколько сильных сторон.
+  4) _crossover переписан: вместо uniform (каждый ключ независимо) теперь
+     блочный кросс-овер по смысловым группам (swing+OB, SL/TP, FVG,
+     CHoCH/internal, trendline, volume, SuperTrend) — сохраняет внутреннюю
+     согласованность параметров, которые работают вместе.
 SMC Optimizer v3.52.37
 - v3.52.37: улучшена вариативность поиска (Basin Hopping exploration).
   1) _neighbour: адаптивная мутация по температуре — горячая фаза (temp>0.6,
@@ -888,7 +905,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.37"
+APP_VERSION  = "3.52.38"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -2843,12 +2860,27 @@ def _neighbour(p, temp=0.1):
     return q
 
 def _crossover(p1, p2):
-    """Uniform crossover двух конфигов из top20 — каждый ключ берётся
-    случайно от одного из родителей. Иногда лучший WinRate-конфиг + лучший
-    Return-конфиг дают вместе что-то лучше любого из них. v3.52.37."""
-    q = {}
-    for k in PARAM_SPACE:
-        q[k] = p1[k] if random.random() < 0.5 else p2[k]
+    """Блочный кросс-овер двух конфигов из top20. В отличие от попарного
+    uniform crossover (каждый ключ независимо), здесь параметры разбиты на
+    смысловые группы — группа целиком берётся от одного родителя. Это
+    сохраняет внутреннюю согласованность: swing_len и min_ob_size обычно
+    работают вместе, sl_pct/tp_pct тоже связаны между собой. v3.52.38."""
+    # Смысловые блоки параметров
+    blocks = [
+        ["swing_len", "min_ob_size", "ob_mitigation", "ob_filter"],
+        ["sl_pct", "tp_pct"],
+        ["fvg_enabled", "fvg_threshold", "require_fvg_confirm"],
+        ["choch_only", "use_internal", "internal_len"],
+        ["tl_filter", "tl_mult", "tl_method"],
+        ["vol_filter", "vol_mult"],
+        ["st_filter", "st_period", "st_mult"],
+    ]
+    q = dict(p1)
+    for block in blocks:
+        src = p2 if random.random() < 0.5 else p1
+        for k in block:
+            if k in PARAM_SPACE and k in src:
+                q[k] = src[k]
     return q
 
 # ─── GitHub ─────────────────────────────────────────────────────────────────
@@ -3447,10 +3479,16 @@ def run_optimizer():
     top20        = []
     cycle        = 0
     TEMP_START   = 1.0
-    STEPS        = 60   # шагов локального поиска за старт
-    no_improve   = 0    # циклов без улучшения глобального best
-    SHAKE_AFTER  = 5    # мягкая встряска через N циклов без улучшения
-    RESTART_AFTER= 15   # полный рестарт через N циклов без улучшения
+    _temp_origin = 0     # цикл последнего рестарта — температура считается от него
+    STEPS_MIN    = 30    # шагов при высокой температуре (широкое покрытие)
+    STEPS_MAX    = 80    # шагов при низкой температуре (глубокая эксплуатация)
+    no_improve   = 0     # циклов без улучшения глобального best
+    SHAKE_AFTER  = 5     # мягкая встряска через N циклов без улучшения
+    RESTART_AFTER= 15    # полный рестарт через N циклов без улучшения
+    # Элиты по отдельным метрикам — дополнительные стартовые точки
+    _elite_wr  = None   # params с лучшим winrate
+    _elite_dd  = None   # params с лучшим max_dd (минимальным)
+    _elite_pf  = None   # params с лучшим profit_factor
 
     # ── Режим слабой производительности (телефон греется на долгих прогонах) ──
     # После ECO_AFTER_CYCLE циклов снижаем параллелизм (меньше воркеров в
@@ -3500,7 +3538,15 @@ def run_optimizer():
     try:
         while not _stop_flag.is_set():
             cycle += 1
-            temp = TEMP_START * math.exp(-0.05 * cycle)
+            # v3.52.38: температура считается от _temp_origin (момента
+            # последнего рестарта), а не от цикла 0. Без этого к циклу 50
+            # temp≈0.08 и алгоритм перестаёт прыгать навсегда — даже после
+            # полного рестарта температура не восстанавливалась.
+            _age  = cycle - _temp_origin
+            temp  = TEMP_START * math.exp(-0.05 * _age)
+            # STEPS адаптируется к температуре: горячо → широкое покрытие
+            # (меньше шагов в одной точке), холодно → глубокая эксплуатация
+            STEPS = int(STEPS_MIN + (STEPS_MAX - STEPS_MIN) * (1.0 - min(temp, 1.0)))
             eco_mode = (cycle >= ECO_MIN_CYCLE) and (no_improve >= ECO_AFTER_STAGNATION)
             with opt_lock:
                 opt_state["cycle"] = cycle
@@ -3585,6 +3631,7 @@ def run_optimizer():
                     _pending_announce = None
                 best_params = _random_params()
                 best_params["sl_pct"] = sl_p; best_params["tp_pct"] = tp_p
+                _temp_origin = cycle   # v3.52.38: сбрасываем температуру
                 no_improve  = 0
             elif no_improve >= SHAKE_AFTER:
                 strength = 0.5 + 0.05 * (no_improve - SHAKE_AFTER)  # 0.5→0.75
@@ -3595,11 +3642,18 @@ def run_optimizer():
                       _random_params()]
             if len(top20) > 2:
                 starts.append(_shake(random.choice(top20)["params"], 0.3))
-            # v3.52.37: кросс-овер двух случайных конфигов из top20 — гибрид
-            # может найти область пространства, до которой BH доползал бы долго
+            # v3.52.38: блочный кросс-овер — сохраняет согласованность групп
             if len(top20) >= 4:
                 p1, p2 = random.sample(top20, 2)
                 starts.append(_crossover(p1["params"], p2["params"]))
+            # v3.52.38: элиты по метрикам — кросс-овер лучшего fitness с
+            # лучшим WR / DD / PF (скрещиваем разные «специализации»)
+            if _elite_wr and len(top20) >= 2:
+                starts.append(_crossover(best_params, _elite_wr["params"]))
+            if _elite_dd and cycle % 3 == 0:
+                starts.append(_crossover(best_params, _elite_dd["params"]))
+            if _elite_pf and cycle % 5 == 0:
+                starts.append(_crossover(best_params, _elite_pf["params"]))
             # v3.52.37: diversity-старт — раз в 7 циклов добавляем точку
             # максимально далёкую от best (анти-эксплуатация): полностью
             # случайная конфигурация, но с фиксированными SL/TP из UI
@@ -3672,6 +3726,13 @@ def run_optimizer():
                             # v3.52.32: персистим лучший конфиг для symbol+tf на диск —
                             # следующий запуск перебора стартует от него.
                             _save_best_config(sym, tf, nb_p, nb_r)
+                            # v3.52.38: обновляем элиты по отдельным метрикам
+                            if _elite_wr is None or nb_r.get("winrate",0) > _elite_wr["result"].get("winrate",0):
+                                _elite_wr = {"params": nb_p, "result": nb_r}
+                            if _elite_dd is None or nb_r.get("max_dd",100) < _elite_dd["result"].get("max_dd",100):
+                                _elite_dd = {"params": nb_p, "result": nb_r}
+                            if _elite_pf is None or nb_r.get("profit_factor",0) > _elite_pf["result"].get("profit_factor",0):
+                                _elite_pf = {"params": nb_p, "result": nb_r}
 
                             # Опционально подкидываем новые параметры живой авто-торговле
                             # того же символа/ТФ, если включён чекбокс синхронизации.
