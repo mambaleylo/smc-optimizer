@@ -1,5 +1,28 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.47
+- v3.52.47: КРИТИЧНО — синтаксическая ошибка в JS ломала ВЕСЬ <script> целиком.
+  В функции renderScreenerResults() (таблица результатов "Скан всех монет")
+  переносы строк оказались записаны буквальным текстом "\n" (два символа:
+  бэкслеш+n) вместо настоящего перевода строки, а кавычки — буквальным
+  \" вместо ". Баг существовал ещё до начала текущей серии правок (проверено
+  по истории коммитов — присутствовал уже в самой первой версии, с которой
+  начиналась работа). Поскольку браузер парсит весь <script> целиком ДО
+  выполнения, синтаксическая ошибка в этой функции могла останавливать
+  разбор ВСЕГО скрипта — переставали работать все кнопки, вкладки, автообновление
+  графика и т.д., если сервер (Termux) был перезапущен с этим файлом и
+  страница открыта/обновлена заново (старая открытая вкладка браузера с уже
+  распарсенным JS могла продолжать работать по инерции, что маскировало баг).
+  Исправлено через прямую замену буквальных \n/\" на настоящие переводы строк
+  и кавычки. Проверено через node --check на извлечённом JS.
+  (2) Отдельно: "Лучший конфиг не применяется к графику" — best/top20
+  подхватывались в _bestParams ТОЛЬКО внутри poll(), а poll() запускается
+  лишь пока оптимизатор запущен (d.running===true). Если он уже был
+  остановлен на момент открытия/обновления страницы — _bestParams навсегда
+  оставался null, и "Открыть на графике"/переключение на вкладку График/
+  "Загрузить" тихо использовали дефолтные поля вместо уже найденного лучшего
+  конфига. Рендер best/top20 вынесен в общую функцию _renderBestAndTop20(d),
+  теперь вызывается и при первой загрузке страницы независимо от running.
 SMC Optimizer v3.52.46
 - v3.52.46: три бага в системе перебора и поиска лучшего конфига.
   (1) Рассинхрон fitness при смене весов эквалайзера "на ходу". POST
@@ -1003,7 +1026,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.46"
+APP_VERSION  = "3.52.47"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -5265,6 +5288,67 @@ function stopOpt(){
   });
 }
 function scheduleNext(){ polling=setTimeout(poll, 1500); }
+function _renderBestAndTop20(d){
+  if(d.best){
+    var r=d.best.result, p=d.best.params;
+    var prevFit = _bestParams ? (_bestParams._fitness||0) : 0;
+    p._fitness = r.fitness;
+    _bestParams = p;
+    window._lastBestResult = r;
+    // v3.52.41: авто-применение при каждом улучшении fitness (цикл >= 30).
+    // Раньше применялось ТОЛЬКО если вкладка "График" была активна в момент
+    // улучшения — пользователь на вкладке "Оптимизатор" пропускал обновление,
+    // а при переходе на "График" switchTab вызывал applyBestToChart() — но
+    // это ненадёжно (зависит от момента). Теперь всегда применяем в _chartExtra
+    // и перегружаем, если вкладка активна; при переходе switchTab применит сам.
+    // v3.52.47: условие срабатывает и здесь при первой загрузке страницы
+    // (prevFit=0, поэтому r.fitness>prevFit почти всегда true) — раньше эта
+    // функция вызывалась только из poll(), а poll() не запускался вовсе если
+    // оптимизатор уже был остановлен на момент открытия страницы, и
+    // _bestParams оставался null навсегда несмотря на то, что сервер уже
+    // знал лучший конфиг.
+    if((d.cycle||0) >= 30 && r.fitness > prevFit){
+      applyBestToChart();
+    }
+    var wrC=r.winrate>=55?'green':r.winrate>=45?'yellow':'red';
+    document.getElementById('bestCard').innerHTML=
+      '<div class="stat-row"><span class="stat-label">Winrate</span><span class="stat-val '+wrC+'">'+r.winrate+'%</span></div>'+
+      '<div class="stat-row"><span class="stat-label">Profit Factor</span><span class="stat-val">'+r.profit_factor+'</span></div>'+
+      '<div class="stat-row"><span class="stat-label">Max DD</span><span class="stat-val red">'+r.max_dd+'%</span></div>'+
+      '<div class="stat-row"><span class="stat-label">Сделок</span><span class="stat-val">'+r.trades+'</span></div>'+
+      '<div class="stat-row"><span class="stat-label">Доходность</span><span class="stat-val '+(r.total_return>=0?'green':'red')+'">'+r.total_return+'%</span></div>'+
+      '<div class="stat-row"><span class="stat-label">Fitness</span><span class="stat-val yellow">'+r.fitness+'</span></div>'+
+      '<hr style="border-color:#222;margin:5px 0">'+
+      '<div class="stat-row"><span class="stat-label">SL / TP</span><span class="stat-val">'+p.sl_pct+'% / '+p.tp_pct+'%</span></div>'+
+      '<div class="stat-row"><span class="stat-label">Swing len</span><span class="stat-val">'+p.swing_len+'</span></div>'+
+      '<div class="stat-row"><span class="stat-label">OB mitigation</span><span class="stat-val">'+p.ob_mitigation+'</span></div>'+
+      '<div class="stat-row"><span class="stat-label">FVG</span><span class="stat-val">'+(p.fvg_enabled?'вкл':'выкл')+'</span></div>'+
+      '<div class="stat-row"><span class="stat-label">CHoCH only</span><span class="stat-val">'+(p.choch_only?'да':'нет')+'</span></div>'+
+      '<div class="stat-row"><span class="stat-label">TL фильтр</span><span class="stat-val">'+(p.tl_filter?'вкл':'выкл')+'</span></div>'+
+      '<div class="stat-row"><span class="stat-label">ST фильтр</span><span class="stat-val">'+(p.st_filter?('вкл ('+p.st_period+'/'+p.st_mult+')'):'выкл')+'</span></div>';
+  }
+
+  var top=(d.top20||[]);
+  if(top.length){
+    var html='<div class="top20-row"><span>#</span><span>WR%</span><span>PF</span><span>DD%</span><span>T</span><span>$100→$</span><span>SL/TP/swing</span></div>';
+    top.forEach(function(e,i){
+      var r=e.result,p=e.params;
+      var wrC=r.winrate>=55?'green':r.winrate>=45?'yellow':'red';
+      var retC=r.total_return>=0?'green':'red';
+      var finalBal=Math.round(100*(1+r.total_return/100));
+      html+='<div class="top20-row">'+
+        '<span style="color:#555">'+(i+1)+'</span>'+
+        '<span class="'+wrC+'">'+r.winrate+'%</span>'+
+        '<span>'+r.profit_factor+'</span>'+
+        '<span class="red">'+r.max_dd+'%</span>'+
+        '<span>'+r.trades+'</span>'+
+        '<span class="'+retC+'">$'+finalBal+'</span>'+
+        '<span style="color:#888">'+p.sl_pct+'/'+p.tp_pct+'/'+p.swing_len+'</span>'+
+      '</div>';
+    });
+    document.getElementById('top20Container').innerHTML=html;
+  }
+}
 function poll(){
   fetch('/opt_status').then(function(r){return r.json();}).then(function(d){
     logsDropped = d.logs_dropped||0;
@@ -5298,59 +5382,7 @@ function poll(){
       scheduleNext();
     }
 
-    if(d.best){
-      var r=d.best.result, p=d.best.params;
-      var prevFit = _bestParams ? (_bestParams._fitness||0) : 0;
-      p._fitness = r.fitness;
-      _bestParams = p;
-      window._lastBestResult = r;
-      // v3.52.41: авто-применение при каждом улучшении fitness (цикл >= 30).
-      // Раньше применялось ТОЛЬКО если вкладка "График" была активна в момент
-      // улучшения — пользователь на вкладке "Оптимизатор" пропускал обновление,
-      // а при переходе на "График" switchTab вызывал applyBestToChart() — но
-      // это ненадёжно (зависит от момента). Теперь всегда применяем в _chartExtra
-      // и перегружаем, если вкладка активна; при переходе switchTab применит сам.
-      if((d.cycle||0) >= 30 && r.fitness > prevFit){
-        applyBestToChart();
-      }
-      var wrC=r.winrate>=55?'green':r.winrate>=45?'yellow':'red';
-      document.getElementById('bestCard').innerHTML=
-        '<div class="stat-row"><span class="stat-label">Winrate</span><span class="stat-val '+wrC+'">'+r.winrate+'%</span></div>'+
-        '<div class="stat-row"><span class="stat-label">Profit Factor</span><span class="stat-val">'+r.profit_factor+'</span></div>'+
-        '<div class="stat-row"><span class="stat-label">Max DD</span><span class="stat-val red">'+r.max_dd+'%</span></div>'+
-        '<div class="stat-row"><span class="stat-label">Сделок</span><span class="stat-val">'+r.trades+'</span></div>'+
-        '<div class="stat-row"><span class="stat-label">Доходность</span><span class="stat-val '+(r.total_return>=0?'green':'red')+'">'+r.total_return+'%</span></div>'+
-        '<div class="stat-row"><span class="stat-label">Fitness</span><span class="stat-val yellow">'+r.fitness+'</span></div>'+
-        '<hr style="border-color:#222;margin:5px 0">'+
-        '<div class="stat-row"><span class="stat-label">SL / TP</span><span class="stat-val">'+p.sl_pct+'% / '+p.tp_pct+'%</span></div>'+
-        '<div class="stat-row"><span class="stat-label">Swing len</span><span class="stat-val">'+p.swing_len+'</span></div>'+
-        '<div class="stat-row"><span class="stat-label">OB mitigation</span><span class="stat-val">'+p.ob_mitigation+'</span></div>'+
-        '<div class="stat-row"><span class="stat-label">FVG</span><span class="stat-val">'+(p.fvg_enabled?'вкл':'выкл')+'</span></div>'+
-        '<div class="stat-row"><span class="stat-label">CHoCH only</span><span class="stat-val">'+(p.choch_only?'да':'нет')+'</span></div>'+
-        '<div class="stat-row"><span class="stat-label">TL фильтр</span><span class="stat-val">'+(p.tl_filter?'вкл':'выкл')+'</span></div>'+
-        '<div class="stat-row"><span class="stat-label">ST фильтр</span><span class="stat-val">'+(p.st_filter?('вкл ('+p.st_period+'/'+p.st_mult+')'):'выкл')+'</span></div>';
-    }
-
-    var top=(d.top20||[]);
-    if(top.length){
-      var html='<div class="top20-row"><span>#</span><span>WR%</span><span>PF</span><span>DD%</span><span>T</span><span>$100→$</span><span>SL/TP/swing</span></div>';
-      top.forEach(function(e,i){
-        var r=e.result,p=e.params;
-        var wrC=r.winrate>=55?'green':r.winrate>=45?'yellow':'red';
-        var retC=r.total_return>=0?'green':'red';
-        var finalBal=Math.round(100*(1+r.total_return/100));
-        html+='<div class="top20-row">'+
-          '<span style="color:#555">'+(i+1)+'</span>'+
-          '<span class="'+wrC+'">'+r.winrate+'%</span>'+
-          '<span>'+r.profit_factor+'</span>'+
-          '<span class="red">'+r.max_dd+'%</span>'+
-          '<span>'+r.trades+'</span>'+
-          '<span class="'+retC+'">$'+finalBal+'</span>'+
-          '<span style="color:#888">'+p.sl_pct+'/'+p.tp_pct+'/'+p.swing_len+'</span>'+
-        '</div>';
-      });
-      document.getElementById('top20Container').innerHTML=html;
-    }
+    _renderBestAndTop20(d);
   }).catch(function(){scheduleNext();});
 }
 fetch('/opt_status').then(function(r){return r.json();}).then(function(d){
@@ -5370,6 +5402,13 @@ fetch('/opt_status').then(function(r){return r.json();}).then(function(d){
     var cDaysEl = document.getElementById('cDays');
     if(cDaysEl) cDaysEl.value = d.days;
   }
+  // v3.52.47: раньше best/top20 подхватывались ТОЛЬКО через poll(), которая
+  // запускается лишь при d.running===true — если оптимизатор к моменту
+  // открытия/перезагрузки страницы уже был остановлен, _bestParams навсегда
+  // оставался null, и "Открыть на графике"/переключение вкладки/"Загрузить"
+  // тихо использовали дефолтные поля вместо уже найденного лучшего конфига.
+  // Теперь рендерим best/top20 сразу здесь тоже, независимо от running.
+  _renderBestAndTop20(d);
   if(d.running){
     document.getElementById('btnStart').style.display='none';
     document.getElementById('btnStop').style.display='';
@@ -5377,6 +5416,7 @@ fetch('/opt_status').then(function(r){return r.json();}).then(function(d){
     scheduleNext();
   }
 });
+
 
 /* ── Chart ── */
 var _cd=[], _sig=[], _obs_bull=[], _obs_bear=[], _fvg_bull=[], _fvg_bear=[];
@@ -5821,7 +5861,21 @@ function renderScreenerResults(results){
   var html='<div class="top20-row" style="'+cols+'">'+
     '<span>#</span><span>Монета</span><span>WR%</span><span>PF</span>'+
     '<span>DD%</span><span>T</span><span>$100→$</span><span>SL/TP/sw</span></div>';
-  results.forEach(function(e,i){\n    var r=e.result,p=e.params;\n    var wrC=r.winrate>=55?'green':r.winrate>=45?'yellow':'red';\n    var retC=r.total_return>=0?'green':'red';\n    var finalBal=Math.round(100*(1+r.total_return/100));\n    html+='<div class=\"top20-row\" style=\"'+cols+'\">'+\n      '<span style=\"color:#555\">'+(i+1)+'</span>'+\n      '<span style=\"color:#f0b800;font-size:10px\">'+e.sym+'</span>'+\n      '<span class=\"'+wrC+'\">'+r.winrate+'%</span>'+\n      '<span>'+r.profit_factor+'</span>'+\n      '<span class=\"red\">'+r.max_dd+'%</span>'+\n      '<span>'+r.trades+'</span>'+\n      '<span class=\"'+retC+'">$'+finalBal+'</span>'+\n      '<span style=\"color:#888\">'+p.sl_pct+'/'+p.tp_pct+'/'+p.swing_len+'</span>'+\n    '</div>';
+  results.forEach(function(e,i){
+    var r=e.result,p=e.params;
+    var wrC=r.winrate>=55?'green':r.winrate>=45?'yellow':'red';
+    var retC=r.total_return>=0?'green':'red';
+    var finalBal=Math.round(100*(1+r.total_return/100));
+    html+='<div class="top20-row" style="'+cols+'">'+
+      '<span style="color:#555">'+(i+1)+'</span>'+
+      '<span style="color:#f0b800;font-size:10px">'+e.sym+'</span>'+
+      '<span class="'+wrC+'">'+r.winrate+'%</span>'+
+      '<span>'+r.profit_factor+'</span>'+
+      '<span class="red">'+r.max_dd+'%</span>'+
+      '<span>'+r.trades+'</span>'+
+      '<span class="'+retC+'">$'+finalBal+'</span>'+
+      '<span style="color:#888">'+p.sl_pct+'/'+p.tp_pct+'/'+p.swing_len+'</span>'+
+    '</div>';
   });
   document.getElementById('screenerTable').innerHTML=html;
 }
