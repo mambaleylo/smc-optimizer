@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.39
+- v3.52.39: фикс — значок «⚡ офлайн» висел постоянно на Android.
+  Причина: navigator.onLine на Android WebView/Termux часто возвращает false
+  даже при живой сети — смотрит на сетевой интерфейс ОС, не на сервер.
+  Теперь вместо navigator.onLine: пинг /opt_status каждые 5с, если отвечает
+  — значок скрыт. Обработчики online/offline остались для быстрой реакции.
 SMC Optimizer v3.52.38
 - v3.52.38: улучшена вариативность перебора (Basin Hopping).
   1) Температура теперь считается от момента ПОСЛЕДНЕГО РЕСТАРТА (_temp_origin),
@@ -905,7 +911,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.38"
+APP_VERSION  = "3.52.39"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -5893,15 +5899,30 @@ _amoledBtnRefresh();
 if(_amoledOn){ _acquireWakeLock(); _resetAmoledTimer(); }
 
 // ── Индикатор сети ──────────────────────────────────────────────────────────
+// navigator.onLine ненадёжен на Android WebView/Termux: часто возвращает
+// false даже при живой сети, потому что смотрит на сетевой интерфейс ОС,
+// а не на реальную доступность сервера. Вместо этого пингуем сам сервер
+// лёгким запросом — если /opt_status отвечает, значит онлайн. v3.52.39.
 (function(){
   var nb = document.getElementById('netBadge');
   if(!nb) return;
-  function _netUpdate(){
-    nb.style.display = navigator.onLine ? 'none' : 'inline';
+  var _netOk = true;
+  function _netPing(){
+    fetch('/opt_status', {method:'GET', cache:'no-store'})
+      .then(function(r){
+        if(r.ok !== _netOk){ _netOk=r.ok; nb.style.display=_netOk?'none':'inline'; }
+        if(_netOk) nb.style.display='none';
+      })
+      .catch(function(){
+        if(_netOk){ _netOk=false; nb.style.display='inline'; }
+      });
   }
-  window.addEventListener('online',  _netUpdate);
-  window.addEventListener('offline', _netUpdate);
-  _netUpdate();
+  // Первая проверка сразу + каждые 5 секунд
+  _netPing();
+  setInterval(_netPing, 5000);
+  // Оставляем обработчики online/offline как подсказку для быстрого реагирования
+  window.addEventListener('online',  function(){ setTimeout(_netPing, 300); });
+  window.addEventListener('offline', function(){ nb.style.display='inline'; });
 })();
 </script></body></html>
 """.replace("__VER__", APP_VERSION)
