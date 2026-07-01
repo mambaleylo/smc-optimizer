@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.41
+- v3.52.41: фикс — найденный конфиг не применялся к графику автоматически.
+  Причина: авто-применение срабатывало ТОЛЬКО если вкладка «График» была
+  активна в момент нахождения нового best. Пользователь на вкладке
+  «Оптимизатор» (типичный случай) полностью пропускал обновление.
+  Переход на «График» вызывал switchTab→applyBestToChart, но к тому моменту
+  fitness мог улучшиться много раз, и визуально казалось что «не применяется».
+  Фикс: applyBestToChart() вызывается при каждом улучшении fitness (цикл>=30)
+  без проверки активной вкладки — всегда обновляет _chartExtra и поля формы,
+  loadChart запускает только если вкладка «График» активна (без лишней нагрузки
+  в фоне). При переходе на «График» switchTab→applyBestToChart() применяет
+  уже актуальные данные.
 SMC Optimizer v3.52.40
 - v3.52.40: КРИТИЧНО — при закрытии позиции по SL оставался висеть TP-ордер
   на бирже (и наоборот). Причина: _check_position_closed_and_alert()
@@ -920,7 +932,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.40"
+APP_VERSION  = "3.52.41"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -4639,8 +4651,11 @@ function applyBestToChart(){
   st_period:  p.st_period != null ? p.st_period : 10,
   st_mult:    p.st_mult   != null ? p.st_mult   : 3.0,
   };
-  // Применяем конфиг к графику без переключения вкладки
-  setTimeout(function(){ loadChart(); }, 80);
+  // v3.52.41: _chartExtra и поля обновляем всегда (чтобы при переходе на
+  // вкладку "График" уже были готовы). loadChart — только если вкладка активна.
+  if(document.getElementById('chartPanel').classList.contains('active')){
+    setTimeout(function(){ loadChart(); }, 80);
+  }
 }
 
 function toggleChartMonitor(){
@@ -5160,12 +5175,14 @@ function poll(){
       p._fitness = r.fitness;
       _bestParams = p;
       window._lastBestResult = r;
-      // Авто-применение: каждый раз когда fitness улучшился И цикл >= 30
+      // v3.52.41: авто-применение при каждом улучшении fitness (цикл >= 30).
+      // Раньше применялось ТОЛЬКО если вкладка "График" была активна в момент
+      // улучшения — пользователь на вкладке "Оптимизатор" пропускал обновление,
+      // а при переходе на "График" switchTab вызывал applyBestToChart() — но
+      // это ненадёжно (зависит от момента). Теперь всегда применяем в _chartExtra
+      // и перегружаем, если вкладка активна; при переходе switchTab применит сам.
       if((d.cycle||0) >= 30 && r.fitness > prevFit){
-        // Обновляем только если вкладка График активна — иначе обновится при переходе
-        if(document.getElementById('chartPanel').classList.contains('active')){
-          applyBestToChart();
-        }
+        applyBestToChart();
       }
       var wrC=r.winrate>=55?'green':r.winrate>=45?'yellow':'red';
       document.getElementById('bestCard').innerHTML=
