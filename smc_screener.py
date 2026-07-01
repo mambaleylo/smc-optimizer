@@ -1,5 +1,26 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.48
+- v3.52.48: два бага в открытии/защите реальной позиции на Gate.io.
+  (1) _gate_get_quanto() при ЛЮБОЙ ошибке сети/API (таймаут, обрыв,
+  невалидный JSON, неверный символ) молча возвращал дефолт 0.0001, без
+  единой строчки в лог — quanto_multiplier напрямую участвует в расчёте
+  размера позиции (size_raw = margin*leverage/(entry_px*qm)), и для
+  символов с реально другим множителем позиция открывалась в разы больше
+  или меньше задуманной. Остальной код в файле честно ретраит/алертит на
+  сетевых сбоях — здесь вместо этого тихо угадывал. Фикс: новая
+  _gate_get_contract_info() с кэшем спецификации контракта (quanto_multiplier
+  + order_price_round) бросает исключение при неудаче вместо тихого
+  дефолта; _gate_open_position уже обёрнута в try/except и корректно
+  прервёт открытие с алертом вместо угадывания размера.
+  (2) _gate_round_price() округляла цену TP/SL по захардкоженным порогам
+  диапазона цены (>1000/>10/>1), а не по реальному шагу цены (tick size)
+  конкретного контракта — для символов, где шаг не совпадал с угаданным
+  числом знаков, Gate.io мог отклонить триггерную цену как невыровненную,
+  и позиция оставалась без защиты именно из-за угадывания. Фикс: берёт
+  order_price_round из _gate_get_contract_info(); угадывание по диапазону
+  остаётся только явным резервом при неудаче получения спецификации
+  (с предупреждением в лог, не молча).
 SMC Optimizer v3.52.47
 - v3.52.47: КРИТИЧНО — синтаксическая ошибка в JS ломала ВЕСЬ <script> целиком.
   В функции renderScreenerResults() (таблица результатов "Скан всех монет")
@@ -1026,7 +1047,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.47"
+APP_VERSION  = "3.52.48"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -1293,12 +1314,43 @@ def _gate_get_price(symbol):
         return 0.0
 
 def _gate_get_quanto(symbol):
-    """Размер одного контракта в USDT (quanto_multiplier)."""
-    try:
-        data = requests.get(f"{GATE_API}/futures/usdt/contracts/{symbol}", timeout=5).json()
-        return float(data.get("quanto_multiplier", 0.0001))
-    except:
-        return 0.0001
+    """Размер одного контракта в USDT (quanto_multiplier).
+    v3.52.48: раньше при ЛЮБОЙ ошибке сети/API тихо подставлял 0.0001 —
+    для символов с реально другим множителем это искажало размер позиции
+    в разы без единой строчки в лог. Теперь бросает исключение при неудаче —
+    _gate_open_position уже обёрнут в try/except и корректно прервёт открытие
+    позиции с алертом, вместо угадывания размера."""
+    return _gate_get_contract_info(symbol)["quanto_multiplier"]
+
+_gate_contract_cache      = {}
+_gate_contract_cache_lock = threading.Lock()
+
+def _gate_get_contract_info(symbol, force_refresh=False):
+    """Спецификация контракта Gate.io (quanto_multiplier, шаг цены
+    order_price_round) с кэшем — спеки контракта практически никогда не
+    меняются, кэш экономит лишний HTTP-запрос на каждый ордер. Бросает
+    исключение при неудаче вместо тихих дефолтов (см. _gate_get_quanto/
+    _gate_round_price v3.52.48) — вызывающий код должен явно обработать
+    отказ, а не открыть/защитить позицию с угаданными параметрами."""
+    contract = symbol.replace("/", "_").upper()
+    if not force_refresh:
+        with _gate_contract_cache_lock:
+            cached = _gate_contract_cache.get(contract)
+        if cached:
+            return cached
+    r = requests.get(f"{GATE_API}/futures/usdt/contracts/{contract}", timeout=5)
+    if r.status_code != 200:
+        raise RuntimeError(f"Gate.io contracts/{contract} → {r.status_code}: {r.text[:200]}")
+    data = r.json()
+    if not isinstance(data, dict) or "quanto_multiplier" not in data:
+        raise RuntimeError(f"Gate.io contracts/{contract}: неожиданный ответ {data}")
+    info = {
+        "quanto_multiplier": float(data["quanto_multiplier"]),
+        "order_price_round": str(data.get("order_price_round", "0.01")),
+    }
+    with _gate_contract_cache_lock:
+        _gate_contract_cache[contract] = info
+    return info
 
 def _gate_get_balance():
     """Свободный баланс USDT (для расчёта размера новой позиции — именно
@@ -1449,11 +1501,31 @@ def _gate_close_position(symbol):
         olog(f"⚠ gate_close_position {symbol}: {e}")
 
 def _gate_round_price(price, contract):
-    """Округляет цену до нужной точности (как в WickFill)."""
-    if price > 1000:  return f"{price:.1f}"
-    if price > 10:    return f"{price:.2f}"
-    if price > 1:     return f"{price:.4f}"
-    return f"{price:.6f}"
+    """Округляет цену TP/SL до реального шага цены (order_price_round)
+    контракта на Gate.io.
+    v3.52.48: раньше округление угадывалось по диапазону цены (>1000/>10/>1)
+    вместо реального tick size биржи — для символов, у которых шаг цены не
+    совпадал с этим угаданным количеством знаков, Gate.io мог отклонить
+    триггерную цену TP/SL как невыровненную по тику, и позиция оставалась
+    без защиты именно из-за угадывания, а не настоящего сбоя сети. Теперь
+    берём order_price_round из спецификации контракта (с кэшем в
+    _gate_get_contract_info); угадывание по диапазону остаётся только как
+    последний резерв, если саму спецификацию контракта получить не удалось
+    (с явным предупреждением в лог, не молча)."""
+    try:
+        info = _gate_get_contract_info(contract)
+        tick_str = info.get("order_price_round", "0.01")
+        tick = float(tick_str)
+        decimals = len(tick_str.split(".")[1]) if "." in tick_str else 0
+        rounded = round(round(price / tick) * tick, decimals)
+        return f"{rounded:.{decimals}f}"
+    except Exception as e:
+        olog(f"⚠ _gate_round_price: не удалось получить шаг цены для {contract} "
+             f"({e}) — использую грубое округление по диапазону цены")
+        if price > 1000:  return f"{price:.1f}"
+        if price > 10:    return f"{price:.2f}"
+        if price > 1:     return f"{price:.4f}"
+        return f"{price:.6f}"
 
 def _gate_open_position(symbol, direction, entry_px, sl_px, tp_px, risk_pct, **kwargs):
     """
