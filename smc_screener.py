@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.44
+- v3.52.44: фикс несогласованности fitness между стартовым best и воркерами.
+  Стартовый best_result (строки инициализации) вычислялся с явным
+  sl_pct=sl_p/tp_pct=tp_p (UI-значения — нижние границы диапазона),
+  тогда как _worker_simulate вызывает _simulate без явных sl_pct/tp_pct и
+  берёт их из p["sl_pct"]/p["tp_pct"] (реальные перебранные значения).
+  Это делало начальный best_fit несравнимым с nb_r от воркеров: конфиги
+  с разными sl/tp имели разный rr_bonus и разный fee_mult, что смещало
+  начальную точку сравнения и могло приводить к ложным "улучшениям" (или
+  наоборот, пропуску реальных). Фикс: начальный best_result теперь тоже
+  без явных sl_pct/tp_pct — берёт их из params как и все воркеры.
+  Применено в run_optimizer и _run_one_sym_screener.
 SMC Optimizer v3.52.43
 - v3.52.43: два критических бага в авто-трейде.
   1) _wf_validate вызывался ТРИЖДЫ подряд (строки 1959→1965→1980) — каждый
@@ -956,7 +968,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.43"
+APP_VERSION  = "3.52.44"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -3547,7 +3559,7 @@ def run_optimizer():
         _saved_fit = _saved_cfg.get("result",{}).get("fitness","?")
         olog(f"♻ Найден сохранённый конфиг для {sym} {tf} (fitness={_saved_fit}) — стартуем от него")
         best_params = _sp
-    best_result  = _simulate(candles, best_params, sl_pct=sl_p, tp_pct=tp_p, risk_pct=risk)
+    best_result  = _simulate(candles, best_params, risk_pct=risk)
     best_fit     = best_result["fitness"] if best_result else 0.0
     top20        = []
     cycle        = 0
@@ -3897,7 +3909,7 @@ def _run_one_sym_screener(sym, tf, days, sl_p, tp_p, risk, max_sl_p=1.0, max_tp_
             elif _spec["type"] in ("cat","bool") and _sp[_k] not in _spec["values"]:
                 _sp[_k] = random.choice(_spec["values"])
         best_params = _sp
-    best_result = _simulate(candles, best_params, sl_pct=sl_p, tp_pct=tp_p, risk_pct=risk)
+    best_result = _simulate(candles, best_params, risk_pct=risk)
     best_fit    = best_result["fitness"] if best_result else 0.0
     for cycle in range(1, max_cycles + 1):
         if _screener_stop.is_set(): return None
