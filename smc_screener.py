@@ -1,5 +1,31 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.46
+- v3.52.46: три бага в системе перебора и поиска лучшего конфига.
+  (1) Рассинхрон fitness при смене весов эквалайзера "на ходу". POST
+  /fitness_weights просто подменял глобальный FITNESS_WEIGHTS, но best_fit/
+  top20 уже работающего оптимизатора оставались посчитаны на СТАРЫХ весах,
+  а новые кандидаты сразу оценивались по новым (через свежий _fw_snap на
+  каждый батч) — сравнение `nfit > best_fit` сравнивало fitness из разных
+  систем координат (тот же класс бага, что чинили для sl_pct/tp_pct в
+  v3.52.44). Фикс: логика пере-оценки top20/best (раньше жила только внутри
+  обновления свечей) вынесена в общую функцию _rescore_top20() и теперь
+  вызывается также при обнаружении изменения весов в начале каждого цикла.
+  (2) _neighbour(p, temp) — параметр temp управляет силой мутации (1-4
+  параметра, дельта шагов), добавлен в v3.52.37 для одиночного
+  оптимизатора. Но _run_one_sym_screener (скрининг всех монет) и
+  _wt_bh_on_slice (автотюнинг весов эквалайзера) вычисляли temp для
+  критерия Метрополиса, но НЕ передавали его в _neighbour() — оба всегда
+  мутировали по дефолтному temp=0.1 (1 параметр, минимальный шаг) даже на
+  "горячих" первых итерациях, из-за чего скрининг и автотюнинг находили
+  заметно более слабые конфиги чем одиночный оптимизатор при том же числе
+  итераций. Фикс: temp теперь передаётся в обоих местах.
+  (3) /scan и /scan_all не проверяли друг друга — оба пишут в общий
+  глобальный PARAM_SPACE["sl_pct"/"tp_pct"]["min"/"max"] без блокировки.
+  При параллельном запуске одиночного оптимизатора и скрининга всех монет
+  (например с двух вкладок/устройств) они перетирали друг другу границы
+  SL%/TP%, что ломало генерацию кандидатов и клэмпинг тёплого старта.
+  Фикс: /scan теперь отказывает если работает /scan_all и наоборот.
 SMC Optimizer v3.52.45
 - v3.52.45: тёмная тема — синий акцент (--accent/--accent2, использовался
   в заголовке, вкладках, кнопках, ползунке эквалайзера) заменён на
@@ -977,7 +1003,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.45"
+APP_VERSION  = "3.52.46"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -3206,7 +3232,7 @@ def _wt_bh_on_slice(candles_slice, sl_p, tp_p, risk, fw, cycles=20):
             cur_f = cur_r["fitness"] if cur_r else 0.0
             for _ in range(30):
                 if _weight_tune_stop.is_set(): break
-                nb_p = _neighbour(cur_p)
+                nb_p = _neighbour(cur_p, temp)
                 nb_p["sl_pct"] = sl_p; nb_p["tp_pct"] = tp_p
                 nb_r = _simulate(candles_slice, nb_p, sl_pct=sl_p, tp_pct=tp_p,
                                  risk_pct=risk, fitness_weights=fw)
@@ -3629,6 +3655,49 @@ def run_optimizer():
     tf_sec_refresh    = TF_SECONDS.get(tf, 900)
     last_candle_fetch = time.time()
 
+    # v3.52.46: общий пере-оценщик top20/best — используется и при обновлении
+    # свечей, и при смене весов эквалайзера "на ходу" (см. ниже). Раньше
+    # /fitness_weights просто подменял глобальный FITNESS_WEIGHTS, а best_fit/
+    # top20 уже работающего оптимизатора оставались посчитаны на СТАРЫХ весах —
+    # новые кандидаты (nb_r) сразу оценивались по новым весам через _fw_snap,
+    # и сравнение `nfit > best_fit` сравнивало fitness из разных систем
+    # координат (тот же класс бага, что чинили для sl_pct/tp_pct в v3.52.44,
+    # только для FITNESS_WEIGHTS).
+    def _rescore_top20(cur_candles):
+        rescored = []
+        for entry in top20:
+            r = _simulate(cur_candles, entry["params"], risk_pct=risk)
+            if r:
+                rescored.append({"params": entry["params"], "result": r})
+        br = _simulate(cur_candles, best_params, risk_pct=risk)
+        if br:
+            rescored.append({"params": best_params, "result": br})
+        rescored.sort(key=lambda x: x["result"]["fitness"], reverse=True)
+        deduped = []
+        for e in rescored:
+            if not any(abs(e["result"]["fitness"] - d["result"]["fitness"]) < 0.001
+                       for d in deduped):
+                deduped.append(e)
+        new_top20 = deduped[:20]
+        if new_top20:
+            nb_params, nb_result = new_top20[0]["params"], new_top20[0]["result"]
+            nb_fit = nb_result["fitness"]
+        else:
+            nb_params, nb_result, nb_fit = best_params, None, 0.0
+        e_wr = e_dd = e_pf = None
+        for _e in new_top20[:5]:
+            _er = _e["result"]
+            if e_wr is None or _er.get("winrate",0) > e_wr["result"].get("winrate",0):
+                e_wr = _e
+            if e_dd is None or _er.get("max_dd",100) < e_dd["result"].get("max_dd",100):
+                e_dd = _e
+            if e_pf is None or _er.get("profit_factor",0) > e_pf["result"].get("profit_factor",0):
+                e_pf = _e
+        return new_top20, nb_params, nb_result, nb_fit, e_wr, e_dd, e_pf
+
+    with fitness_w_lock:
+        _last_fw_snap = dict(FITNESS_WEIGHTS)
+
     try:
         while not _stop_flag.is_set():
             cycle += 1
@@ -3645,6 +3714,23 @@ def run_optimizer():
             with opt_lock:
                 opt_state["cycle"] = cycle
                 opt_state["eco_mode"] = eco_mode
+
+            # v3.52.46: веса эквалайзера могли поменяться "на ходу" — если
+            # изменились, пере-оцениваем top20/best под новые веса ДО того
+            # как новые кандидаты начнут с ними сравниваться.
+            with fitness_w_lock:
+                _fw_now = dict(FITNESS_WEIGHTS)
+            if _fw_now != _last_fw_snap and (top20 or best_result):
+                (top20, best_params, best_result, best_fit,
+                 _elite_wr, _elite_dd, _elite_pf) = _rescore_top20(candles)
+                no_improve = 0
+                with opt_lock:
+                    opt_state["top20"] = top20
+                    opt_state["best"]  = ({"params": best_params, "result": best_result}
+                                           if best_result else None)
+                olog(f"🎛 Цикл {cycle}: веса эквалайзера изменены — top20/best "
+                     f"пере-оценены под новые веса, best fit={best_fit:.4f}")
+            _last_fw_snap = _fw_now
 
             if time.time() - last_candle_fetch >= tf_sec_refresh:
                 olog(f"🔄 Цикл {cycle}: обновляю набор свечей "
@@ -3671,40 +3757,9 @@ def run_optimizer():
                     # v3.52.21: вместо полного сброса top20=[] лениво пере-оцениваем
                     # те же params на новом окне — params остаются валидными
                     # отправными точками поиска, меняется только их fitness.
-                    rescored = []
-                    for entry in top20:
-                        r = _simulate(candles, entry["params"], risk_pct=risk)
-                        if r:
-                            rescored.append({"params": entry["params"], "result": r})
-                    br = _simulate(candles, best_params, risk_pct=risk)
-                    if br:
-                        rescored.append({"params": best_params, "result": br})
-                    rescored.sort(key=lambda x: x["result"]["fitness"], reverse=True)
-                    deduped = []
-                    for e in rescored:
-                        if not any(abs(e["result"]["fitness"] - d["result"]["fitness"]) < 0.001
-                                   for d in deduped):
-                            deduped.append(e)
-                    top20 = deduped[:20]
-                    if top20:
-                        best_params = top20[0]["params"]
-                        best_result = top20[0]["result"]
-                        best_fit    = best_result["fitness"]
-                    else:
-                        best_result = None
-                        best_fit    = 0.0
+                    (top20, best_params, best_result, best_fit,
+                     _elite_wr, _elite_dd, _elite_pf) = _rescore_top20(candles)
                     no_improve  = 0
-                    # v3.52.42: при смене окна свечей элиты пере-оцениваем
-                    # на новом окне — иначе их fitness несравним с текущим best
-                    _elite_wr = _elite_dd = _elite_pf = None
-                    for _e in top20[:5]:
-                        _er = _e["result"]; _ep = _e["params"]
-                        if _elite_wr is None or _er.get("winrate",0) > _elite_wr["result"].get("winrate",0):
-                            _elite_wr = _e
-                        if _elite_dd is None or _er.get("max_dd",100) < _elite_dd["result"].get("max_dd",100):
-                            _elite_dd = _e
-                        if _elite_pf is None or _er.get("profit_factor",0) > _elite_pf["result"].get("profit_factor",0):
-                            _elite_pf = _e
                     with opt_lock:
                         opt_state["top20"] = top20
                         opt_state["best"]  = ({"params": best_params, "result": best_result}
@@ -3931,7 +3986,7 @@ def _run_one_sym_screener(sym, tf, days, sl_p, tp_p, risk, max_sl_p=1.0, max_tp_
             cur_f = cur_r["fitness"] if cur_r else 0.0
             for _ in range(60):
                 if _screener_stop.is_set(): return None
-                nb_p = _neighbour(cur_p)
+                nb_p = _neighbour(cur_p, temp)
                 nb_r = _simulate(candles, nb_p, risk_pct=risk)
                 if not nb_r: continue
                 nfit = nb_r["fitness"]
@@ -6193,6 +6248,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.path == "/scan":
             if _opt_thread and _opt_thread.is_alive():
                 self._json({"ok":False,"msg":"уже работает"}); return
+            if _screener_thread and _screener_thread.is_alive():
+                self._json({"ok":False,"msg":"скрининг всех монет уже идёт — дождитесь окончания или остановите его (они делят общие границы SL/TP и не могут работать одновременно)"}); return
             _stop_flag.clear()
             _scan_symbol = body.get("symbol","BTC_USDT")
             with opt_lock:
@@ -6223,6 +6280,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             try:
                 if _screener_thread and _screener_thread.is_alive():
                     self._json({"ok":False,"msg":"скрининг уже идёт"}); return
+                if _opt_thread and _opt_thread.is_alive():
+                    self._json({"ok":False,"msg":"одиночный оптимизатор уже работает — дождитесь окончания или остановите его (они делят общие границы SL/TP и не могут работать одновременно)"}); return
                 _screener_stop.clear()
                 with screener_lock:
                     screener_state.update({
