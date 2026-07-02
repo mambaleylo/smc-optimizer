@@ -1,5 +1,31 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.49
+- v3.52.49: два бага с чтением чужого глобального opt_state вместо
+  собственного контекста.
+  (1) _wf_validate() (walk-forward гейт авто-трейда) брала train_days/
+  train_offset из opt_state["days"]/["offset_days"] — полей формы
+  ОДИНОЧНОГО оптимизатора (вкладка "Оптимизатор"), перезаписываемых при
+  каждом /scan под ЛЮБОЙ символ. Если пока авто-трейд торговал символ A,
+  на вкладке "Оптимизатор" запускался прогон для другого символа B — OOS-
+  окно проверки сигналов символа A тихо начинало считаться по days/offset
+  символа B, никак не связанным с тем, на чём реально обучался конфиг A.
+  Плюс кэш _wf_cache не учитывал train_days/offset в ключе — устаревший
+  результат мог продолжать отдаваться даже после того как opt_state
+  вернулся к прежним значениям. Фикс: train_days/train_offset теперь
+  передаются явно вызывающим кодом (_auto_trade_loop использует
+  собственное auto_trade_state["days"], offset=0 — самодостаточная OOS-
+  проверка, не зависящая от формы одиночного оптимизатора); добавлены в
+  ключ кэша.
+  (2) _gh_save_best() читала opt_state["symbol"]/["tf"] ВНУТРИ фонового
+  потока, запускаемого асинхронно при находке нового best — если между
+  запуском потока и его реальным исполнением пользователь успевал
+  стартовать новый /scan для другого символа, opt_state уже указывал на
+  него, и найденный best символа A пушился на GitHub под именем файла
+  символа B (configs/best_{sym}_{tf}.json), затирая его сохранённую
+  историю. Фикс: sym/tf теперь передаются явным аргументом, захваченным
+  из локальной (а не глобальной) области run_optimizer() в момент
+  находки — иммунно к последующей смене opt_state.
 SMC Optimizer v3.52.48
 - v3.52.48: два бага в открытии/защите реальной позиции на Gate.io.
   (1) _gate_get_quanto() при ЛЮБОЙ ошибке сети/API (таймаут, обрыв,
@@ -1047,7 +1073,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.48"
+APP_VERSION  = "3.52.49"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -1740,18 +1766,26 @@ def _bootstrap_ci(trades, n_resamples=1000, ci=0.80):
 # "повезло на этом конкретном наборе сделок".
 _wf_cache = {"key": None, "passed": None, "detail": ""}
 
-def _wf_validate(sym, tf, params, risk_pct):
+def _wf_validate(sym, tf, params, risk_pct, train_days, train_offset=0):
     """Возвращает (passed, detail). passed: True/False — проверка прошла/не
     прошла, None — не удалось проверить (мало OOS-данных/ошибка фетча, в
     этом случае сделку лучше не блокировать навсегда — fail-open с пометкой
-    в логе, а не fail-closed по причине нехватки истории)."""
+    в логе, а не fail-closed по причине нехватки истории).
+
+    v3.52.49: train_days/train_offset раньше читались из глобального
+    opt_state["days"]/["offset_days"] — полей формы ОДИНОЧНОГО оптимизатора
+    (вкладка "Оптимизатор"), которые перезаписываются при каждом запуске
+    /scan под ЛЮБОЙ символ. Если пока авто-трейд торгует символ A, на
+    вкладке "Оптимизатор" запускался прогон для другого символа B — OOS-окно
+    проверки сигналов символа A тихо начинало считаться по days/offset
+    символа B. Теперь окно передаётся явно вызывающим кодом (auto-trade
+    использует собственное auto_trade_state["days"], независимо от того,
+    что сейчас происходит в форме одиночного оптимизатора)."""
     global _wf_cache
-    key = (sym, tf, tuple(sorted((k, str(v)) for k, v in params.items())))
+    key = (sym, tf, tuple(sorted((k, str(v)) for k, v in params.items())),
+           train_days, train_offset)
     if _wf_cache["key"] == key:
         return _wf_cache["passed"], _wf_cache["detail"]
-    with opt_lock:
-        train_days   = int(opt_state.get("days", 30))
-        train_offset = int(opt_state.get("offset_days", 0))
     oos_offset = train_offset + train_days
     try:
         oos_candles = _fetch_candles(sym, tf, train_days, offset_days=oos_offset)
@@ -2112,7 +2146,7 @@ def _auto_trade_loop():
                                         # достаточно оптимизированы.
                                         with auto_trade_lock:
                                             auto_trade_state["last_entry_ts"] = entry_ts
-                                    elif (_wf_result := _wf_validate(sym, tf, p, risk_pct))[0] is False:
+                                    elif (_wf_result := _wf_validate(sym, tf, p, risk_pct, train_days=days, train_offset=0))[0] is False:
                                         # v3.52.22: настоящая OOS-проверка — params прогнаны через
                                         # _simulate на окне, которое оптимизатор НЕ видел во время
                                         # поиска. None (мало OOS-данных/ошибка фетча) не блокирует —
@@ -3113,9 +3147,16 @@ def _gh_request(method, path, body=None):
         olog(f"gh error {method} {path}: {e}")
         return None
 
-def _gh_save_best(best):
+def _gh_save_best(best, sym, tf):
+    """sym/tf передаются явно вызывающим кодом (захвачены в момент находки
+    best), а не читаются из глобального opt_state здесь.
+    v3.52.49: раньше читал opt_state["symbol"]/["tf"] прямо в теле функции,
+    исполняемой в фоновом потоке — если между запуском потока и его
+    реальным исполнением пользователь успевал стартовать новый /scan для
+    другого символа, opt_state уже указывал на него, и найденный best
+    символа A пушился на GitHub под именем файла символа B."""
     if not GH_TOKEN: return
-    sym = opt_state["symbol"].replace("/","_"); tf = opt_state["tf"]
+    sym = sym.replace("/","_")
     fname = f"configs/best_{sym}_{tf}.json"
     existing = _gh_request("GET", f"contents/{fname}")
     sha = existing.get("sha","") if existing else ""
@@ -3734,7 +3775,7 @@ def run_optimizer():
              f"SL={nb_p['sl_pct']}% TP={nb_p['tp_pct']}% "
              f"swing={nb_p['swing_len']}")
         threading.Thread(target=_gh_save_best,
-            args=({"params": nb_p, "result": nb_r},), daemon=True).start()
+            args=({"params": nb_p, "result": nb_r}, sym, tf), daemon=True).start()
 
     with opt_lock:
         opt_state["top20"] = top20
