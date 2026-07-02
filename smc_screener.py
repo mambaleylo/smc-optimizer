@@ -1,5 +1,30 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.51
+- v3.52.51: два бага из-за которых "лучший конфиг" на UI отставал от
+  реального топ-1 в top20 (в т.ч. кнопка "Открыть на графике" применяла
+  старый конфиг вместо текущего топ-1).
+  (1) opt_state["best"] безусловно обнулялся в None при (пере)старте
+  оптимизатора — даже если строчкой выше уже был посчитан best_result
+  (например из тёплого старта — уже сильный сохранённый конфиг). Клиент
+  получал best=None и не обновлял _bestParams, пока НОВЫЙ цикл случайно не
+  побьёт fitness тёплого старта — а тёплый старт уже близок к оптимуму,
+  побить его могло не получаться очень долго. Фикс: инициализируем
+  opt_state["best"] из уже посчитанного best_result, а не в None.
+  (2) "Полный рестарт" после N циклов без улучшения (защита от тупиков)
+  переприсваивал best_params = случайный конфиг — а это ТА ЖЕ переменная,
+  что хранит РЕАЛЬНО лучший найденный конфиг для UI/_rescore_top20/
+  _save_best_config. best_fit/best_result/opt_state["best"] при этом не
+  трогались, так что до следующего улучшения _rescore_top20() (при
+  обновлении свечей) пересчитывал fitness СЛУЧАЙНОГО конфига под именем
+  "best_params" вместо реального лучшего. Настоящий лучший обычно спасался
+  за счёт того, что сам оставался отдельной записью в top20 — но это
+  хрупко: если его вытесняли из top20 при переоценке на новых свечах, UI
+  терял реальный best безвозвратно. Фикс: заведена отдельная переменная
+  anchor_params — именно она сбрасывается на рестарте и используется для
+  генерации новых стартовых точек поиска (_shake/_crossover); best_params
+  теперь МЕНЯЕТСЯ ТОЛЬКО при настоящем улучшении fitness (nfit>best_fit)
+  и никогда не подменяется рабочей точкой поиска.
 SMC Optimizer v3.52.50
 - v3.52.50: кнопка "Открыть на графике" не переключала вкладку — вызывала
   applyBestToChart() напрямую, а та грузит график (loadChart()) только если
@@ -1085,7 +1110,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.50"
+APP_VERSION  = "3.52.51"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -3744,6 +3769,11 @@ def run_optimizer():
         best_params = _sp
     best_result  = _simulate(candles, best_params, risk_pct=risk)
     best_fit     = best_result["fitness"] if best_result else 0.0
+    # v3.52.51: anchor_params — точка, ОТ которой генерируются новые старты
+    # ("встряска"/кроссовер), отдельно от best_params (который должен
+    # означать ТОЛЬКО реально лучший найденный конфиг и никогда не
+    # подменяться "рабочей" точкой поиска — см. фикс рестарта ниже).
+    anchor_params = best_params
     top20        = []
     cycle        = 0
     TEMP_START   = 1.0
@@ -3791,7 +3821,16 @@ def run_optimizer():
 
     with opt_lock:
         opt_state["top20"] = top20
-        opt_state["best"]  = None
+        # v3.52.51: раньше здесь стояло безусловное None, даже если строчкой
+        # выше best_result уже посчитан (в т.ч. из тёплого старта — уже
+        # найденный ранее сильный конфиг). UI получал best=None и не обновлял
+        # _bestParams на клиенте, пока новый цикл случайно не побьёт fitness
+        # тёплого старта — а это могло не происходить очень долго (тёплый
+        # старт уже близок к оптимуму). Кнопка "Открыть на графике" при этом
+        # применяла старый _bestParams, оставшийся в браузере с прошлой
+        # сессии, а не текущий top20[0].
+        opt_state["best"]  = ({"params": best_params, "result": best_result}
+                               if best_result else None)
 
     # ── Периодическое обновление набора свечей ───────────────────────────
     # candles грузились ОДИН раз перед стартом и больше никогда не обновлялись
@@ -3871,6 +3910,7 @@ def run_optimizer():
             if _fw_now != _last_fw_snap and (top20 or best_result):
                 (top20, best_params, best_result, best_fit,
                  _elite_wr, _elite_dd, _elite_pf) = _rescore_top20(candles)
+                anchor_params = best_params  # v3.52.51: точка поиска идёт за новым best
                 no_improve = 0
                 with opt_lock:
                     opt_state["top20"] = top20
@@ -3907,6 +3947,7 @@ def run_optimizer():
                     # отправными точками поиска, меняется только их fitness.
                     (top20, best_params, best_result, best_fit,
                      _elite_wr, _elite_dd, _elite_pf) = _rescore_top20(candles)
+                    anchor_params = best_params  # v3.52.51: точка поиска идёт за новым best
                     no_improve  = 0
                     with opt_lock:
                         opt_state["top20"] = top20
@@ -3937,8 +3978,21 @@ def run_optimizer():
                     except Exception as e:
                         olog(f"⚠ Не удалось отправить best при рестарте: {e}")
                     _pending_announce = None
-                best_params = _random_params()
-                best_params["sl_pct"] = sl_p; best_params["tp_pct"] = tp_p
+                # v3.52.51: раньше здесь переприсваивался best_params — та же
+                # переменная, что хранит РЕАЛЬНО лучший найденный конфиг для
+                # UI/_rescore_top20/_save_best_config. После рестарта
+                # best_params становился случайным, а best_fit/best_result/
+                # opt_state["best"] — нет: до следующего улучшения _simulate()
+                # внутри _rescore_top20 (при обновлении свечей) считал
+                # fitness СЛУЧАЙНОГО конфига под именем "best_params", а не
+                # реального лучшего. Настоящий лучший конфиг при этом обычно
+                # спасался за счёт top20 (сам остаётся отдельной записью),
+                # но это хрупко — если его вытеснят из top20 при переоценке
+                # на новых свечах, UI мог потерять реальный best. Теперь
+                # рестарт трогает только anchor_params (точку для генерации
+                # новых стартов поиска) — best_params остаётся нетронутым.
+                anchor_params = _random_params()
+                anchor_params["sl_pct"] = sl_p; anchor_params["tp_pct"] = tp_p
                 _temp_origin = cycle   # v3.52.38: сбрасываем температуру
                 no_improve  = 0
                 # v3.52.42: при рестарте сбрасываем элиты — иначе
@@ -3950,7 +4004,7 @@ def run_optimizer():
                 olog(f"⚡ Цикл {cycle}: встряска strength={strength:.2f} (стагнация {no_improve})")
 
             # Несколько стартовых точек за цикл
-            starts = [_shake(best_params, 0.4) if best_params else _random_params(),
+            starts = [_shake(anchor_params, 0.4) if anchor_params else _random_params(),
                       _random_params()]
             if len(top20) > 2:
                 starts.append(_shake(random.choice(top20)["params"], 0.3))
@@ -3961,11 +4015,11 @@ def run_optimizer():
             # v3.52.38: элиты по метрикам — кросс-овер лучшего fitness с
             # лучшим WR / DD / PF (скрещиваем разные «специализации»)
             if _elite_wr and len(top20) >= 2:
-                starts.append(_crossover(best_params, _elite_wr["params"]))
+                starts.append(_crossover(anchor_params, _elite_wr["params"]))
             if _elite_dd and cycle % 3 == 0:
-                starts.append(_crossover(best_params, _elite_dd["params"]))
+                starts.append(_crossover(anchor_params, _elite_dd["params"]))
             if _elite_pf and cycle % 5 == 0:
-                starts.append(_crossover(best_params, _elite_pf["params"]))
+                starts.append(_crossover(anchor_params, _elite_pf["params"]))
             # v3.52.37: diversity-старт — раз в 7 циклов добавляем точку
             # максимально далёкую от best (анти-эксплуатация): полностью
             # случайная конфигурация, но с фиксированными SL/TP из UI
@@ -3975,7 +4029,7 @@ def run_optimizer():
                 starts.append(_div)
             if no_improve >= SHAKE_AFTER:
                 strength = 0.5 + 0.05 * (no_improve - SHAKE_AFTER)
-                starts.append(_shake(best_params, min(strength, 0.9)))
+                starts.append(_shake(anchor_params, min(strength, 0.9)))
                 if len(top20) > 0:
                     starts.append(_shake(top20[0]["params"], min(strength, 0.9)))
 
@@ -4035,9 +4089,10 @@ def run_optimizer():
                                 opt_state["top20"] = top20[:20]
 
                         if nfit > best_fit:
-                            best_fit    = nfit
-                            best_params = nb_p
-                            best_result = nb_r
+                            best_fit      = nfit
+                            best_params   = nb_p
+                            best_result   = nb_r
+                            anchor_params = nb_p  # v3.52.51: держим anchor на реальном лучшем
                             no_improve  = 0
                             with opt_lock:
                                 opt_state["best"] = {"params": nb_p, "result": nb_r}
