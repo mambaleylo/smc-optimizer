@@ -1,5 +1,27 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.55
+- v3.52.55: продолжение фикса v3.52.54 — та версия только ОПИСЫВАЛА дедуп
+  top20 по params вместо fitness, но по факту защита best-записи всё ещё
+  сравнивала params через `==` (отсюда дублирующиеся строки #1/#2 в топ-20
+  с идентичными WR/PF/DD/T и метка ● не на первой строке). `==` для dict с
+  float валится в False при совпадающих по смыслу, но различающихся на
+  уровне ULP числах (params из warm-start/сохранённого конфига против
+  params, построенных в _neighbour() в текущем цикле) — из-за этого:
+  (1) best-запись задваивалась в top20 вместо того, чтобы считаться уже
+  присутствующей — две одинаковые на вид строки подряд;
+  (2) при сортировке такой почти-дубль мог оказаться выше реально
+  применённой к графику записи — топ-1 в списке переставал совпадать с
+  тем, что на графике, метка ● "убегала" вниз или пропадала;
+  (3) на клиенте та же болезнь: _bestParamsKey/eKey сравнивались как
+  JSON.stringify(params) побайтово — то же ULP-расхождение туда же.
+  Фикс: добавлена _params_equal(a, b, tol=1e-6) — сравнение с допуском для
+  float, используется везде вместо `==` (защита best-записи от вымывания +
+  финальный дедуп-проход top20 ПО ПАРАМЕТРАМ после каждого обновления, и в
+  _rescore_top20 — сначала убираем настоящие дубликаты по params, потом
+  почти-близнецов по fitness). На клиенте — аналогичный _paramsKey() с
+  округлением чисел до 1e-6 перед сериализацией вместо сырого
+  JSON.stringify, используется и для isNewBest, и для метки ● (isApplied).
 SMC Optimizer v3.52.54
 - v3.52.54: НАСТОЯЩАЯ причина "точка применённого конфига в топ-20 пропадает,
   а лучший конфиг перестаёт обновляться" (при этом best fit в логе честно
@@ -1173,7 +1195,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.54"
+APP_VERSION  = "3.52.55"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -3765,6 +3787,38 @@ def _chart_monitor_loop(sym, tf, days, p):
         _chart_mon_stop.wait(timeout=max(5, sleep_for))
     olog("🔕 Монитор графика остановлен")
 
+def _params_equal(a, b, tol=1e-6):
+    """Сравнение двух наборов параметров с допуском для float.
+    v3.52.55: раньше top20-дедуп сравнивал params через `==` (см. правку
+    ниже) — при точном совпадении СОДЕРЖИМОГО, но разном происхождении
+    объектов (например, best_params, восстановленный из warm-start/JSON,
+    против params, только что построенного в _neighbour()), float-значения
+    могут отличаться на долю ULP (0.6 vs 0.6000000000000001) — `==` для
+    dict в этом случае возвращает False, хотя конфиг фактически один и тот
+    же. Это и вызывало дублирующиеся строки в топ-20 (одинаковые WR/PF/DD/T
+    в UI, но "разные" по мнению дедупа) и потерю метки "применено к
+    графику" (●), когда её строка вытеснялась почти-дублем ниже топ-1.
+    Сравниваем поэтому не по идентичности объектов/строк, а по значениям
+    с допуском для чисел с плавающей точкой."""
+    if a is b:
+        return True
+    if a is None or b is None:
+        return a is b
+    if set(a.keys()) != set(b.keys()):
+        return False
+    for k, va in a.items():
+        vb = b[k]
+        if isinstance(va, float) or isinstance(vb, float):
+            try:
+                if abs(float(va) - float(vb)) > tol:
+                    return False
+            except (TypeError, ValueError):
+                if va != vb:
+                    return False
+        elif va != vb:
+            return False
+    return True
+
 # ─── Основной оптимизатор ───────────────────────────────────────────────────
 def run_optimizer():
     global _opt_thread
@@ -3935,9 +3989,19 @@ def run_optimizer():
         rescored.sort(key=lambda x: x["result"]["fitness"], reverse=True)
         deduped = []
         for e in rescored:
-            if not any(abs(e["result"]["fitness"] - d["result"]["fitness"]) < 0.001
-                       for d in deduped):
-                deduped.append(e)
+            # v3.52.55: раньше дедуп смотрел ТОЛЬКО на близость fitness
+            # (|Δfit|<0.001) — мог случайно слить в одну запись два РАЗНЫХ
+            # конфига с похожим результатом, а мог и пропустить настоящий
+            # дубликат (тот же params), если пере-оценка на новых свечах
+            # развела их fitness чуть дальше 0.001. Сначала отбрасываем
+            # настоящие дубликаты по _params_equal, и только потом —
+            # почти-близнецов по fitness.
+            if any(_params_equal(e["params"], d["params"]) for d in deduped):
+                continue
+            if any(abs(e["result"]["fitness"] - d["result"]["fitness"]) < 0.001
+                   for d in deduped):
+                continue
+            deduped.append(e)
         new_top20 = deduped[:20]
         if new_top20:
             nb_params, nb_result = new_top20[0]["params"], new_top20[0]["result"]
@@ -4176,9 +4240,20 @@ def run_optimizer():
                                 # сравниваем по самим params (сериализованно), а не
                                 # по fitness, так что настоящий best никогда не
                                 # вытесняется "почти-дубликатом" по значению fitness.
-                                if not any(e["params"] == best_params for e in top20):
+                                if not any(_params_equal(e["params"], best_params) for e in top20):
                                     top20.append({"params": best_params, "result": best_result})
-                                top20.sort(key=lambda x: x["result"]["fitness"], reverse=True)
+                                # v3.52.55: финальный проход дедупликации ПО ПАРАМЕТРАМ
+                                # (не по fitness) — раньше в top20 могли уживаться две
+                                # записи с фактически идентичными params (float-ULP
+                                # разница, см. _params_equal), выглядевшие в UI как две
+                                # одинаковые строки подряд, и метка "применено к графику"
+                                # могла оказаться не на той из них. Оставляем по одной
+                                # записи на уникальный набор params — с более высоким fitness.
+                                _deduped20 = []
+                                for _e in sorted(top20, key=lambda x: x["result"]["fitness"], reverse=True):
+                                    if not any(_params_equal(_e["params"], _d["params"]) for _d in _deduped20):
+                                        _deduped20.append(_e)
+                                top20 = _deduped20
                                 opt_state["top20"] = top20[:20]
 
                         if nfit > best_fit:
@@ -4768,6 +4843,20 @@ input:focus,select:focus{outline:none;border-color:var(--accent)}
 
 var _bestParams = null;
 var _bestParamsKey = null;  // v3.52.52: сериализованные params последнего применённого best (не fitness)
+// v3.52.55: раньше ключ строился JSON.stringify(params) "как есть" — если
+// сервер присылал ФАКТИЧЕСКИ тот же конфиг, но с числом, отличающимся на
+// долю ULP (та же причина, что чинили в _params_equal на Python-стороне),
+// строки не совпадали побайтово, и зелёная метка "применено к графику"
+// (●) переставала находить свою строку в топ-20 (или находила не ту при
+// дублирующихся строках). _paramsKey округляет числа перед сериализацией,
+// чтобы такие ULP-отличия не ломали сравнение ключей.
+function _paramsKey(p){
+  return JSON.stringify(p, function(k,v){
+    if(k==='_fitness') return undefined;
+    if(typeof v==='number') return Math.round(v*1e6)/1e6;
+    return v;
+  });
+}
 var _autoAppliedAt30 = false;
 var _chartExtra = {internal_len:5, ob_filter:'atr', ob_mitigation:'highlow',
   fvg_enabled:true, fvg_threshold:0.1, choch_only:false, use_internal:true,
@@ -5599,7 +5688,7 @@ function _renderBestAndTop20(d){
     // ДРУГОЙ набор параметров как best, значит best реально сменился, и мы
     // применяем его к графику независимо от того, выше или ниже пересчитанный
     // fitness относительно того, что было показано раньше.
-    var pKey = JSON.stringify(p, function(k,v){ return k==='_fitness'?undefined:v; });
+    var pKey = _paramsKey(p);
     var isNewBest = (pKey !== _bestParamsKey);
     _bestParamsKey = pKey;
     _bestParams = p;
@@ -5654,7 +5743,7 @@ function _renderBestAndTop20(d){
       // Помечаем зелёной полосой именно ту строку, чей ПОЛНЫЙ набор
       // параметров сейчас реально применён к графику (сравниваем не
       // отображаемые 3 числа, а весь объект params, как и в isNewBest выше).
-      var eKey = JSON.stringify(p, function(k,v){ return k==='_fitness'?undefined:v; });
+      var eKey = _paramsKey(p);
       var isApplied = _bestParamsKey && (eKey === _bestParamsKey);
       html+='<div class="top20-row'+(isApplied?' applied':'')+'"'+(isApplied?' title="Это применено к графику сейчас"':'')+'>'+
         '<span style="color:#555">'+(i+1)+(isApplied?' ●':'')+'</span>'+
