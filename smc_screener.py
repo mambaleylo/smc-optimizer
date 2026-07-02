@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.58
+- v3.52.58: добавлено отображение fitness прямо в строке топ-20 (мелким
+  серым рядом с SL/TP/swing). Причина: единственный способ на глаз
+  свериться "то ли это на графике, что в списке" был через 3 поля
+  SL/TP/swing, которые легко совпадают у РАЗНЫХ конфигов (разные
+  ob_filter/fvg_*/tl_*/st_* при одинаковых SL/TP/swing дают разный
+  результат) — визуально это выглядит как рассинхрон, хотя дедуп/
+  isApplied работают правильно. Панель графика уже показывает Fitness —
+  теперь то же число видно и в топ-20 построчно, так что совпадение
+  проверяется однозначно по числу, а не на глаз по SL/TP.
 SMC Optimizer v3.52.57
 - v3.52.57: убран порог "цикл >= 30" для авто-применения best к графику
   (введён в v3.52.41). На коротких прогонах или если пользователь заходит
@@ -1226,7 +1236,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.57"
+APP_VERSION  = "3.52.58"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -5825,6 +5835,13 @@ function _renderBestAndTop20(d){
       // отображаемые 3 числа, а весь объект params, как и в isNewBest выше).
       var eKey = _paramsKey(p);
       var isApplied = _bestParamsKey && (eKey === _bestParamsKey);
+      // v3.52.58: показываем fitness прямо в строке (мелким серым, вместе
+      // с SL/TP/swing) — раньше сверить "это точно та же запись, что на
+      // графике" можно было только на глаз по 3 полям SL/TP/swing, которые
+      // легко совпадают у РАЗНЫХ конфигов (см. комментарий выше). Панель
+      // графика (bestCard) уже показывает Fitness — теперь то же число
+      // видно и в топ-20, так что расхождение проверяется однозначно, а
+      // не визуальным совпадением SL/TP.
       html+='<div class="top20-row'+(isApplied?' applied':'')+'"'+(isApplied?' title="Это применено к графику сейчас"':'')+'>'+
         '<span style="color:#555">'+(i+1)+(isApplied?' ●':'')+'</span>'+
         '<span class="'+wrC+'">'+r.winrate+'%</span>'+
@@ -5832,7 +5849,7 @@ function _renderBestAndTop20(d){
         '<span class="red">'+r.max_dd+'%</span>'+
         '<span>'+r.trades+'</span>'+
         '<span class="'+retC+'">$'+finalBal+'</span>'+
-        '<span style="color:#888">'+p.sl_pct+'/'+p.tp_pct+'/'+p.swing_len+'</span>'+
+        '<span style="color:#888" title="fitness: '+r.fitness+'">'+p.sl_pct+'/'+p.tp_pct+'/'+p.swing_len+' <span style=\"color:#555;font-size:10px\">('+r.fitness+')</span></span>'+
       '</div>';
     });
     document.getElementById('top20Container').innerHTML=html;
