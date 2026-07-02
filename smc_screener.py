@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.50
+- v3.52.50: кнопка "Открыть на графике" не переключала вкладку — вызывала
+  applyBestToChart() напрямую, а та грузит график (loadChart()) только если
+  вкладка "График" уже активна. Нажатие с вкладки "Оптимизатор" молча
+  обновляло скрытые поля и внешне ничего не происходило. По той же причине
+  казалось, что авто-применение лучшего конфига при улучшении fitness
+  срабатывает только один раз — на самом деле оно срабатывало каждый раз,
+  но видимо становилось только при заходе на вкладку "График" через сам
+  таб (switchTab), который активирует панель ДО применения. Фикс: кнопка
+  теперь зовёт новую openChartWithBest(), которая явно переключает вкладку
+  через switchTab() — та сама активирует панель и вызывает
+  applyBestToChart()/loadChart() в верном порядке.
 SMC Optimizer v3.52.49
 - v3.52.49: два бага с чтением чужого глобального opt_state вместо
   собственного контекста.
@@ -1073,7 +1085,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.49"
+APP_VERSION  = "3.52.50"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -4410,7 +4422,7 @@ input:focus,select:focus{outline:none;border-color:var(--accent)}
 </div>
 <div class="tabs">
   <button class="tab active" onclick="switchTab('opt',this)">Оптимизатор</button>
-  <button class="tab" onclick="switchTab('chart',this)">График</button>
+  <button class="tab" id="chartTabBtn" onclick="switchTab('chart',this)">График</button>
   <button class="tab" onclick="switchTab('sim',this)">▶ Симуляция</button>
 </div>
 <div id="optPanel" class="tab-panel active">
@@ -4472,7 +4484,7 @@ input:focus,select:focus{outline:none;border-color:var(--accent)}
   </div>
   <div class="card">
     <h3>Лучший конфиг</h3>
-    <button class="btn btn-go" style="width:100%;margin-bottom:8px;font-size:11px" onclick="applyBestToChart()">Открыть на графике</button>
+    <button class="btn btn-go" style="width:100%;margin-bottom:8px;font-size:11px" onclick="openChartWithBest()">Открыть на графике</button>
     <div id="bestCard" style="color:var(--text4);font-size:11px">—</div>
   </div>
   <div class="card">
@@ -4884,6 +4896,22 @@ function simDrawCanvas(data, winStart){
 }
 // ═══════════════════════════════ конец модуля симуляции ═══════════════════
 
+function openChartWithBest(){
+  // v3.52.50: кнопка "Открыть на графике" раньше звала applyBestToChart()
+  // напрямую — та применяет поля/best-конфиг, НО грузит график (loadChart())
+  // только если вкладка "График" УЖЕ активна. Если нажать кнопку, сидя на
+  // вкладке "Оптимизатор" (обычный случай), applyBestToChart() тихо
+  // обновляла скрытые поля и не переключала вкладку — визуально ничего не
+  // происходило, будто кнопка не работает. По той же причине авто-применение
+  // лучшего конфига при каждом улучшении fitness (см. _renderBestAndTop20)
+  // тоже оставалось невидимым, если пользователь не сидел на графике —
+  // казалось, что оно сработало только один раз (когда вкладку открывали
+  // вручную через switchTab, которая правильно активирует панель первой).
+  // Теперь кнопка явно переключает вкладку через switchTab() — та сама
+  // активирует панель и вызывает applyBestToChart()/loadChart() в верном порядке.
+  var btn = document.getElementById('chartTabBtn');
+  switchTab('chart', btn);
+}
 function applyBestToChart(){
   if(!_bestParams){ loadChart(); return; }  // нет конфига — просто грузим с текущими полями
   var p = _bestParams;
