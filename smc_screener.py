@@ -1,5 +1,25 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.56
+- v3.52.56: v3.52.55 сравнивал дубли top20 только по params (_params_equal
+  с допуском на float) — но это не ловило случай, когда ДВА РЕАЛЬНО РАЗНЫХ
+  набора params (отличаются в полях, не влияющих на результат в данном
+  окне свечей — например st_period/st_mult при st_filter=False) дают
+  побитово идентичный результат симуляции. В UI это выглядело как та же
+  болезнь — строки #1/#2 с одинаковыми WR/PF/DD/T/$, метка ● не на первой
+  строке — просто с другой причиной дублирования. Хуже того: defensive-
+  добавление best_params в top20 могло "потеряться", если уже лежащая
+  запись-дубль (с ДРУГИМИ params, но тем же результатом) блокировала
+  добавление канонической best-записи — тогда клиентское сравнение ключей
+  (_paramsKey на основе params) вообще не находило совпадения ни с одной
+  строкой, и метка ● пропадала совсем.
+  Фикс: добавлены _results_equal() (сравнение по WR/PF/DD/T/return/fitness
+  с допуском) и _same_entry() (дубль — если совпадают params ИЛИ результат).
+  Единый дедуп-проход top20 (и в основном цикле, и в _rescore_top20)
+  использует _same_entry; при слиянии группы дублей, содержащей запись,
+  совпадающую с текущим best_params, в top20 остаётся именно она — не
+  любая другая версия с тем же результатом — это гарантирует, что
+  клиентская метка ● всегда находит свою строку.
 SMC Optimizer v3.52.55
 - v3.52.55: продолжение фикса v3.52.54 — та версия только ОПИСЫВАЛА дедуп
   top20 по params вместо fitness, но по факту защита best-записи всё ещё
@@ -1195,7 +1215,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.55"
+APP_VERSION  = "3.52.56"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -3819,6 +3839,40 @@ def _params_equal(a, b, tol=1e-6):
             return False
     return True
 
+def _results_equal(r1, r2, tol=1e-6):
+    """v3.52.56: params-сравнение (_params_equal выше) не ловит случай, когда
+    ДВА РЕАЛЬНО РАЗНЫХ набора параметров (отличаются в "невидимых" полях —
+    ob_filter/internal_len/fvg_*/choch_only/tl_*/st_* и т.п., см. комментарий
+    про SL/TP/swing в _renderBestAndTop20) дают побитово идентичный результат
+    бэктеста на данном окне свечей — например, когда st_filter=False и период/
+    множитель SuperTrend физически ни на что не влияют, но при этом различны у
+    двух конфигов. В UI это выглядит как настоящий дубль строки (WR/PF/DD/T/$
+    совпадают), хотя _params_equal считает их разными записями и не сливает.
+    Сравниваем по значениям результата симуляции — если результат идентичен,
+    для целей top20-списка это ОДНА строка независимо от расхождения в
+    неактивных параметрах."""
+    if r1 is r2:
+        return True
+    if r1 is None or r2 is None:
+        return r1 is r2
+    keys = ("winrate", "profit_factor", "max_dd", "trades", "total_return", "fitness")
+    for k in keys:
+        v1, v2 = r1.get(k), r2.get(k)
+        if v1 is None or v2 is None:
+            if v1 != v2:
+                return False
+            continue
+        if abs(float(v1) - float(v2)) > tol:
+            return False
+    return True
+
+def _same_entry(e1, e2, tol=1e-6):
+    """Две записи top20 считаются одной и той же строкой, если совпадают
+    параметры (_params_equal) ИЛИ совпадает результат (_results_equal) —
+    см. комментарии обеих функций выше про две разные причины дублей."""
+    return (_params_equal(e1["params"], e2["params"], tol)
+            or _results_equal(e1["result"], e2["result"], tol))
+
 # ─── Основной оптимизатор ───────────────────────────────────────────────────
 def run_optimizer():
     global _opt_thread
@@ -3989,14 +4043,17 @@ def run_optimizer():
         rescored.sort(key=lambda x: x["result"]["fitness"], reverse=True)
         deduped = []
         for e in rescored:
-            # v3.52.55: раньше дедуп смотрел ТОЛЬКО на близость fitness
-            # (|Δfit|<0.001) — мог случайно слить в одну запись два РАЗНЫХ
-            # конфига с похожим результатом, а мог и пропустить настоящий
-            # дубликат (тот же params), если пере-оценка на новых свечах
-            # развела их fitness чуть дальше 0.001. Сначала отбрасываем
-            # настоящие дубликаты по _params_equal, и только потом —
-            # почти-близнецов по fitness.
-            if any(_params_equal(e["params"], d["params"]) for d in deduped):
+            # v3.52.56: раньше дедуп ловил только настоящие дубли по params
+            # (_params_equal) — но два РАЗНЫХ набора params с полями, не
+            # влияющими на результат в данном окне (см. _results_equal),
+            # тоже дают одинаковую на вид строку и должны схлопываться в
+            # одну. Используем _same_entry (params ИЛИ результат), и если
+            # дубль — это каноническая best_params-запись, она заменяет
+            # уже лежащую версию (иначе клиентская метка ● её не найдёт).
+            _dupe_i = next((i for i, d in enumerate(deduped) if _same_entry(e, d)), None)
+            if _dupe_i is not None:
+                if _params_equal(e["params"], best_params):
+                    deduped[_dupe_i] = e
                 continue
             if any(abs(e["result"]["fitness"] - d["result"]["fitness"]) < 0.001
                    for d in deduped):
@@ -4240,19 +4297,34 @@ def run_optimizer():
                                 # сравниваем по самим params (сериализованно), а не
                                 # по fitness, так что настоящий best никогда не
                                 # вытесняется "почти-дубликатом" по значению fitness.
-                                if not any(_params_equal(e["params"], best_params) for e in top20):
-                                    top20.append({"params": best_params, "result": best_result})
-                                # v3.52.55: финальный проход дедупликации ПО ПАРАМЕТРАМ
-                                # (не по fitness) — раньше в top20 могли уживаться две
-                                # записи с фактически идентичными params (float-ULP
-                                # разница, см. _params_equal), выглядевшие в UI как две
-                                # одинаковые строки подряд, и метка "применено к графику"
-                                # могла оказаться не на той из них. Оставляем по одной
-                                # записи на уникальный набор params — с более высоким fitness.
+                                # v3.52.56: раньше добавляли best_params только если не
+                                # нашли params-совпадение среди top20 — теперь добавляем
+                                # его всегда, а разруливание дублей (в т.ч. по результату,
+                                # не только по params) делает единый проход дедупа ниже,
+                                # который явно предпочитает каноническую best-запись любой
+                                # другой версии с тем же результатом.
+                                top20.append({"params": best_params, "result": best_result})
+                                # v3.52.56: финальный проход дедупликации — раньше сравнивал
+                                # только params (v3.52.55), но два РАЗНЫХ набора params с
+                                # неактивными в данном окне полями (ob_filter/fvg_*/tl_*/st_*)
+                                # могут дать побитово идентичный результат симуляции — в UI
+                                # это те же "две одинаковые строки подряд", просто с другой
+                                # причиной. _same_entry ловит оба случая (по params ИЛИ по
+                                # результату). Когда группа дублей содержит запись, совпадающую
+                                # с best_params, в топ-20 остаётся ИМЕННО best_params-версия
+                                # (не любая другая с тем же результатом) — иначе клиентское
+                                # сравнение ключей (_paramsKey) не находит совпадения с
+                                # opt_state["best"], и метка ● не появляется ни на одной строке.
                                 _deduped20 = []
                                 for _e in sorted(top20, key=lambda x: x["result"]["fitness"], reverse=True):
-                                    if not any(_params_equal(_e["params"], _d["params"]) for _d in _deduped20):
+                                    _dupe_i = next((i for i, _d in enumerate(_deduped20)
+                                                     if _same_entry(_e, _d)), None)
+                                    if _dupe_i is None:
                                         _deduped20.append(_e)
+                                    elif _params_equal(_e["params"], best_params):
+                                        # найденный дубль — каноническая best-запись,
+                                        # предпочитаем её версии, уже лежащей в списке
+                                        _deduped20[_dupe_i] = _e
                                 top20 = _deduped20
                                 opt_state["top20"] = top20[:20]
 
