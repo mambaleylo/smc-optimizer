@@ -1,5 +1,27 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.61
+- v3.52.61: краш сразу после запуска (TypeError: 'NoneType' object is not
+  subscriptable, run_optimizer, sorted(top20, key=lambda x: x["result"]
+  ["fitness"])). Причина: _rescore_top20() (вызывается при периодическом
+  обновлении окна свечей и при смене весов эквалайзера "на ходу") в редком
+  случае, когда _simulate() не смог посчитать результат ни для одной
+  записи top20, ни для best_params на новом окне свечей (например, сразу
+  после запуска/обновления свечей временно оказывается слишком мало баров
+  — _simulate возвращает None при n < min_bars), явно возвращает
+  best_result=None как фолбэк (best_params при этом остаётся прежним, не
+  None). Это None молча протаскивалось в переменную best_result основного
+  цикла — и на следующем же кандидате, который бьёт best_fit или locally
+  улучшает current_fit (частое событие, не только "новый лучший"),
+  безусловно добавлялось в top20 записью {"params": best_params,
+  "result": None}. Следующий же sorted(top20, key=...fitness...) падал
+  на этой записи сразу.
+  Фикс: (1) top20 фильтруется от записей с пустым/None result на входе в
+  блок обновления — на случай, если такая запись уже успела просочиться
+  раньше этого фикса; (2) best_params/best_result добавляются в top20
+  только если best_result не None; (3) сама sorted()-key-функция в
+  дедуп-проходе на всякий случай тоже не падает на отсутствующем result
+  (трактует такую запись как fitness=-inf вместо краша).
 SMC Optimizer v3.52.60
 - v3.52.60: ДЕЙСТВИТЕЛЬНО настоящая причина "на графике SL/TP как у топ-1,
   а WR/PF/DD/Fitness — от другого конфига" (жалоба повторилась даже
@@ -1278,7 +1300,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.60"
+APP_VERSION  = "3.52.61"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -4332,6 +4354,27 @@ def run_optimizer():
                             # Обновляем топ-20
                             with opt_lock:
                                 top20 = opt_state["top20"]
+                                # v3.52.61: защита от TypeError 'NoneType' object is
+                                # not subscriptable в sorted() ниже. _rescore_top20()
+                                # (вызывается при обновлении свечей/весов эквалайзера)
+                                # в редком случае, когда _simulate() не смог посчитать
+                                # результат ни для одной записи top20 И для best_params
+                                # на новом окне свечей (например временно слишком мало
+                                # баров сразу после обновления/перезапуска), возвращает
+                                # best_result=None как явный фолбэк (см. её код) — сам
+                                # best_params при этом остаётся прежним, не None. Раньше
+                                # это None молча протаскивалось дальше в переменную
+                                # best_result и на следующем же успешном кандидате
+                                # неусловно добавлялось в top20 записью {"result": None}
+                                # ниже по коду — а любой следующий sorted(...,
+                                # key=lambda x: x["result"]["fitness"]) на top20,
+                                # содержащем такую запись, падал с этой ошибкой сразу
+                                # при следующем обновлении списка. Фильтруем такие
+                                # "битые" записи здесь же, на входе — не только для
+                                # добавления new best ниже, но и для случая, если они
+                                # уже успели просочиться в opt_state["top20"] раньше
+                                # этого фикса (напр. из сохранённого состояния).
+                                top20 = [e for e in top20 if e.get("result")]
                                 entry = {"params": nb_p, "result": nb_r}
                                 # v3.52.42: дедупликация — удаляем только те
                                 # записи, которые ХУЖЕ нового кандидата.
@@ -4366,7 +4409,12 @@ def run_optimizer():
                                 # не только по params) делает единый проход дедупа ниже,
                                 # который явно предпочитает каноническую best-запись любой
                                 # другой версии с тем же результатом.
-                                top20.append({"params": best_params, "result": best_result})
+                                # v3.52.61: best_result сам может быть None (см.
+                                # комментарий выше про _rescore_top20) — не добавляем
+                                # заведомо битую запись, чтобы не пришлось полагаться
+                                # только на фильтр в начале блока.
+                                if best_result is not None:
+                                    top20.append({"params": best_params, "result": best_result})
                                 # v3.52.56: финальный проход дедупликации — раньше сравнивал
                                 # только params (v3.52.55), но два РАЗНЫХ набора params с
                                 # неактивными в данном окне полями (ob_filter/fvg_*/tl_*/st_*)
@@ -4379,7 +4427,7 @@ def run_optimizer():
                                 # сравнение ключей (_paramsKey) не находит совпадения с
                                 # opt_state["best"], и метка ● не появляется ни на одной строке.
                                 _deduped20 = []
-                                for _e in sorted(top20, key=lambda x: x["result"]["fitness"], reverse=True):
+                                for _e in sorted(top20, key=lambda x: x["result"]["fitness"] if x.get("result") else -1e18, reverse=True):
                                     _dupe_i = next((i for i, _d in enumerate(_deduped20)
                                                      if _same_entry(_e, _d)), None)
                                     if _dupe_i is None:
