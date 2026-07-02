@@ -1,5 +1,31 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.52
+- v3.52.52: два бага из-за которых лучший конфиг переставал подхватываться
+  на графике (ни автоматически, ни по кнопке "Открыть на графике") после
+  какого-то времени работы, хотя в top20 уже висели конфиги выше того, что
+  реально показан/применён.
+  (1) JSON-ответы API (в т.ч. /opt_status, который дёргают и poll(), и кнопка
+  "Открыть на графике") не помечались заголовком Cache-Control — GET без
+  query-параметров на один и тот же URL браузер/Android WebView мог начать
+  отдавать из эвристического кэша вместо сети. Симптом ровно "первое время
+  работает, потом перестаёт": пока кэш не прогрет — свежие данные идут,
+  как только браузер решает закэшировать /opt_status — клиент годами видит
+  один и тот же снимок best/top20 независимо от того, что реально происходит
+  на сервере. Фикс: Cache-Control: no-store на все JSON-ответы сервера
+  (_json()) + явный cache:'no-store' на fetch('/opt_status') на клиенте.
+  (2) Авто-применение лучшего конфига к графику сравнивало r.fitness с
+  prevFit — абсолютным значением fitness, взятым с клиента на предыдущем
+  рендере. Fitness не на одной шкале между разными окнами свечей: сервер
+  периодически пере-оценивает top20/best на свежих свечах (_rescore_top20,
+  см. v3.52.21/46), и после такой пере-оценки fitness даже объективно нового
+  топ-1 мог оказаться НИЖЕ значения, посчитанного раньше на устаревшем окне.
+  С этого момента r.fitness > prevFit переставало срабатывать вообще —
+  клиент замирал на старом конфиге навсегда, хотя на сервере best реально
+  менялся (и в top20 это было видно — применённый конфиг "убегал" вниз по
+  списку). Фикс: сравниваем не fitness, а сериализованные params самого
+  конфига — если сервер прислал ДРУГОЙ набор параметров как best, применяем
+  его к графику независимо от относительной величины пересчитанного fitness.
 SMC Optimizer v3.52.51
 - v3.52.51: два бага из-за которых "лучший конфиг" на UI отставал от
   реального топ-1 в top20 (в т.ч. кнопка "Открыть на графике" применяла
@@ -1110,7 +1136,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.51"
+APP_VERSION  = "3.52.52"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -4673,6 +4699,7 @@ input:focus,select:focus{outline:none;border-color:var(--accent)}
 <script>
 
 var _bestParams = null;
+var _bestParamsKey = null;  // v3.52.52: сериализованные params последнего применённого best (не fitness)
 var _autoAppliedAt30 = false;
 var _chartExtra = {internal_len:5, ob_filter:'atr', ob_mitigation:'highlow',
   fvg_enabled:true, fvg_threshold:0.1, choch_only:false, use_internal:true,
@@ -5379,7 +5406,7 @@ function _gsSet(pillId, dotId, txtId, state, text){
   txt.textContent = text;
 }
 function pollGlobalStatus(){
-  fetch('/opt_status').then(function(r){return r.json();}).then(function(d){
+  fetch('/opt_status',{cache:'no-store'}).then(function(r){return r.json();}).then(function(d){
     if(d.running){
       if(d.eco_mode){
         _gsSet('gsOpt','gsOptDot','gsOptTxt','warn','Перебор: цикл '+(d.cycle||0)+' · 🌡 эко');
@@ -5487,8 +5514,26 @@ function scheduleNext(){ polling=setTimeout(poll, 1500); }
 function _renderBestAndTop20(d){
   if(d.best){
     var r=d.best.result, p=d.best.params;
-    var prevFit = _bestParams ? (_bestParams._fitness||0) : 0;
     p._fitness = r.fitness;
+    // v3.52.52: раньше новый best определялся сравнением r.fitness > prevFit,
+    // где prevFit — абсолютное значение fitness, взятое с клиента ПОСЛЕ
+    // предыдущего рендера. Проблема: fitness не на одной шкале между разными
+    // окнами свечей/весами эквалайзера — сервер периодически пере-оценивает
+    // top20/best на свежих свечах (_rescore_top20), и после такой пере-оценки
+    // fitness того же самого (или даже более нового и объективно лучшего)
+    // конфига мог оказаться НИЖЕ старого значения, посчитанного на устаревшем
+    // окне. С этого момента r.fitness > prevFit переставало срабатывать вообще
+    // — клиент замирал на старом применённом конфиге навсегда (или пока
+    // fitness случайно не отыграет обратно выше устаревшей планки), хотя
+    // top20 на сервере уже жил своей жизнью и найденный конфиг реально
+    // уезжал вниз по списку. Теперь сравниваем не fitness, а сам конфиг
+    // (сериализованные params без служебного _fitness) — если сервер прислал
+    // ДРУГОЙ набор параметров как best, значит best реально сменился, и мы
+    // применяем его к графику независимо от того, выше или ниже пересчитанный
+    // fitness относительно того, что было показано раньше.
+    var pKey = JSON.stringify(p, function(k,v){ return k==='_fitness'?undefined:v; });
+    var isNewBest = (pKey !== _bestParamsKey);
+    _bestParamsKey = pKey;
     _bestParams = p;
     window._lastBestResult = r;
     // v3.52.41: авто-применение при каждом улучшении fitness (цикл >= 30).
@@ -5503,7 +5548,7 @@ function _renderBestAndTop20(d){
     // оптимизатор уже был остановлен на момент открытия страницы, и
     // _bestParams оставался null навсегда несмотря на то, что сервер уже
     // знал лучший конфиг.
-    if((d.cycle||0) >= 30 && r.fitness > prevFit){
+    if((d.cycle||0) >= 30 && isNewBest){
       applyBestToChart();
     }
     var wrC=r.winrate>=55?'green':r.winrate>=45?'yellow':'red';
@@ -5546,7 +5591,7 @@ function _renderBestAndTop20(d){
   }
 }
 function poll(){
-  fetch('/opt_status').then(function(r){return r.json();}).then(function(d){
+  fetch('/opt_status',{cache:'no-store'}).then(function(r){return r.json();}).then(function(d){
     logsDropped = d.logs_dropped||0;
     var totalNow = logsDropped + (d.logs||[]).length;
     var newFrom = Math.max(0, lastLogTotal - logsDropped);
@@ -5581,7 +5626,7 @@ function poll(){
     _renderBestAndTop20(d);
   }).catch(function(){scheduleNext();});
 }
-fetch('/opt_status').then(function(r){return r.json();}).then(function(d){
+fetch('/opt_status',{cache:'no-store'}).then(function(r){return r.json();}).then(function(d){
   // v3.50: подставляем последнюю прогоняемую пару в поля ввода при загрузке страницы
   if(d.symbol){
     var symEl = document.getElementById('sym'), cSymEl = document.getElementById('cSym');
@@ -6356,6 +6401,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type","application/json")
         self.send_header("Content-Length",len(body))
+        # v3.52.52: без этого заголовка GET-ответы (в т.ч. /opt_status) не
+        # помечены явно как некэшируемые — браузер/WebView (особенно на
+        # Android) может начать отдавать эвристически закэшированную копию
+        # одного и того же URL без query-параметров вместо свежего ответа с
+        # сервера. Внешне выглядело как "первое время работает, потом
+        # перестаёт": пока кэш не прогрелся — всё живое, а как только браузер
+        # решает закэшировать ответ — /opt_status годами отдаёт один и тот же
+        # снимок best/top20, и клиент застревает на старом лучшем конфиге
+        # независимо от того, опрашивается ли он через poll() или дёргается
+        # вручную кнопкой "Открыть на графике" (оба бьют в один и тот же URL).
+        self.send_header("Cache-Control","no-store, no-cache, must-revalidate, max-age=0")
+        self.send_header("Pragma","no-cache")
         self.end_headers()
         self.wfile.write(body)
 
