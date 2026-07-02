@@ -1,5 +1,30 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.60
+- v3.52.60: ДЕЙСТВИТЕЛЬНО настоящая причина "на графике SL/TP как у топ-1,
+  а WR/PF/DD/Fitness — от другого конфига" (жалоба повторилась даже
+  ПОСЛЕ v3.52.59 — та гонка была реальной, но не единственной и не
+  главной). v3.52.53/58/59 сравнивали и подсвечивали ПОЛНЫЙ params-объект
+  правильно, но сам этот объект на клиенте (_chartExtra) никогда не включал
+  vol_filter/vol_mult — объёмный фильтр подтверждения BOS-пробоя, добавленный
+  в v3.52.21-23 и живущий в PARAM_SPACE/_simulate() наравне с остальными
+  ~15 параметрами (ob_filter/fvg_*/tl_*/st_* и т.д. — все ОНИ были
+  проброшены в _chartExtra ещё в v3.52.53, а vol_filter/vol_mult туда так и
+  не попали). Раз этих двух полей не было ни в _chartExtra, ни в URL,
+  который loadChart() строит для /chart_data, сервер тихо подставлял
+  дефолт vol_filter=False — график ВСЕГДА считался без объёмного фильтра,
+  какой бы ни была реальная best-конфигурация. Если топ-1 отличается от
+  другой строки top20 именно этим фильтром (а SL/TP/swing и прочие видимые
+  поля совпадают — обычное дело при близких по духу конфигах), график молча
+  воспроизводил ЧУЖУЮ строку — SL/TP на экране от топ-1 (эти поля
+  выставляются отдельно и корректно), а WR/PF/DD/Fitness от конфига,
+  у которого vol_filter совпадает с дефолтным False.
+  Фикс: vol_filter/vol_mult добавлены в дефолты _chartExtra, в маппинг
+  params->_chartExtra внутри applyBestToChart(), и в query string
+  /chart_data внутри loadChart(). toggleChartMonitor()/startAutoTrade()
+  чинить отдельно не потребовалось — они уже строят params через
+  Object.assign({}, _chartExtra, {...}), так что подхватили фикс
+  автоматически.
 SMC Optimizer v3.52.59
 - v3.52.59: НАСТОЯЩАЯ причина "на графике SL/TP как у топ-1, а WR/PF/DD/
   Fitness — от старого конфига" (продолжающаяся жалоба после v3.52.55-58,
@@ -1253,7 +1278,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.59"
+APP_VERSION  = "3.52.60"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -4971,7 +4996,10 @@ var _autoAppliedAt30 = false;
 var _chartExtra = {internal_len:5, ob_filter:'atr', ob_mitigation:'highlow',
   fvg_enabled:true, fvg_threshold:0.1, choch_only:false, use_internal:true,
   min_ob_size:1.0, require_fvg_confirm:false, tl_mult:1.0, tl_method:'atr', tl_filter:false,
-  st_filter:false, st_period:10, st_mult:3.0};
+  st_filter:false, st_period:10, st_mult:3.0,
+  // v3.52.60: vol_filter/vol_mult (объёмный фильтр, введён в v3.52.21-23)
+  // отсутствовали здесь — см. подробности в applyBestToChart().
+  vol_filter:false, vol_mult:1.0};
 var TF_SEC = {"1m":60,"5m":300,"15m":900,"30m":1800,"1h":3600,"4h":14400,"1d":86400};
 var _chartAutoTimer = null;
 var _monitorActive = false;
@@ -5292,6 +5320,21 @@ function applyBestToChart(){
   st_filter:  p.st_filter != null ? p.st_filter : false,
   st_period:  p.st_period != null ? p.st_period : 10,
   st_mult:    p.st_mult   != null ? p.st_mult   : 3.0,
+  // v3.52.60: НАСТОЯЩАЯ причина "на графике SL/TP как у топ-1, а WR/PF/DD/
+  // Fitness — от другого конфига", которую v3.52.53/58/59 не ловили, потому
+  // что все они сравнивали/подсвечивали ПОЛНЫЙ params-объект — но сам этот
+  // объект на клиенте (_chartExtra) никогда не включал vol_filter/vol_mult
+  // (объёмный фильтр подтверждения пробоя, добавлен в v3.52.21-23, живёт в
+  // PARAM_SPACE и в _simulate() наравне с остальными ~15 параметрами).
+  // Раз этих двух полей не было ни в _chartExtra, ни в URL loadChart(),
+  // сервер в /chart_data тихо подставлял дефолт vol_filter=False — то есть
+  // график ВСЕГДА считался без объёмного фильтра, независимо от того,
+  // включён ли он у реального топ-1. Если топ-1 отличается от другой строки
+  // top20 именно этим фильтром (а SL/TP/swing совпадают — обычное дело),
+  // график молча воспроизводил чужой конфиг, хотя все остальные поля
+  // (включая видимые SL/TP/swing) были выставлены верно.
+  vol_filter: p.vol_filter != null ? p.vol_filter : false,
+  vol_mult:   p.vol_mult   != null ? p.vol_mult   : 1.0,
   };
   // v3.52.41: _chartExtra и поля обновляем всегда (чтобы при переходе на
   // вкладку "График" уже были готовы). loadChart — только если вкладка активна.
@@ -5978,7 +6021,8 @@ function loadChart(auto){
     +'&use_internal='+ex.use_internal+'&min_ob_size='+ex.min_ob_size
     +'&require_fvg_confirm='+ex.require_fvg_confirm+'&tl_mult='+ex.tl_mult+'&tl_method='+ex.tl_method
     +'&tl_filter='+ex.tl_filter
-    +'&st_filter='+ex.st_filter+'&st_period='+ex.st_period+'&st_mult='+ex.st_mult;
+    +'&st_filter='+ex.st_filter+'&st_period='+ex.st_period+'&st_mult='+ex.st_mult
+    +'&vol_filter='+ex.vol_filter+'&vol_mult='+ex.vol_mult;
   // v3.52.59: НАСТОЯЩАЯ причина "SL/TP на графике как у топ-1, а WR/PF/
   // Fitness — от какого-то старого конфига". applyBestToChart() дёргается
   // на КАЖДОЕ реальное улучшение best (после v3.52.57 — без порога по
