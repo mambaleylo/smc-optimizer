@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.53
+- v3.52.53: колонка "SL/TP/swing" в топ-20 показывает только 3 из ~15
+  реально оптимизируемых параметров (остальные — ob_filter/internal_len/
+  fvg_*/choch_only/tl_*/st_* — см. applyBestToChart). Разные строки списка
+  запросто совпадают по этим 3 видимым цифрам, оставаясь РАЗНЫМИ конфигами
+  с разным WR/PF/сделками — выглядит так, будто на графике "не то", хотя
+  SL/TP/swing совпадают со строкой в списке (просто с другой, не с #1).
+  Теперь строка, чей ПОЛНЫЙ набор параметров реально применён к графику
+  прямо сейчас, подсвечивается зелёной полосой и меткой "●" — сравнение
+  идёт по всему объекту params (как в isNewBest), а не по 3 отображаемым
+  цифрам. Если после этого подсвеченная строка окажется НЕ на первом месте
+  — это будет означать реальное рассинхронение best/top20[0] на сервере,
+  а не путаницу в интерфейсе.
 SMC Optimizer v3.52.52
 - v3.52.52: два бага из-за которых лучший конфиг переставал подхватываться
   на графике (ни автоматически, ни по кнопке "Открыть на графике") после
@@ -1136,7 +1149,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.52"
+APP_VERSION  = "3.52.53"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -4418,6 +4431,7 @@ input:focus,select:focus{outline:none;border-color:var(--accent)}
 .prog-bar{background:var(--border2);border-radius:3px;height:6px;margin:6px 0}
 .prog-fill{background:var(--accent);height:6px;border-radius:3px;transition:width .3s}
 .top20-row{display:grid;grid-template-columns:24px 1fr 1fr 1fr 1fr 1fr 1fr;gap:4px;padding:3px 0;border-bottom:1px solid var(--border2);font-size:11px;align-items:center}
+.top20-row.applied{background:rgba(0,220,136,.08);border-left:2px solid var(--green);padding-left:3px}
 .badge{display:inline-block;padding:1px 5px;border-radius:3px;font-size:10px;margin-right:3px}
 .badge-bull{background:rgba(0,220,136,.15);color:var(--green)}.badge-bear{background:rgba(255,68,85,.15);color:var(--red)}
 #chartPanel{padding:10px}
@@ -5577,8 +5591,19 @@ function _renderBestAndTop20(d){
       var wrC=r.winrate>=55?'green':r.winrate>=45?'yellow':'red';
       var retC=r.total_return>=0?'green':'red';
       var finalBal=Math.round(100*(1+r.total_return/100));
-      html+='<div class="top20-row">'+
-        '<span style="color:#555">'+(i+1)+'</span>'+
+      // v3.52.52: SL/TP/swing — это только 3 из ~15 реально оптимизируемых
+      // параметров (см. ob_filter/internal_len/fvg_*/choch_only/tl_*/st_*
+      // в applyBestToChart). Разные строки top20 запросто совпадают по этим
+      // трём видимым цифрам, оставаясь РАЗНЫМИ конфигами с разным WR/PF/T —
+      // это сбивало с толку ("на графике не то же самое, что в списке
+      // строка №1", хотя SL/TP/swing совпадали с другой строкой ниже).
+      // Помечаем зелёной полосой именно ту строку, чей ПОЛНЫЙ набор
+      // параметров сейчас реально применён к графику (сравниваем не
+      // отображаемые 3 числа, а весь объект params, как и в isNewBest выше).
+      var eKey = JSON.stringify(p, function(k,v){ return k==='_fitness'?undefined:v; });
+      var isApplied = _bestParamsKey && (eKey === _bestParamsKey);
+      html+='<div class="top20-row'+(isApplied?' applied':'')+'"'+(isApplied?' title="Это применено к графику сейчас"':'')+'>'+
+        '<span style="color:#555">'+(i+1)+(isApplied?' ●':'')+'</span>'+
         '<span class="'+wrC+'">'+r.winrate+'%</span>'+
         '<span>'+r.profit_factor+'</span>'+
         '<span class="red">'+r.max_dd+'%</span>'+
