@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-SMC Optimizer v3.52.69
+SMC Optimizer v3.52.70
+- v3.52.70: Метка PnL — X оставлен по центру зоны сделки (v3.52.69), а Y
+  вынесен ЗА пределы залитой зоны: над зоной для прибыльной сделки, под
+  зоной для стопа (было — прямо посередине заливки).
 - v3.52.69: Метка PnL на графике сделок — переделка после неудачной попытки
   в v3.52.68 (тёмная подложка сбоку от точки выхода всё равно цепляла
   соседние свечи). Теперь метка стоит по ЦЕНТРУ всей зоны сделки (по X —
@@ -1426,7 +1429,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.69"
+APP_VERSION  = "3.52.70"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -6486,16 +6489,16 @@ function drawChart(){
       ctx2.beginPath();ctx2.arc(exitX,exitY,3.5,0,Math.PI*2);ctx2.fill();
       if(sg.dep_pct!==undefined){
         var lbl=(sg.dep_pct>0?'+':'')+sg.dep_pct+'%';
-        // v3.52.69: метка теперь по центру всей зоны сделки (между входом
-        // и выходом, между entry-ценой и TP/SL-ценой) — раньше липла к
-        // точке выхода сбоку/сверху и упиралась то в фитили, то в текст
-        // TP/SL. Плашка — сплошной цвет исхода (зелёная в прибыль,
-        // красная в стоп), текст белый — вместо тёмного полупрозрачного фона.
+        // v3.52.70: X — центр зоны сделки (как в v3.52.69), но Y теперь
+        // СНАРУЖИ заливки зоны, а не поверх неё — над зоной для прибыльной
+        // сделки, под зоной для стопа. Раньше плашка стояла прямо в
+        // середине залитого прямоугольника, что тоже читалось как "внутри".
         var zcx=(xe+Math.min(xe2,W-PAD.r))/2;
-        var zcy=(ye+exitY)/2;
+        var zoneTop=Math.min(ye,exitY), zoneBot=Math.max(ye,exitY);
         ctx2.font='bold 11px monospace';
         var tw=ctx2.measureText(lbl).width;
         var boxW=tw+12, boxH=17;
+        var zcy = sg.win ? zoneTop - boxH/2 - 5 : zoneBot + boxH/2 + 5;
         ctx2.fillStyle=sg.win?clrTP:clrSL;
         ctx2.fillRect(zcx-boxW/2, zcy-boxH/2, boxW, boxH);
         ctx2.fillStyle='#fff';
