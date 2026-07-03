@@ -1,5 +1,27 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.63 (ДИАГНОСТИЧЕСКАЯ СБОРКА)
+- v3.52.63: v3.52.62 (Cache-Control на "/") подтверждена рабочей (версия в
+  шапке обновилась до 3.52.62 после жёсткого рефреша), но "Скан всех"
+  виснет на "Подключаемся..." ровно как раньше. Значит дело не в кэше
+  страницы. Раз JS доходит до fetch() (текст "Подключаемся..." успевает
+  выставиться) и ни .then, ни .catch не срабатывают вообще — сам запрос
+  где-то реально виснет без ответа. Полная тишина в логе Termux ничего не
+  доказывает: log_message() у этого сервера намеренно заглушен (return
+  без действия), обычные успешные запросы и так ничего не печатают —
+  это НЕ признак того, что запрос не дошёл до сервера.
+  Временная диагностика:
+  (1) print(f"[POST] {self.path}", flush=True) в самом начале do_POST —
+      в обход заглушенного log_message. Если после нажатия кнопки в
+      терминале появится "[POST] /scan_all" — запрос доходит до сервера,
+      проблема где-то в обработке. Если НЕ появится — запрос не долетает
+      до сервера вообще (сеть/браузер/расширение).
+  (2) AbortController с таймаутом 15с на сам fetch в startOpt() (ветка
+      "Скан всех") — вместо вечного молчания через 15с покажет явную
+      ошибку "Таймаут: сервер не ответил за 15с на /scan_all" и алерт.
+      Если сработает именно эта ветка — подтверждает, что запрос реально
+      завис (не JS-баг на клиенте, не мгновенная ошибка на сервере).
+  Убрать print() и (по желанию) таймаут после того, как найдём причину.
 SMC Optimizer v3.52.62
 - v3.52.62: "Скан всех" зависает на «Подключаемся...» без единой строки в
   логе Termux. Причина в том же семействе багов, что и v3.52.52 (там
@@ -1321,7 +1343,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.62"
+APP_VERSION  = "3.52.63"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -6440,8 +6462,17 @@ startOpt=function(){
     document.getElementById('btnStop').style.display='';
     document.getElementById('statusBadge').textContent='\u23f3 запуск...';
     document.getElementById('screenerStatus').textContent='Подключаемся...';
-    fetch('/scan_all',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
-      .then(function(r){return r.json();})
+    // v3.52.63: временная диагностика — таймаут на сам fetch. Если сервер
+    // реально не отвечает (запрос завис где-то в сети/на сервере), раньше
+    // fetch() ждал бы бесконечно без единого сигнала — "Подключаемся..."
+    // висело бы вечно без объяснений. Теперь через 15с покажем чёткую
+    // ошибку вместо тишины — и заодно узнаем, действительно ли это таймаут
+    // сети, или проблема в чём-то другом (тогда сработает обычный .catch
+    // раньше 15с, либо .then сработает с ok:false).
+    var _scanAllAbort = new AbortController();
+    var _scanAllTimeout = setTimeout(function(){ _scanAllAbort.abort(); }, 15000);
+    fetch('/scan_all',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),signal:_scanAllAbort.signal})
+      .then(function(r){clearTimeout(_scanAllTimeout);return r.json();})
       .then(function(d){
         if(!d.ok){
           document.getElementById('btnStart').style.display='';
@@ -6452,9 +6483,15 @@ startOpt=function(){
         pollScreener();
       })
       .catch(function(e){
+        clearTimeout(_scanAllTimeout);
         document.getElementById('btnStart').style.display='';
         document.getElementById('btnStop').style.display='none';
-        alert('Ошибка: '+e);
+        if(e && e.name==='AbortError'){
+          document.getElementById('screenerStatus').textContent='Таймаут: сервер не ответил за 15с на /scan_all';
+          alert('Таймаут: сервер не ответил за 15 секунд на /scan_all. Значит запрос реально не доходит/не обрабатывается — это не кэш и не JS-баг на клиенте.');
+        } else {
+          alert('Ошибка: '+e);
+        }
       });
     return;
   }
@@ -6976,6 +7013,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         global _opt_thread, _screener_thread
+        # v3.52.63: временная диагностика для бага "Скан всех виснет на
+        # Подключаемся..., в логе Termux полная тишина". log_message()
+        # намеренно заглушен (см. выше) — поэтому "тишина в логе" НЕ
+        # доказывает, что запрос не дошёл до сервера, обычные запросы и
+        # так ничего не печатают. Эта строка использует print() напрямую,
+        # в обход log_message, чтобы один раз проверить: доходит ли
+        # POST /scan_all до сервера вообще. Если после нажатия кнопки в
+        # терминале появится "[POST] /scan_all" — проблема не в сети/кэше,
+        # а где-то дальше по цепочке (внутри обработчика или run_screener).
+        # Если строка НЕ появится — запрос действительно не долетает до
+        # сервера (браузер/сеть/расширение блокирует). Убрать после
+        # диагностики.
+        print(f"[POST] {self.path}", flush=True)
         try:
             length = int(self.headers.get("Content-Length",0))
             body   = json.loads(self.rfile.read(length)) if length else {}
