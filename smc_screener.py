@@ -1,5 +1,21 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.73
+- v3.52.73: Анализатор стабильного периода (кнопка "🎯 Найти лучший период"
+  в карточке "Параметры запуска"). Не переобучает параметры заново на
+  каждом кандидате (дорого) — берёт уже найденный лучший конфиг (текущий
+  opt_state["best"] для этого symbol+tf, либо сохранённый best_config.json)
+  и прогоняет его через несколько последовательных непересекающихся окон
+  истории (folds) для каждой длины окна из сетки [15,20,30,45,60,90]
+  дней, уходя вглубь истории. Критерий фолда — тот же бутстрап-ДИ PF>=1.0,
+  что и в _wf_validate (не точечный PF — "один бросок кости"). Score =
+  доля прошедших фолдов минус штраф за разброс PF между фолдами минус
+  штраф за недостающее покрытие (мало валидных фолдов = молодой символ/
+  короткая история = меньше доверия к выбору). Результат — не "самый
+  красивый бэктест", а период, на котором конфиг держится наиболее
+  ПОВТОРЯЕМО, что и есть подсказка, каким days/offset_days стоит
+  переобучаться дальше. Новые эндпоинты: POST /period_stab_start,
+  POST /period_stab_stop, GET /period_stab_status.
 SMC Optimizer v3.52.72
 - v3.52.72: Потолок Profit Factor в fitness-формуле поднят с 5.0 до 10.0
   (строка ~3361). Причина: конфиги с PF=7-10 на выборках 20-22 сделок
@@ -1448,7 +1464,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.72"
+APP_VERSION  = "3.52.73"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -1575,6 +1591,20 @@ screener_state = {
 }
 _screener_stop   = threading.Event()
 _screener_thread = None
+
+# ─── Анализатор стабильного периода (v3.52.73) ──────────────────────────────
+PERIODSTAB_DAYS_GRID = [15, 20, 30, 45, 60, 90]
+PERIODSTAB_FOLDS     = 6
+
+periodstab_lock  = threading.Lock()
+periodstab_state = {
+    "running": False, "done": False, "error": None,
+    "symbol": None, "tf": None,
+    "candidates": list(PERIODSTAB_DAYS_GRID), "n_folds": PERIODSTAB_FOLDS,
+    "results": [], "progress": 0, "best_days": None, "logs": [],
+}
+_periodstab_stop   = threading.Event()
+_periodstab_thread = None
 
 # Монитор графика: раз в бар проверяет, не появился ли новый сигнал,
 # и шлёт алерт в Telegram (по аналогии с WickFill)
@@ -2192,6 +2222,124 @@ def _wf_validate(sym, tf, params, risk_pct, train_days, train_offset=0):
               f"trades={oos_result['trades']}")
     _wf_cache = {"key": key, "passed": passed, "detail": detail}
     return passed, detail
+
+# v3.52.73: анализатор стабильного периода. НЕ переобучает параметры заново
+# на каждом кандидате длины окна (это было бы дорого — полный BH-перебор на
+# каждый из PERIODSTAB_DAYS_GRID) — берёт уже найденный лучший конфиг и
+# прогоняет его через несколько последовательных непересекающихся окон
+# истории (folds), уходя вглубь по каждой длине окна из сетки. Смотрим не на
+# "средний" PF, а на то, насколько результат ПОВТОРЯЕТСЯ от фолда к фолду —
+# т.е. какая длина окна была бы наименее случайной, если бы её использовали
+# для (пере)обучения. Критерий прохождения фолда — тот же бутстрап-ДИ
+# PF>=1.0, что и в _wf_validate (см. коммент там же про "один бросок кости"
+# вместо статистически устойчивого подтверждения).
+def _periodstab_log(msg):
+    with periodstab_lock:
+        periodstab_state["logs"].append({"ts": time.strftime("%H:%M:%S"), "msg": msg})
+        if len(periodstab_state["logs"]) > 200:
+            periodstab_state["logs"] = periodstab_state["logs"][-150:]
+
+def _run_period_stability(sym, tf, risk_pct):
+    try:
+        with opt_lock:
+            _cur_sym  = opt_state.get("symbol")
+            _cur_tf   = opt_state.get("tf")
+            _cur_best = opt_state.get("best")
+        params = None
+        src = ""
+        if _cur_sym == sym and _cur_tf == tf and _cur_best and _cur_best.get("params"):
+            params = _cur_best["params"]
+            src = "текущий результат оптимизатора"
+        else:
+            saved = _load_best_config_for(sym, tf)
+            if saved and saved.get("params"):
+                params = saved["params"]
+                src = "сохранённый лучший конфиг"
+        if not params:
+            with periodstab_lock:
+                periodstab_state.update({"running": False, "done": True,
+                    "error": f"нет сохранённого/текущего лучшего конфига для {sym} {tf} — "
+                             "сначала запусти обычный перебор хотя бы раз"})
+            return
+
+        _periodstab_log(f"▶ Анализ стабильности периода {sym} {tf} — конфиг: {src}")
+        sl_p = float(params.get("sl_pct", 0.6))
+        tp_p = float(params.get("tp_pct", 1.0))
+        results = []
+        total = len(PERIODSTAB_DAYS_GRID)
+        for idx, days in enumerate(PERIODSTAB_DAYS_GRID):
+            if _periodstab_stop.is_set():
+                _periodstab_log("⏹ Остановлено пользователем")
+                break
+            folds = []
+            for fi in range(PERIODSTAB_FOLDS):
+                if _periodstab_stop.is_set():
+                    break
+                offset = fi * days
+                try:
+                    candles = _fetch_candles(sym, tf, days, offset_days=offset)
+                except Exception as e:
+                    folds.append({"offset": offset, "status": "fetch_error"})
+                    continue
+                if not candles or len(candles) < 100:
+                    folds.append({"offset": offset, "status": "no_data"})
+                    continue
+                res = _simulate(candles, params, sl_pct=sl_p, tp_pct=tp_p,
+                                 risk_pct=risk_pct, return_trades=True)
+                if not res or res.get("trades", 0) < 5:
+                    folds.append({"offset": offset, "status": "few_trades",
+                                  "trades": (res.get("trades", 0) if res else 0)})
+                    continue
+                boot = _bootstrap_ci(res["trades_raw"])
+                if boot is None:
+                    folds.append({"offset": offset, "status": "few_trades", "trades": res["trades"]})
+                    continue
+                folds.append({"offset": offset, "status": "ok",
+                              "pf": res["profit_factor"], "wr": res["winrate"],
+                              "trades": res["trades"], "passed": boot["pf_lo"] >= 1.0})
+            valid    = [f for f in folds if f.get("status") == "ok"]
+            n_valid  = len(valid)
+            n_passed = sum(1 for f in valid if f["passed"])
+            pass_rate = (n_passed / n_valid) if n_valid else 0.0
+            pf_vals = [f["pf"] for f in valid]
+            avg_pf  = (sum(pf_vals) / n_valid) if n_valid else 0.0
+            if n_valid >= 2:
+                pf_std = (sum((v - avg_pf) ** 2 for v in pf_vals) / (n_valid - 1)) ** 0.5
+            else:
+                pf_std = 0.0
+            # Скор: доля прошедших фолдов важнее всего (0-100), из неё
+            # вычитается штраф за разброс PF между фолдами (нестабильность)
+            # и штраф за нехватку покрытия (мало валидных фолдов — молодой
+            # символ/короткая история — меньше доверия к выбору).
+            coverage = n_valid / PERIODSTAB_FOLDS
+            score = pass_rate * 100.0 - pf_std * 8.0 - (1.0 - coverage) * 15.0
+            entry = {"days": days, "score": round(score, 1),
+                      "pass_rate": round(pass_rate * 100, 1),
+                      "avg_pf": round(avg_pf, 2), "pf_std": round(pf_std, 2),
+                      "n_valid": n_valid, "n_passed": n_passed,
+                      "n_folds": PERIODSTAB_FOLDS, "folds": folds}
+            results.append(entry)
+            _periodstab_log(f"  {days}д: {n_passed}/{n_valid} фолдов прошли OOS-гейт "
+                             f"(PF ср.={entry['avg_pf']} σ={entry['pf_std']}) → score={entry['score']}")
+            with periodstab_lock:
+                periodstab_state["results"]  = sorted(results, key=lambda r: r["score"], reverse=True)
+                periodstab_state["progress"] = int((idx + 1) / total * 100)
+
+        if results:
+            best = max(results, key=lambda r: (r["score"], r["n_valid"], -r["days"]))
+            best_days = best["days"]
+            _periodstab_log(f"✅ Лучший период: {best_days}д (score={best['score']})")
+        else:
+            best_days = None
+            _periodstab_log("⚠ Не удалось получить ни одного результата (нет данных)")
+        with periodstab_lock:
+            periodstab_state.update({"running": False, "done": True,
+                "results": sorted(results, key=lambda r: r["score"], reverse=True),
+                "best_days": best_days, "progress": 100})
+    except Exception as e:
+        _periodstab_log(f"⚠ Ошибка анализатора: {e}")
+        with periodstab_lock:
+            periodstab_state.update({"running": False, "done": True, "error": str(e)})
 
 # ─── Поток авто-торговли ────────────────────────────────────────────────────
 def _auto_trade_loop():
@@ -5116,6 +5264,13 @@ input:focus,select:focus{outline:none;border-color:var(--accent)}
     <label>Риск на сделку %</label><input id="risk_pct" type="number" value="10" step="1">
     <button class="btn btn-sm" style="width:100%;margin-top:4px" onclick="resetBestCfg()" title="Удаляет сохранённый лучший конфиг для текущего символа+ТФ — следующий перебор стартует с нуля, а не от старого якоря">↺ Сбросить сохранённый конфиг</button>
     <div id="bestCfgStatus" style="font-size:10px;color:var(--text3);margin-top:4px;min-height:14px"></div>
+    <div style="display:flex;gap:6px;margin-top:6px">
+      <button class="btn btn-go" id="btnPsStart" style="flex:1;font-size:11px" onclick="psStart()" title="Не переобучает параметры заново — берёт уже найденный лучший конфиг (текущий или сохранённый) и проверяет, окно какой длины даёт наиболее ПОВТОРЯЕМЫЙ (не случайный) OOS-результат на нескольких последовательных фолдах. Подсказка, каким days/offset_days стоит переобучаться дальше.">🎯 Найти лучший период</button>
+      <button class="btn btn-stop" id="btnPsStop" style="flex:1;font-size:11px;display:none" onclick="psStop()">⏹ Стоп</button>
+    </div>
+    <div id="psStatus" style="font-size:10px;color:var(--text3);margin-top:4px;min-height:14px"></div>
+    <div id="psResults" style="font-size:10px;margin-top:4px;display:none"></div>
+    <div id="psLog" style="font-size:9.5px;color:var(--text2);max-height:90px;overflow-y:auto;margin-top:3px;display:none"></div>
   </div>
   <div class="card">
     <h3>🎛 Эквалайзер fitness <span style="color:var(--text4);font-size:10px;font-weight:400">(на ходу)</span></h3>
@@ -6017,6 +6172,85 @@ function wtPoll(){
     if(d.logs && d.logs.length>_wtLogLen){
       var newLines=d.logs.slice(_wtLogLen);
       _wtLogLen=d.logs.length;
+      newLines.forEach(function(l){
+        var div=document.createElement('div');
+        div.textContent=l.ts+' '+l.msg;
+        logEl.appendChild(div);
+      });
+      logEl.scrollTop=logEl.scrollHeight;
+    }
+  }).catch(function(){});
+}
+
+/* ── Анализатор стабильного периода ── */
+var _psPollTimer = null;
+var _psLogLen = 0;
+function psStart(){
+  var sym  = document.getElementById('sym').value;
+  var tf   = document.getElementById('tf').value;
+  var risk = parseFloat(document.getElementById('risk_pct').value) || 10;
+  fetch('/period_stab_start',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({symbol:sym, tf:tf, risk_pct:risk})}).then(function(r){return r.json();}).then(function(d){
+    if(!d.ok){ alert('Ошибка: '+(d.msg||'?')); return; }
+    document.getElementById('btnPsStart').style.display='none';
+    document.getElementById('btnPsStop').style.display='';
+    document.getElementById('psLog').style.display='';
+    document.getElementById('psResults').style.display='none';
+    document.getElementById('psStatus').textContent='';
+    _psLogLen=0;
+    if(_psPollTimer) clearInterval(_psPollTimer);
+    _psPollTimer=setInterval(psPoll,1500);
+    psPoll();
+  }).catch(function(){ alert('Сеть недоступна'); });
+}
+function psStop(){
+  fetch('/period_stab_stop',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}).catch(function(){});
+}
+function psApply(days){
+  document.getElementById('days').value = days;
+  document.getElementById('offset_days').value = 0;
+}
+function psRenderResults(results, bestDays){
+  var el = document.getElementById('psResults');
+  if(!results || !results.length){ el.style.display='none'; return; }
+  var html = '<table style="width:100%;border-collapse:collapse;font-size:10px">'
+    +'<tr style="color:var(--text3)"><th style="text-align:left">Дней</th><th>Фолдов ОК</th><th>PF ср.</th><th>Score</th><th></th></tr>';
+  results.forEach(function(r){
+    var mark = (r.days===bestDays) ? ' style="font-weight:700;color:var(--green,#4caf50)"' : '';
+    html += '<tr'+mark+'><td>'+r.days+'д</td><td>'+r.n_passed+'/'+r.n_valid+'</td><td>'+r.avg_pf+'</td><td>'+r.score+'</td>'
+      +'<td><button class="btn-sm" onclick="psApply('+r.days+')" title="Подставить '+r.days+' в поля Дней/Смещение">✓</button></td></tr>';
+  });
+  html += '</table>';
+  el.innerHTML = html;
+  el.style.display='';
+}
+function psPoll(){
+  fetch('/period_stab_status').then(function(r){return r.json();}).then(function(d){
+    var status=document.getElementById('psStatus');
+    var logEl=document.getElementById('psLog');
+    if(d.running){
+      status.textContent='⏳ Анализ '+(d.progress||0)+'%...';
+      status.style.color='#f0b800';
+      psRenderResults(d.results, d.best_days);
+    } else if(d.done){
+      document.getElementById('btnPsStart').style.display='';
+      document.getElementById('btnPsStop').style.display='none';
+      if(_psPollTimer){clearInterval(_psPollTimer);_psPollTimer=null;}
+      if(d.error){
+        status.textContent='⚠ '+d.error;
+        status.style.color='#f45';
+      } else if(d.best_days){
+        status.textContent='✅ Рекомендуемый период: '+d.best_days+'д (жми ✓ в таблице, чтобы применить)';
+        status.style.color='#4caf50';
+      } else {
+        status.textContent='⚠ Не удалось получить результат';
+        status.style.color='#f45';
+      }
+      psRenderResults(d.results, d.best_days);
+    }
+    if(d.logs && d.logs.length>_psLogLen){
+      var newLines=d.logs.slice(_psLogLen);
+      _psLogLen=d.logs.length;
       newLines.forEach(function(l){
         var div=document.createElement('div');
         div.textContent=l.ts+' '+l.msg;
@@ -7258,6 +7492,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 snap = dict(weight_tune_state)
                 snap["logs"] = list(weight_tune_state["logs"])
             self._json(snap)
+        elif self.path == "/period_stab_status":
+            with periodstab_lock:
+                snap = dict(periodstab_state)
+                snap["logs"]    = list(periodstab_state["logs"])
+                snap["results"] = list(periodstab_state["results"])
+            self._json(snap)
         elif self.path.startswith("/best_config"):
             qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             sym = (qs.get("symbol", [""])[0] or "").strip()
@@ -7423,6 +7663,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         elif self.path == "/weight_tune_stop":
             _weight_tune_stop.set()
+            self._json({"ok": True})
+
+        elif self.path == "/period_stab_start":
+            global _periodstab_thread
+            with periodstab_lock:
+                if periodstab_state.get("running"):
+                    self._json({"ok": False, "msg": "уже выполняется"}); return
+            sym      = body.get("symbol", opt_state.get("symbol", "BTC_USDT"))
+            tf       = body.get("tf", opt_state.get("tf", "15m"))
+            risk_pct = float(body.get("risk_pct", 10.0))
+            _periodstab_stop.clear()
+            with periodstab_lock:
+                periodstab_state.update({
+                    "running": True, "done": False, "error": None,
+                    "symbol": sym, "tf": tf, "results": [], "progress": 0,
+                    "best_days": None, "logs": [],
+                })
+            _periodstab_thread = threading.Thread(
+                target=_run_period_stability, args=(sym, tf, risk_pct), daemon=True)
+            _periodstab_thread.start()
+            self._json({"ok": True})
+
+        elif self.path == "/period_stab_stop":
+            _periodstab_stop.set()
             self._json({"ok": True})
 
         elif self.path == "/best_config_reset":
