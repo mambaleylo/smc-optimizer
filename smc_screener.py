@@ -1,6 +1,20 @@
 #!/usr/bin/env python3
 """
-SMC Optimizer v3.52.64
+SMC Optimizer v3.52.65
+- v3.52.65: UI топ-20 конфигураций (мобильная вёрстка). (1) На экранах
+  ≤700px (телефон) блок "Топ-20 конфигураций" (.main) теперь идёт ВЫШЕ
+  блока "Параметры запуска" (.sidebar) — через CSS order:-1 на .main
+  внутри @media(max-width:700px), без изменения DOM-порядка (десктоп-
+  раскладка 320px+1fr не тронута). Раньше на телефоне после старта
+  перебора приходилось скроллить мимо всех карточек (параметры,
+  эквалайзер, лучший конфиг, алерты, прогресс, лог) до самого топ-20.
+  (2) Из строк топ-20 убраны Fitness (было мелким серым числом в скобках
+  рядом с SL/TP/swing) и Swing len — колонка в шапке переименована из
+  "SL/TP/swing" в "SL/TP". (3) SL и TP в строке топ-20 теперь окрашены
+  раздельно (SL — красным классом .red, TP — зелёным классом .green)
+  вместо единого серого текста, для быстрой визуальной идентификации
+  без чтения цифр. Экран "Скрининг всех монет" (renderScreenerResults)
+  не трогали — там своя таблица с отдельной раскладкой колонок.
 - v3.52.64: НАСТОЯЩАЯ причина "Скан всех виснет на Подключаемся...".
   Диагностика из v3.52.63 (print("[POST] /scan_all") + AbortController-
   таймаут) подтвердила: сам POST /scan_all доходит до сервера и успешно
@@ -1367,7 +1381,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.64"
+APP_VERSION  = "3.52.65"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -4794,7 +4808,7 @@ body{background:var(--bg);color:var(--text);font-family:'JetBrains Mono',monospa
 .tab.active{color:var(--accent);border-bottom:2px solid var(--accent)}
 .tab-panel{display:none}.tab-panel.active{display:block}
 .body{display:grid;grid-template-columns:320px 1fr;gap:0;height:calc(100vh - 80px)}
-@media(max-width:700px){.body{grid-template-columns:1fr;height:auto}}
+@media(max-width:700px){.body{grid-template-columns:1fr;height:auto}.main{order:-1}}
 .sidebar{background:var(--bg2);border-right:1px solid var(--border2);padding:10px;overflow-y:auto;height:100%}
 .main{padding:10px;overflow-y:auto;height:100%}
 .card{background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:10px;margin-bottom:8px}
@@ -5993,7 +6007,7 @@ function _renderBestAndTop20(d){
 
   var top=(d.top20||[]);
   if(top.length){
-    var html='<div class="top20-row"><span>#</span><span>WR%</span><span>PF</span><span>DD%</span><span>T</span><span>$100→$</span><span>SL/TP/swing</span></div>';
+    var html='<div class="top20-row"><span>#</span><span>WR%</span><span>PF</span><span>DD%</span><span>T</span><span>$100→$</span><span>SL/TP</span></div>';
     top.forEach(function(e,i){
       var r=e.result,p=e.params;
       var wrC=r.winrate>=55?'green':r.winrate>=45?'yellow':'red';
@@ -6024,7 +6038,7 @@ function _renderBestAndTop20(d){
         '<span class="red">'+r.max_dd+'%</span>'+
         '<span>'+r.trades+'</span>'+
         '<span class="'+retC+'">$'+finalBal+'</span>'+
-        '<span style="color:#888" title="fitness: '+r.fitness+'">'+p.sl_pct+'/'+p.tp_pct+'/'+p.swing_len+' <span style=\"color:#555;font-size:10px\">('+r.fitness+')</span></span>'+
+        '<span><span class="red">'+p.sl_pct+'%</span>/<span class="green">'+p.tp_pct+'%</span></span>'+
       '</div>';
     });
     document.getElementById('top20Container').innerHTML=html;
