@@ -1,5 +1,29 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.64
+- v3.52.64: НАСТОЯЩАЯ причина "Скан всех виснет на Подключаемся...".
+  Диагностика из v3.52.63 (print("[POST] /scan_all") + AbortController-
+  таймаут) подтвердила: сам POST /scan_all доходит до сервера и успешно
+  стартует run_screener() в фоне (бейдж переключался на "скрининг..."),
+  но дальше клиент бесконечно опрашивает GET /scan_all_status — а такого
+  роута в do_GET НЕ БЫЛО вообще. Запрос падал в самую нижнюю ветку
+  do_GET (else: self.send_response(404); self.end_headers()) — 404 БЕЗ
+  ТЕЛА. pollScreener() делает fetch('/scan_all_status').then(r=>r.json()) —
+  .json() на пустом теле кидает SyntaxError, промис уходит в .catch(),
+  который молча планирует следующий опрос через 3с — и так по кругу
+  бесконечно, без alert'а, без записи куда-либо, кроме как в devtools
+  (которых на телефоне под рукой нет). Отсюда и "Подключаемся..." висит
+  вечно: pollScreener() физически не может получить ни единого валидного
+  ответа, хотя скрининг всех монет в фоне мог прекрасно работать (или не
+  работать по своим причинам) — с интерфейса это было неотличимо.
+  Похоже, роут потерялся при каком-то более раннем рефакторинге do_GET
+  (в докстринге есть упоминание v3.29 "фикс зависания интерфейса —
+  /scan_all_status делал dict()..." — значит роут когда-то существовал).
+  Фикс: добавлен `elif self.path == "/scan_all_status": with screener_lock:
+  self._json(dict(screener_state))`, зеркально /opt_status.
+  Диагностический print() из v3.52.63 убран (роль свою выполнил).
+  AbortController-таймаут на fetch в startOpt() оставлен — теперь это
+  просто полезная защита от будущих подобных молчаливых зависаний.
 SMC Optimizer v3.52.63 (ДИАГНОСТИЧЕСКАЯ СБОРКА)
 - v3.52.63: v3.52.62 (Cache-Control на "/") подтверждена рабочей (версия в
   шапке обновилась до 3.52.62 после жёсткого рефреша), но "Скан всех"
@@ -1343,7 +1367,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.63"
+APP_VERSION  = "3.52.64"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -6895,6 +6919,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif self.path == "/opt_status":
             with opt_lock:
                 self._json({k:v for k,v in opt_state.items() if k!="chart"})
+        elif self.path == "/scan_all_status":
+            # v3.52.64: этого роута не было вообще — do_GET не знал путь
+            # "/scan_all_status", падал в самый нижний else: self.send_response(404)
+            # БЕЗ ТЕЛА. Клиент (pollScreener()) делал fetch('/scan_all_status')
+            # .then(r=>r.json()) — .json() на пустом 404-ответе кидает
+            # SyntaxError, промис уходит в .catch(), который тихо
+            # перезапускает опрос через 3с — и так бесконечно, без единого
+            # видимого признака ошибки (нет alert, нет записи в консоль,
+            # которую видно без devtools). Снаружи выглядело ТОЧНО как
+            # "Скан всех виснет на Подключаемся..." — сам /scan_all POST
+            # исправно стартовал run_screener() в фоне (бейдж менялся на
+            # "скрининг...", это подтвердил print("[POST] /scan_all") из
+            # v3.52.63), но опрос его прогресса был обречён с самого начала.
+            with screener_lock:
+                self._json(dict(screener_state))
         elif self.path.startswith("/chart_data"):
             from urllib.parse import urlparse, parse_qs
             qs = parse_qs(urlparse(self.path).query)
@@ -7013,19 +7052,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         global _opt_thread, _screener_thread
-        # v3.52.63: временная диагностика для бага "Скан всех виснет на
-        # Подключаемся..., в логе Termux полная тишина". log_message()
-        # намеренно заглушен (см. выше) — поэтому "тишина в логе" НЕ
-        # доказывает, что запрос не дошёл до сервера, обычные запросы и
-        # так ничего не печатают. Эта строка использует print() напрямую,
-        # в обход log_message, чтобы один раз проверить: доходит ли
-        # POST /scan_all до сервера вообще. Если после нажатия кнопки в
-        # терминале появится "[POST] /scan_all" — проблема не в сети/кэше,
-        # а где-то дальше по цепочке (внутри обработчика или run_screener).
-        # Если строка НЕ появится — запрос действительно не долетает до
-        # сервера (браузер/сеть/расширение блокирует). Убрать после
-        # диагностики.
-        print(f"[POST] {self.path}", flush=True)
         try:
             length = int(self.headers.get("Content-Length",0))
             body   = json.loads(self.rfile.read(length)) if length else {}
