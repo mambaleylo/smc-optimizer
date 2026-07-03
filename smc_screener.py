@@ -1,5 +1,22 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.74
+- v3.52.74: Кнопка "🔗 Синк с авто-трейдом" на вкладке График. Возникла из
+  разбора репорта "авто-трейд прислал алерт про сигнал, а на графике при
+  немедленной проверке сигнала нет вообще". applyBestToChart() (кнопка
+  "★ Лучший конфиг") тянет параметры из клиентской _bestParams — последнего
+  результата оптимизатора В ЭТОЙ вкладке браузера. Если авто-трейд запущен
+  от сохранённого конфига (или из другой вкладки/сессии), а оптимизатор с
+  тех пор на этом symbol+tf не гонялся, _bestParams будет null или вообще
+  от другого символа. Видимые поля (Swing/SL/TP) человек может выставить
+  руками "на глаз" одинаково, а ~15 скрытых параметров (ob_filter,
+  min_ob_size, tl_*, st_*, vol_*, ...), которые живут в _chartExtra и не
+  отображаются на форме, при этом незаметно расходятся с тем, что реально
+  видит _auto_trade_loop() — график пересчитывается с ДРУГИМ конфигом, и
+  непонятно, баг это рассинхрона окон свечей или просто рассинхрон
+  параметров на клиенте. Новая кнопка берёт параметры НАПРЯМУЮ из
+  /auto_trade_status (тот же словарь params, с которым работает живой цикл
+  авто-трейда) — гарантированная 1:1 сверка без посредников.
 SMC Optimizer v3.52.73
 - v3.52.73: Анализатор стабильного периода (кнопка "🎯 Найти лучший период"
   в карточке "Параметры запуска"). Не переобучает параметры заново на
@@ -1464,7 +1481,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.73"
+APP_VERSION  = "3.52.74"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -5365,6 +5382,7 @@ input:focus,select:focus{outline:none;border-color:var(--accent)}
     <label>SL%<input id="cSl" type="number" value="0.6" step="0.1" style="width:60px"></label>
     <label>TP%<input id="cTp" type="number" value="1.0" step="0.1" style="width:60px"></label>
     <button class="btn btn-go" onclick="loadChart()" style="align-self:flex-end">Загрузить</button>
+    <button class="btn" onclick="syncChartWithAutoTrade()" style="align-self:flex-end" title="Подтягивает РОВНО те параметры/days/символ, с которыми ПРЯМО СЕЙЧАС торгует авто-трейд — берёт их напрямую из /auto_trade_status, а не из _bestParams (который может быть устаревшим или от другого символа, если оптимизатор с тех пор не запускался в этой вкладке браузера). Нужно для 1:1 сверки, почему сигнал, который увидел авто-трейд, не появляется на графике.">🔗 Синк с авто-трейдом</button>
     <button class="btn" id="atBtn" onclick="toggleAutoTrade()" style="align-self:flex-end;background:var(--accent2);color:#fff">🤖 Авто</button>
   </div>
   <!-- Панель авто-торговли (скрыта по умолчанию) -->
@@ -5756,6 +5774,54 @@ function openChartWithBest(){
   // активирует панель и вызывает applyBestToChart()/loadChart() в верном порядке.
   var btn = document.getElementById('chartTabBtn');
   switchTab('chart', btn);
+}
+// v3.52.74: applyBestToChart() тянет параметры из клиентской _bestParams
+// (последний результат оптимизатора В ЭТОЙ вкладке браузера) — если авто-
+// трейд был запущен от сохранённого конфига (или в другой вкладке/сессии),
+// а оптимизатор с тех пор на этом symbol+tf не гонялся, _bestParams будет
+// null или вообще от другого символа. Видимые поля (Swing/SL/TP) человек
+// может выставить руками "на глаз" одинаково, а ~15 скрытых параметров
+// (ob_filter, min_ob_size, tl_*, st_*, vol_*, ...) в _chartExtra при этом
+// незаметно разъедутся с тем, что реально видит _auto_trade_loop() —
+// график будет пересчитан с другим конфигом, сигнал не совпадёт, и не
+// поймёшь, баг это или просто рассинхрон параметров на клиенте. Эта
+// функция берёт параметры НАПРЯМУЮ из /auto_trade_status (тот же словарь
+// params, что использует живой цикл авто-трейда) — гарантированная 1:1
+// сверка без посредников.
+function syncChartWithAutoTrade(){
+  fetch('/auto_trade_status').then(function(r){return r.json();}).then(function(d){
+    if(!d.symbol || !d.params){ alert('Авто-трейд ни разу не запускался в этой сессии — нет параметров для синка'); return; }
+    var p = d.params;
+    document.getElementById('cSym').value = d.symbol;
+    var tfSel = document.getElementById('cTf');
+    for(var i=0;i<tfSel.options.length;i++){ if(tfSel.options[i].value===d.tf){ tfSel.selectedIndex=i; break; } }
+    document.getElementById('cDays').value  = d.days;
+    document.getElementById('cSwing').value = p.swing_len != null ? p.swing_len : 10;
+    document.getElementById('cSl').value    = p.sl_pct    != null ? p.sl_pct    : 0.3;
+    document.getElementById('cTp').value    = p.tp_pct    != null ? p.tp_pct    : 0.6;
+    _chartExtra = {
+      internal_len:        p.internal_len        != null ? p.internal_len        : 5,
+      ob_filter:           p.ob_filter           != null ? p.ob_filter           : 'atr',
+      ob_mitigation:       p.ob_mitigation       != null ? p.ob_mitigation       : 'highlow',
+      fvg_enabled:         p.fvg_enabled         != null ? p.fvg_enabled         : true,
+      fvg_threshold:       p.fvg_threshold       != null ? p.fvg_threshold       : 0.1,
+      choch_only:          p.choch_only          != null ? p.choch_only         : false,
+      use_internal:        p.use_internal        != null ? p.use_internal        : true,
+      min_ob_size:         p.min_ob_size         != null ? p.min_ob_size         : 1.0,
+      require_fvg_confirm: p.require_fvg_confirm != null ? p.require_fvg_confirm : false,
+      tl_mult:    p.tl_mult    != null ? p.tl_mult    : 1.0,
+      tl_method:  p.tl_method  != null ? p.tl_method  : 'atr',
+      tl_filter:  p.tl_filter  != null ? p.tl_filter  : false,
+      st_filter:  p.st_filter  != null ? p.st_filter  : false,
+      st_period:  p.st_period  != null ? p.st_period  : 10,
+      st_mult:    p.st_mult    != null ? p.st_mult    : 3.0,
+      vol_filter: p.vol_filter != null ? p.vol_filter : false,
+      vol_mult:   p.vol_mult   != null ? p.vol_mult   : 1.0
+    };
+    var chartBtn = document.getElementById('chartTabBtn');
+    if(chartBtn) switchTab('chart', chartBtn);
+    loadChart();
+  }).catch(function(){ alert('Сеть недоступна — не удалось получить /auto_trade_status'); });
 }
 function applyBestToChart(){
   if(!_bestParams){ loadChart(); return; }  // нет конфига — просто грузим с текущими полями
