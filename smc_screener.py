@@ -1,6 +1,18 @@
 #!/usr/bin/env python3
 """
-SMC Optimizer v3.52.66
+SMC Optimizer v3.52.67
+- v3.52.67: Heartbeat в healthchecks.io — настоящее решение проблемы "нет
+  интернета на телефоне → нечем отправить алерт" из v3.52.66. Фоновый поток
+  каждые 5 минут пингует URL, заданный в новом поле "Heartbeat URL
+  (healthchecks.io)" карточки "Алерты". Если пинг долго не приходит — алерт
+  в Telegram шлёт САМ healthchecks.io со своих серверов (порог задаётся в
+  настройках чека на их сайте, Period), а не наш скрипт — поэтому
+  уведомление формируется именно в момент истечения таймера, а не только
+  когда связь на телефоне вернётся (в отличие от watchdog из v3.52.66,
+  который остаётся как доп. слой — ловит именно недоступность Gate.io API,
+  даже если общий интернет жив). hc_url персистится в тот же
+  ~/.smc_alert_cfg.json, поле необязательное (если пусто — heartbeat-поток
+  просто ничего не шлёт).
 - v3.52.66: Watchdog пропажи интернета. Раз в 60с фоновый поток проверяет
   доступность Gate.io API. Если связи нет дольше настраиваемого порога
   (по умолчанию 60 мин) — пытается отправить TG/ntfy алерт "🔴 Нет связи
@@ -1395,7 +1407,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.66"
+APP_VERSION  = "3.52.67"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -1427,6 +1439,7 @@ TG_CHAT      = os.environ.get("TG_CHAT", "")
 NTFY_URL     = os.environ.get("NTFY_URL", "")
 WATCHDOG_ENABLED      = True   # v3.52.66: увед. в TG/ntfy, если пропал интернет
 WATCHDOG_TIMEOUT_MIN  = 60     # порог простоя (мин) до первого алерта
+HC_URL       = os.environ.get("HC_URL", "")  # v3.52.67: heartbeat healthchecks.io
 ALERT_CFG_PATH   = os.path.expanduser("~/.smc_alert_cfg.json")
 FITNESS_W_PATH   = os.path.expanduser("~/.smc_fitness_weights.json")
 GATE_CFG_PATH    = os.path.expanduser("~/.smc_gate_cfg.json")
@@ -3530,13 +3543,14 @@ def _send_alert(msg):
 
 def _load_alert_cfg():
     """Подхватывает сохранённые TG/ntfy настройки из файла (приоритет над env)."""
-    global TG_TOKEN, TG_CHAT, NTFY_URL, WATCHDOG_ENABLED, WATCHDOG_TIMEOUT_MIN
+    global TG_TOKEN, TG_CHAT, NTFY_URL, WATCHDOG_ENABLED, WATCHDOG_TIMEOUT_MIN, HC_URL
     try:
         with open(ALERT_CFG_PATH, "r") as f:
             cfg = json.load(f)
         TG_TOKEN = cfg.get("tg_token", TG_TOKEN) or TG_TOKEN
         TG_CHAT  = cfg.get("tg_chat",  TG_CHAT)  or TG_CHAT
         NTFY_URL = cfg.get("ntfy_url", NTFY_URL) or NTFY_URL
+        HC_URL   = cfg.get("hc_url",   HC_URL)   or HC_URL
         if "watchdog_enabled" in cfg:
             WATCHDOG_ENABLED = bool(cfg.get("watchdog_enabled"))
         if "watchdog_timeout_min" in cfg:
@@ -3553,6 +3567,7 @@ def _save_alert_cfg():
     try:
         with open(ALERT_CFG_PATH, "w") as f:
             json.dump({"tg_token": TG_TOKEN, "tg_chat": TG_CHAT, "ntfy_url": NTFY_URL,
+                       "hc_url": HC_URL,
                        "watchdog_enabled": WATCHDOG_ENABLED,
                        "watchdog_timeout_min": WATCHDOG_TIMEOUT_MIN}, f)
     except Exception as e:
@@ -3972,6 +3987,27 @@ def _watchdog_loop():
                     _send_alert(f"🔴 Нет связи с интернетом/Gate.io уже {int(elapsed_min)} мин.")
                     _watchdog_alerted    = True
                     _watchdog_last_alert = now
+
+# ─── Heartbeat healthchecks.io (v3.52.67) ────────────────────────────────────
+# В отличие от _watchdog_loop выше (который сам пытается слать TG/ntfy и
+# физически не может это сделать, если интернета нет вообще), heartbeat
+# решает эту проблему иначе: скрипт просто пингует внешний URL, пока есть
+# связь. Если пинг не приходит дольше периода, заданного в настройках чека
+# на healthchecks.io — АЛЕРТ ШЛЁТ САМ healthchecks.io СО СВОИХ СЕРВЕРОВ,
+# а не наш скрипт. Поэтому уведомление о простое реально формируется и
+# уходит в момент истечения таймера, а не только когда связь вернётся.
+HEARTBEAT_INTERVAL_SEC = 300  # пинг каждые 5 минут
+
+def _heartbeat_loop():
+    while True:
+        time.sleep(HEARTBEAT_INTERVAL_SEC)
+        if not HC_URL:
+            continue
+        try:
+            requests.get(HC_URL, timeout=10)
+        except Exception:
+            pass  # не страшно — если пинги не проходят долго, это и есть сигнал для healthchecks.io
+
 
 
 
@@ -5067,6 +5103,7 @@ input:focus,select:focus{outline:none;border-color:var(--accent)}
     <label>TG Token</label><input id="tgToken" type="password" placeholder="1234567890:AA...">
     <label>TG Chat ID</label><input id="tgChat" placeholder="123456789">
     <label>ntfy URL (необязательно)</label><input id="ntfyUrl" placeholder="https://ntfy.sh/your-topic">
+    <label>Heartbeat URL (healthchecks.io, опционально)</label><input id="hcUrl" placeholder="https://hc-ping.com/xxxxxxxx-xxxx">
     <div style="display:flex;align-items:center;gap:6px;margin:2px 0 8px">
       <input type="checkbox" id="wdEnabled" style="width:auto;margin:0" checked>
       <label style="margin:0;font-size:11px;color:var(--text3);flex:1">Увед. если пропал интернет дольше</label>
@@ -5764,6 +5801,7 @@ function loadAlertCfg(){
     document.getElementById('tgToken').value = d.tg_token||'';
     document.getElementById('tgChat').value  = d.tg_chat||'';
     document.getElementById('ntfyUrl').value = d.ntfy_url||'';
+    document.getElementById('hcUrl').value   = d.hc_url||'';
     document.getElementById('wdEnabled').checked = d.watchdog_enabled!==false;
     document.getElementById('wdTimeout').value   = d.watchdog_timeout_min||60;
     if(d.tg_token||d.tg_chat||d.ntfy_url) alertCfgStatus('Загружено из сохранённых настроек');
@@ -5775,6 +5813,7 @@ function saveAlertCfg(){
     tg_token: document.getElementById('tgToken').value.trim(),
     tg_chat:  document.getElementById('tgChat').value.trim(),
     ntfy_url: document.getElementById('ntfyUrl').value.trim(),
+    hc_url:   document.getElementById('hcUrl').value.trim(),
     watchdog_enabled: document.getElementById('wdEnabled').checked,
     watchdog_timeout_min: parseInt(document.getElementById('wdTimeout').value)||60
   };
@@ -5800,6 +5839,7 @@ function saveAlertCfgSync(){
     tg_token: document.getElementById('tgToken').value.trim(),
     tg_chat:  document.getElementById('tgChat').value.trim(),
     ntfy_url: document.getElementById('ntfyUrl').value.trim(),
+    hc_url:   document.getElementById('hcUrl').value.trim(),
     watchdog_enabled: document.getElementById('wdEnabled').checked,
     watchdog_timeout_min: parseInt(document.getElementById('wdTimeout').value)||60
   };
@@ -7142,6 +7182,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._json({k:v for k,v in chart_mon_state.items() if k != "params"})
         elif self.path == "/alert_cfg":
             self._json({"tg_token": TG_TOKEN, "tg_chat": TG_CHAT, "ntfy_url": NTFY_URL,
+                        "hc_url": HC_URL,
                         "watchdog_enabled": WATCHDOG_ENABLED,
                         "watchdog_timeout_min": WATCHDOG_TIMEOUT_MIN})
         elif self.path == "/fitness_weights":
@@ -7268,10 +7309,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json({"ok": True})
 
         elif self.path == "/alert_cfg":
-            global TG_TOKEN, TG_CHAT, NTFY_URL, WATCHDOG_ENABLED, WATCHDOG_TIMEOUT_MIN
+            global TG_TOKEN, TG_CHAT, NTFY_URL, WATCHDOG_ENABLED, WATCHDOG_TIMEOUT_MIN, HC_URL
             TG_TOKEN = (body.get("tg_token") or "").strip()
             TG_CHAT  = (body.get("tg_chat")  or "").strip()
             NTFY_URL = (body.get("ntfy_url") or "").strip()
+            HC_URL   = (body.get("hc_url")   or "").strip()
             if "watchdog_enabled" in body:
                 WATCHDOG_ENABLED = bool(body.get("watchdog_enabled"))
             if "watchdog_timeout_min" in body:
@@ -7464,6 +7506,7 @@ def main():
     _load_fitness_weights()
     _load_last_symbol()
     threading.Thread(target=_watchdog_loop, daemon=True).start()
+    threading.Thread(target=_heartbeat_loop, daemon=True).start()
 
     server = http.server.ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print(f"{_C_GRN}SMC Optimizer v{APP_VERSION} — http://0.0.0.0:{PORT}{_C_RST}", flush=True)
