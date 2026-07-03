@@ -1,5 +1,30 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.76
+- v3.52.76: Убрал ручную кнопку "🔗 Синк с авто-трейдом" — вкладка "График"
+  теперь САМА следует за живым конфигом авто-трейда (символ/tf/days/все
+  параметры), без необходимости жать что-то руками. При открытии вкладки и
+  на каждом тике уже существующего 2с-поллера (/auto_trade_status) график
+  сверяет текущий конфиг с тем, чем реально торгует бот, и перегружается
+  сам, если что-то изменилось (новый best подхвачен авто-трейдом, ручной
+  рестарт с другим сетапом). Ручное редактирование любого поля графика
+  (символ/tf/days/swing/SL/TP) переводит в режим "Ручной" — авто-трейд
+  больше не перезаписывает поля, пока не кликнуть по бейджу режима заново.
+  Явный выбор конфига из топ-20 ("Открыть на графике") тоже считается
+  ручным действием и отключает слежение — иначе следующий тик поллера тут
+  же переписал бы выбранный конфиг живым конфигом авто-трейда, и клик
+  выглядел бы так, будто ничего не применилось. Авто-применение нового best
+  оптимизатора (при каждом улучшении fitness) также поставлено на паузу,
+  пока активен LIVE-режим слежения — иначе на графике конкурировали бы два
+  источника правды одновременно.
+  Второе: если авто-трейд реально открыл позицию, а текущий пересчёт
+  графика с ТЕМИ ЖЕ параметрами не видит соответствующего сигнала —
+  раньше это можно было заметить только вручную, сравнивая на глаз. Теперь
+  после каждой загрузки графика сверяется opt_state.chart.auto_trade_sig
+  (запись о реально открытой сделке) с массивом сигналов свежего пересчёта;
+  при несовпадении наверху вкладки загорается яркий красный баннер — сразу
+  видно, что расхождение всё ещё существует, а не тихо надеяться, что его
+  больше нет.
 SMC Optimizer v3.52.75
 - v3.52.75: Найден и исправлен настоящий корень рассинхрона "авто-трейд ≠
   график" — _fetch_candles() отдавал (и auto_trade_loop, и /chart_data
@@ -1499,7 +1524,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.75"
+APP_VERSION  = "3.52.76"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -5405,19 +5430,20 @@ input:focus,select:focus{outline:none;border-color:var(--accent)}
 </div>
 <div id="chartPanel" class="tab-panel">
   <div class="chart-bar">
-    <label>Символ<input id="cSym" value="BTC_USDT"></label>
-    <label>ТФ<select id="cTf">
+    <label>Символ<input id="cSym" value="BTC_USDT" oninput="_chartBreakFollow()"></label>
+    <label>ТФ<select id="cTf" onchange="_chartBreakFollow()">
       <option value="1m">1m</option><option value="5m">5m</option><option value="15m" selected>15m</option>
       <option value="30m">30m</option><option value="1h">1h</option><option value="4h">4h</option><option value="1d">1d</option>
     </select></label>
-    <label>Дней<input id="cDays" type="number" value="30" min="1" max="60" style="width:60px"></label>
-    <label>Swing<input id="cSwing" type="number" value="10" min="3" max="50" style="width:60px"></label>
-    <label>SL%<input id="cSl" type="number" value="0.6" step="0.1" style="width:60px"></label>
-    <label>TP%<input id="cTp" type="number" value="1.0" step="0.1" style="width:60px"></label>
+    <label>Дней<input id="cDays" type="number" value="30" min="1" max="60" style="width:60px" oninput="_chartBreakFollow()"></label>
+    <label>Swing<input id="cSwing" type="number" value="10" min="3" max="50" style="width:60px" oninput="_chartBreakFollow()"></label>
+    <label>SL%<input id="cSl" type="number" value="0.6" step="0.1" style="width:60px" oninput="_chartBreakFollow()"></label>
+    <label>TP%<input id="cTp" type="number" value="1.0" step="0.1" style="width:60px" oninput="_chartBreakFollow()"></label>
     <button class="btn btn-go" onclick="loadChart()" style="align-self:flex-end">Загрузить</button>
-    <button class="btn" onclick="syncChartWithAutoTrade()" style="align-self:flex-end" title="Подтягивает РОВНО те параметры/days/символ, с которыми ПРЯМО СЕЙЧАС торгует авто-трейд — берёт их напрямую из /auto_trade_status, а не из _bestParams (который может быть устаревшим или от другого символа, если оптимизатор с тех пор не запускался в этой вкладке браузера). Нужно для 1:1 сверки, почему сигнал, который увидел авто-трейд, не появляется на графике.">🔗 Синк с авто-трейдом</button>
+    <span id="chartSyncBadge" onclick="_chartToggleFollow()" style="align-self:flex-end;cursor:pointer;font-size:11px;padding:6px 10px;border-radius:4px;border:1px solid var(--border);color:var(--text4)" title="Клик — переключить между автослежением за живым авто-трейдом и ручным режимом">—</span>
     <button class="btn" id="atBtn" onclick="toggleAutoTrade()" style="align-self:flex-end;background:var(--accent2);color:#fff">🤖 Авто</button>
   </div>
+  <div id="chartMismatchBanner" style="display:none;background:#3a0a0a;border:1px solid #f45;color:#f88;border-radius:6px;padding:8px 10px;margin-bottom:8px;font-size:12px;font-weight:bold"></div>
   <!-- Панель авто-торговли (скрыта по умолчанию) -->
   <div id="atPanel" style="display:none;background:var(--card-bg);border:1px solid var(--border);border-radius:6px;padding:10px;margin-bottom:8px;font-size:12px;color:var(--text)">
     <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
@@ -5529,23 +5555,36 @@ function switchTab(id, btn){
   document.getElementById(id+'Panel').classList.add('active');
   btn.classList.add('active');
   if(id === 'chart'){
-    if(_bestParams){
-      applyBestToChart();
-    } else {
-      // Параметров ещё нет — синхронизируем поля графика с полями оптимизатора и грузим
-      var symEl = document.getElementById('sym');
-      var tfEl  = document.getElementById('tf');
-      var daysEl= document.getElementById('days');
-      if(symEl)  document.getElementById('cSym').value  = symEl.value;
-      if(daysEl) document.getElementById('cDays').value = daysEl.value;
-      if(tfEl){
-        var tfSel = document.getElementById('cTf');
-        for(var i=0;i<tfSel.options.length;i++){
-          if(tfSel.options[i].value===tfEl.value){tfSel.selectedIndex=i;break;}
-        }
+    fetch('/auto_trade_status').then(function(r){return r.json();}).then(function(d){
+      if(d.enabled && d.symbol && d.params && _chartFollowAT){
+        _syncFieldsFromAT(d);
+        _chartUpdateBadge(true, true);
+        loadChart();
+        return;
       }
-      setTimeout(function(){ loadChart(); }, 80);
-    }
+      _chartUpdateBadge(false, !!d.enabled);
+      if(_bestParams){
+        applyBestToChart();
+      } else {
+        // Параметров ещё нет — синхронизируем поля графика с полями оптимизатора и грузим
+        var symEl = document.getElementById('sym');
+        var tfEl  = document.getElementById('tf');
+        var daysEl= document.getElementById('days');
+        if(symEl)  document.getElementById('cSym').value  = symEl.value;
+        if(daysEl) document.getElementById('cDays').value = daysEl.value;
+        if(tfEl){
+          var tfSel = document.getElementById('cTf');
+          for(var i=0;i<tfSel.options.length;i++){
+            if(tfSel.options[i].value===tfEl.value){tfSel.selectedIndex=i;break;}
+          }
+        }
+        setTimeout(function(){ loadChart(); }, 80);
+      }
+    }).catch(function(){
+      _chartUpdateBadge(false, false);
+      if(_bestParams){ applyBestToChart(); }
+      else { setTimeout(function(){ loadChart(); }, 80); }
+    });
   }
 }
 
@@ -5793,6 +5832,13 @@ function simDrawCanvas(data, winStart){
 // ═══════════════════════════════ конец модуля симуляции ═══════════════════
 
 function openChartWithBest(){
+  // v3.52.76: явный клик "Открыть на графике" по конкретному конфигу из
+  // топ-20 — это осознанный выбор пользователя посмотреть ИМЕННО этот
+  // конфиг, а не то, чем сейчас торгует авто-трейд. Если оставить
+  // _chartFollowAT включённым, switchTab() тут же перезапишет поля живым
+  // конфигом авто-трейда и клик будет выглядеть так, будто ничего не
+  // применилось. Явный выбор конфига = ручной режим.
+  _chartFollowAT = false;
   // v3.52.50: кнопка "Открыть на графике" раньше звала applyBestToChart()
   // напрямую — та применяет поля/best-конфиг, НО грузит график (loadChart())
   // только если вкладка "График" УЖЕ активна. Если нажать кнопку, сидя на
@@ -5818,43 +5864,118 @@ function openChartWithBest(){
 // незаметно разъедутся с тем, что реально видит _auto_trade_loop() —
 // график будет пересчитан с другим конфигом, сигнал не совпадёт, и не
 // поймёшь, баг это или просто рассинхрон параметров на клиенте. Эта
-// функция берёт параметры НАПРЯМУЮ из /auto_trade_status (тот же словарь
-// params, что использует живой цикл авто-трейда) — гарантированная 1:1
-// сверка без посредников.
-function syncChartWithAutoTrade(){
+// v3.52.76: раньше подхват live-конфига авто-трейда на график требовал
+// ручного клика по кнопке "Синк с авто-трейдом" — если её забыть нажать,
+// график тихо показывал параметры оптимизатора (_bestParams) или дефолты
+// формы, а не то, чем реально торгует _auto_trade_loop(). Внешне это
+// выглядело как "сигнал авто-трейда не совпадает с графиком", хотя на
+// самом деле сравнивались два РАЗНЫХ конфига. Теперь график по умолчанию
+// сам следует за живым авто-трейдом (_chartFollowAT=true) — подтягивает
+// его параметры при открытии вкладки И на лету, как только авто-трейд
+// меняет sym/tf/days/params (см. pollGlobalStatus). Явное редактирование
+// любого поля графика руками (_chartBreakFollow) переводит в ручной режим
+// до следующего клика по бейджу — так можно всё ещё исследовать другие
+// конфиги, не теряя это насовсем при каждом тике авто-обновления.
+var _chartFollowAT   = true;
+var _chartLastSyncKey = null;
+
+function _syncFieldsFromAT(d){
+  var p = d.params;
+  document.getElementById('cSym').value = d.symbol;
+  var tfSel = document.getElementById('cTf');
+  for(var i=0;i<tfSel.options.length;i++){ if(tfSel.options[i].value===d.tf){ tfSel.selectedIndex=i; break; } }
+  document.getElementById('cDays').value  = d.days;
+  document.getElementById('cSwing').value = p.swing_len != null ? p.swing_len : 10;
+  document.getElementById('cSl').value    = p.sl_pct    != null ? p.sl_pct    : 0.3;
+  document.getElementById('cTp').value    = p.tp_pct    != null ? p.tp_pct    : 0.6;
+  _chartExtra = {
+    internal_len:        p.internal_len        != null ? p.internal_len        : 5,
+    ob_filter:           p.ob_filter           != null ? p.ob_filter           : 'atr',
+    ob_mitigation:       p.ob_mitigation       != null ? p.ob_mitigation       : 'highlow',
+    fvg_enabled:         p.fvg_enabled         != null ? p.fvg_enabled         : true,
+    fvg_threshold:       p.fvg_threshold       != null ? p.fvg_threshold       : 0.1,
+    choch_only:          p.choch_only          != null ? p.choch_only         : false,
+    use_internal:        p.use_internal        != null ? p.use_internal        : true,
+    min_ob_size:         p.min_ob_size         != null ? p.min_ob_size         : 1.0,
+    require_fvg_confirm: p.require_fvg_confirm != null ? p.require_fvg_confirm : false,
+    tl_mult:    p.tl_mult    != null ? p.tl_mult    : 1.0,
+    tl_method:  p.tl_method  != null ? p.tl_method  : 'atr',
+    tl_filter:  p.tl_filter  != null ? p.tl_filter  : false,
+    st_filter:  p.st_filter  != null ? p.st_filter  : false,
+    st_period:  p.st_period  != null ? p.st_period  : 10,
+    st_mult:    p.st_mult    != null ? p.st_mult    : 3.0,
+    vol_filter: p.vol_filter != null ? p.vol_filter : false,
+    vol_mult:   p.vol_mult   != null ? p.vol_mult   : 1.0
+  };
+  _chartLastSyncKey = JSON.stringify([d.symbol,d.tf,d.days,p]);
+}
+
+function _chartBreakFollow(){
+  if(!_chartFollowAT) return;
+  _chartFollowAT = false;
+  _chartUpdateBadge(false, false);
+}
+
+function _chartToggleFollow(){
+  if(_chartFollowAT){
+    _chartFollowAT = false;
+    _chartUpdateBadge(false, false);
+    return;
+  }
   fetch('/auto_trade_status').then(function(r){return r.json();}).then(function(d){
-    if(!d.symbol || !d.params){ alert('Авто-трейд ни разу не запускался в этой сессии — нет параметров для синка'); return; }
-    var p = d.params;
-    document.getElementById('cSym').value = d.symbol;
-    var tfSel = document.getElementById('cTf');
-    for(var i=0;i<tfSel.options.length;i++){ if(tfSel.options[i].value===d.tf){ tfSel.selectedIndex=i; break; } }
-    document.getElementById('cDays').value  = d.days;
-    document.getElementById('cSwing').value = p.swing_len != null ? p.swing_len : 10;
-    document.getElementById('cSl').value    = p.sl_pct    != null ? p.sl_pct    : 0.3;
-    document.getElementById('cTp').value    = p.tp_pct    != null ? p.tp_pct    : 0.6;
-    _chartExtra = {
-      internal_len:        p.internal_len        != null ? p.internal_len        : 5,
-      ob_filter:           p.ob_filter           != null ? p.ob_filter           : 'atr',
-      ob_mitigation:       p.ob_mitigation       != null ? p.ob_mitigation       : 'highlow',
-      fvg_enabled:         p.fvg_enabled         != null ? p.fvg_enabled         : true,
-      fvg_threshold:       p.fvg_threshold       != null ? p.fvg_threshold       : 0.1,
-      choch_only:          p.choch_only          != null ? p.choch_only         : false,
-      use_internal:        p.use_internal        != null ? p.use_internal        : true,
-      min_ob_size:         p.min_ob_size         != null ? p.min_ob_size         : 1.0,
-      require_fvg_confirm: p.require_fvg_confirm != null ? p.require_fvg_confirm : false,
-      tl_mult:    p.tl_mult    != null ? p.tl_mult    : 1.0,
-      tl_method:  p.tl_method  != null ? p.tl_method  : 'atr',
-      tl_filter:  p.tl_filter  != null ? p.tl_filter  : false,
-      st_filter:  p.st_filter  != null ? p.st_filter  : false,
-      st_period:  p.st_period  != null ? p.st_period  : 10,
-      st_mult:    p.st_mult    != null ? p.st_mult    : 3.0,
-      vol_filter: p.vol_filter != null ? p.vol_filter : false,
-      vol_mult:   p.vol_mult   != null ? p.vol_mult   : 1.0
-    };
-    var chartBtn = document.getElementById('chartTabBtn');
-    if(chartBtn) switchTab('chart', chartBtn);
+    if(!d.enabled || !d.symbol || !d.params){ alert('Авто-трейд сейчас не запущен — нечего подтягивать'); return; }
+    _chartFollowAT = true;
+    _syncFieldsFromAT(d);
     loadChart();
-  }).catch(function(){ alert('Сеть недоступна — не удалось получить /auto_trade_status'); });
+  }).catch(function(){ alert('Сеть недоступна'); });
+}
+
+function _chartUpdateBadge(live, running){
+  var b = document.getElementById('chartSyncBadge');
+  if(!b) return;
+  if(live){
+    b.textContent = '🔗 LIVE авто-трейд';
+    b.style.color = 'var(--green)';
+    b.style.borderColor = 'var(--green)';
+  } else if(running){
+    b.textContent = '✏️ Ручной (авто-трейд идёт)';
+    b.style.color = 'var(--yellow)';
+    b.style.borderColor = 'var(--yellow)';
+  } else {
+    b.textContent = '✏️ Ручной';
+    b.style.color = 'var(--text4)';
+    b.style.borderColor = 'var(--border)';
+  }
+}
+
+// v3.52.76: раньше расхождение "авто-трейд открыл сделку по X, а на графике
+// такого сигнала нет" замечали только на глаз, задним числом, роясь в логах.
+// Теперь после каждой загрузки/автообновления графика сверяем факт: если
+// opt_state.chart.auto_trade_sig (запись о РЕАЛЬНО открытой авто-трейдом
+// позиции) не находит соответствия среди сигналов, которые ПРЯМО СЕЙЧАС
+// выдаёт тот же _simulate() с теми же параметрами — это симптом реального
+// расхождения (а не просто "авто-трейд ещё не вооружился" — тут сравниваем
+// только уже СОСТОЯВШИЕСЯ сделки, у которых просто обязан быть парный
+// сигнал на графике), и баннер загорается сразу, ярко, без необходимости
+// сравнивать вручную.
+function _checkATMismatch(){
+  var banner = document.getElementById('chartMismatchBanner');
+  if(!banner) return;
+  if(!_autoTradeSig || !_autoTradeSig.ts){ banner.style.display='none'; return; }
+  var tol = Math.max(_autoTradeSig.entry * 0.003, 0.0000001); // 0.3% допуск на переисполнение/раунд
+  var found = false;
+  for(var i=0;i<_sig.length;i++){
+    var s = _sig[i];
+    if(s.dir !== _autoTradeSig.dir) continue;
+    if(Math.abs((s.entry||0) - _autoTradeSig.entry) <= tol){ found = true; break; }
+  }
+  if(found){
+    banner.style.display = 'none';
+  } else {
+    banner.style.display = 'block';
+    banner.textContent = '⚠ Авто-трейд открыл '+_autoTradeSig.dir.toUpperCase()+' по '+fmt(_autoTradeSig.entry)+
+      ', но текущий пересчёт графика с этими же параметрами такого сигнала не видит — расхождение, разбираться';
+  }
 }
 function applyBestToChart(){
   if(!_bestParams){ loadChart(); return; }  // нет конфига — просто грузим с текущими полями
@@ -6396,6 +6517,21 @@ function pollGlobalStatus(){
       } else {
         _gsSet('gsTrade','gsTradeDot','gsTradeTxt','on','Авто-трейд: '+(d.symbol||'')+' '+(d.tf||''));
       }
+      // v3.52.76: график на вкладке "Chart" следует за живым конфигом
+      // авто-трейда сам, без ручной кнопки — если параметры/символ/days
+      // поменялись (новый best от оптимизатора, ручной рестарт авто-трейда
+      // с другим сетапом), перегружаем график тем же самым конфигом здесь,
+      // на том же поллере что уже опрашивает /auto_trade_status раз в 2с.
+      if(_chartFollowAT && d.symbol && d.params){
+        var chartActive = document.getElementById('chartPanel').classList.contains('active');
+        var key = JSON.stringify([d.symbol,d.tf,d.days,d.params]);
+        if(key !== _chartLastSyncKey){
+          _syncFieldsFromAT(d);
+          if(chartActive){ _chartUpdateBadge(true,true); loadChart(); }
+        } else if(chartActive){
+          _chartUpdateBadge(true, true);
+        }
+      }
       if(!_atActive){
         // Этот поллер работает всегда, с самой загрузки страницы, независимо
         // от того открыта ли панель авто-трейда. Раньше кнопки Start/Stop и
@@ -6414,6 +6550,9 @@ function pollGlobalStatus(){
       }
     } else {
       _gsSet('gsTrade','gsTradeDot','gsTradeTxt','off','Авто-трейд: выкл');
+      if(document.getElementById('chartPanel').classList.contains('active')){
+        _chartUpdateBadge(false, false);
+      }
     }
   }).catch(function(){});
 }
@@ -6510,7 +6649,16 @@ function _renderBestAndTop20(d){
     // не перезагружать сам график, если применённый конфиг не изменился
     // (это и делает isNewBest); порог по номеру цикла был лишним и только
     // вредил корректности.
-    if(isNewBest){
+    if(isNewBest && !(_chartFollowAT && document.getElementById('chartPanel').classList.contains('active'))){
+      // v3.52.76: пока график в режиме LIVE-слежения за авто-трейдом
+      // (см. switchTab/pollGlobalStatus), новый best оптимизатора НЕ должен
+      // молча перебивать поля — иначе на вкладке одновременно дерутся два
+      // источника правды (best оптимизатора vs реальный конфиг авто-трейда),
+      // и результат зависит от того, какой fetch пришёл последним. В LIVE-
+      // режиме график продолжает показывать именно то, чем торгует бот;
+      // новый best применится только когда сам авто-трейд его подхватит
+      // (auto_sync) — это отразится через /auto_trade_status на следующем
+      // тике поллера.
       applyBestToChart();
     }
     var wrC=r.winrate>=55?'green':r.winrate>=45?'yellow':'red';
@@ -6707,6 +6855,7 @@ function loadChart(auto){
       _tl_upos=d.tl_upos||[]; _tl_dnos=d.tl_dnos||[];
       _fvg_bull=d.fvg_bull||[]; _fvg_bear=d.fvg_bear||[];
       _autoTradeSig=d.auto_trade_sig||null;
+      _checkATMismatch();
       if(!auto || anchorTs===null){
         _camStart=Math.max(0,_cd.length-80);
         _camEnd=_cd.length-1;
