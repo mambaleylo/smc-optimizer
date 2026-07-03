@@ -1,6 +1,17 @@
 #!/usr/bin/env python3
 """
-SMC Optimizer v3.52.67
+SMC Optimizer v3.52.68
+- v3.52.68: Читаемость графика сделок. (1) Пунктирная линия входа (entry)
+  раньше рисовалась только у последней (самой правой) сделки — у всех
+  остальных были видны TP/SL, но не было видно, где именно был вход. Теперь
+  entry-линия рисуется у ВСЕХ сделок: у последней — как раньше (яркая,
+  entryCol), у прошлых — тонкая тускло-серая пунктирная (rgba(180,180,180,
+  0.3)), по аналогии с тем, как уже приглушались TP/SL у не-последних сделок.
+  (2) Метка процента PnL у точки выхода (+N%/−N%) рисовалась прямо поверх
+  свечей без фона — на разноцветных фитилях сливалась и была нечитаема.
+  Добавлена тёмная полупрозрачная плашка-подложка (rgba(0,0,0,0.6)) под
+  текст, с отступом побольше от точки выхода (было ±5/12px, стало ±8/16px),
+  чтобы не наезжать на саму точку.
 - v3.52.67: Heartbeat в healthchecks.io — настоящее решение проблемы "нет
   интернета на телефоне → нечем отправить алерт" из v3.52.66. Фоновый поток
   каждые 5 минут пингует URL, заданный в новом поле "Heartbeat URL
@@ -1407,7 +1418,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.67"
+APP_VERSION  = "3.52.68"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -6446,17 +6457,18 @@ function drawChart(){
     ctx2.beginPath();ctx2.moveTo(xe,yt);ctx2.lineTo(xe2,yt);ctx2.stroke();
     ctx2.strokeStyle=isLast?clrSL:'rgba(239,83,80,0.45)';
     ctx2.beginPath();ctx2.moveTo(xe,ys);ctx2.lineTo(xe2,ys);ctx2.stroke();
+    // Entry линия — v3.52.68: теперь у ВСЕХ сделок, не только у последней.
+    // Раньше пунктир входа рисовался только для isLast — у остальных сделок
+    // были видны TP/SL, но было непонятно, где именно был вход в сделку.
+    ctx2.strokeStyle=isLast?entryCol:'rgba(180,180,180,0.3)';
+    ctx2.lineWidth=isLast?0.8:0.5; ctx2.setLineDash(isLast?[3,5]:[2,4]);
+    ctx2.beginPath();ctx2.moveTo(xe,ye);ctx2.lineTo(xe2,ye);ctx2.stroke();
+    ctx2.setLineDash([]);
     if(isLast){
-      // Entry линия — только у последней
-      ctx2.strokeStyle=entryCol;ctx2.lineWidth=0.8;ctx2.setLineDash([3,5]);
-      ctx2.beginPath();ctx2.moveTo(xe,ye);ctx2.lineTo(xe2,ye);ctx2.stroke();
-      ctx2.setLineDash([]);
       // Метки — только у правого края
       ctx2.font='bold 9px monospace';
       ctx2.fillStyle=clrTP;ctx2.textAlign='right';ctx2.fillText('TP '+fmt(sg.tp),xe2-3,yt-3);
       ctx2.fillStyle=clrSL;ctx2.textAlign='right';ctx2.fillText('SL '+fmt(sg.sl),xe2-3,ys+10);
-    } else {
-      ctx2.setLineDash([]);
     }
     // Точка выхода + метка PnL
     if(sg.exit_i!==undefined&&sg.exit_i>=s&&sg.exit_i<=e){
@@ -6467,10 +6479,20 @@ function drawChart(){
       if(sg.dep_pct!==undefined){
         var lbl=(sg.dep_pct>0?'+':'')+sg.dep_pct+'%';
         ctx2.font='bold 9px monospace';
+        var alignRight = exitX > W*0.85;
+        ctx2.textAlign = alignRight ? 'right' : 'left';
+        var lx = alignRight ? exitX-6 : exitX+6;
+        var ly = sg.win ? exitY-20 : exitY+28;
+        // v3.52.68: тёмная плашка-фон под текстом — раньше процент терялся
+        // на фоне свечей. Смещаем метку по ВЕРТИКАЛИ (дальше от точки
+        // выхода вверх/вниз), а не по горизонтали — сдвиг вбок всё равно
+        // упирается в соседние свечи, а вертикальный отступ выводит метку
+        // за пределы тела/фитилей.
+        var tw = ctx2.measureText(lbl).width;
+        var bx = alignRight ? lx-tw-3 : lx-3;
+        ctx2.fillStyle='rgba(0,0,0,0.6)';
+        ctx2.fillRect(bx, ly-9, tw+6, 12);
         ctx2.fillStyle=sg.win?clrTP:clrSL;
-        ctx2.textAlign= exitX > W*0.85 ? 'right' : 'left';
-        var lx = exitX > W*0.85 ? exitX-6 : exitX+6;
-        var ly = sg.win ? exitY-5 : exitY+12;
         ctx2.fillText(lbl,lx,ly);
       }
     }
