@@ -1,6 +1,20 @@
 #!/usr/bin/env python3
 """
-SMC Optimizer v3.52.65
+SMC Optimizer v3.52.66
+- v3.52.66: Watchdog пропажи интернета. Раз в 60с фоновый поток проверяет
+  доступность Gate.io API. Если связи нет дольше настраиваемого порога
+  (по умолчанию 60 мин) — пытается отправить TG/ntfy алерт "🔴 Нет связи
+  уже N мин", и повторяет попытку каждые N минут, пока простой продолжается
+  (на случай если первая попытка не смогла уйти из-за отсутствия сети).
+  Как только связь появляется — гарантированно уходит "🟢 Связь
+  восстановлена, простой был ~N мин" (отправляется уже при наличии сети,
+  так что дойдёт всегда, даже если алерт о пропаже не смог). Настройки —
+  чекбокс вкл/выкл и порог в минутах — в карточке "Алерты" рядом с TG/ntfy
+  полями, персистятся в тот же ~/.smc_alert_cfg.json. Важно понимать
+  ограничение: если на устройстве вообще нет интернета (напр. кончились
+  деньги на мобильном трафике), скрипт физически не может отправить алерт
+  В ТОТ МОМЕНТ — уведомление гарантированно дойдёт только когда связь
+  реально появится снова (то самое "🟢 восстановлена").
 - v3.52.65: UI топ-20 конфигураций (мобильная вёрстка). (1) На экранах
   ≤700px (телефон) блок "Топ-20 конфигураций" (.main) теперь идёт ВЫШЕ
   блока "Параметры запуска" (.sidebar) — через CSS order:-1 на .main
@@ -1381,7 +1395,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.65"
+APP_VERSION  = "3.52.66"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -1411,6 +1425,8 @@ GH_TOKEN     = os.environ.get("GH_TOKEN", "")
 TG_TOKEN     = os.environ.get("TG_TOKEN", "")
 TG_CHAT      = os.environ.get("TG_CHAT", "")
 NTFY_URL     = os.environ.get("NTFY_URL", "")
+WATCHDOG_ENABLED      = True   # v3.52.66: увед. в TG/ntfy, если пропал интернет
+WATCHDOG_TIMEOUT_MIN  = 60     # порог простоя (мин) до первого алерта
 ALERT_CFG_PATH   = os.path.expanduser("~/.smc_alert_cfg.json")
 FITNESS_W_PATH   = os.path.expanduser("~/.smc_fitness_weights.json")
 GATE_CFG_PATH    = os.path.expanduser("~/.smc_gate_cfg.json")
@@ -3514,13 +3530,20 @@ def _send_alert(msg):
 
 def _load_alert_cfg():
     """Подхватывает сохранённые TG/ntfy настройки из файла (приоритет над env)."""
-    global TG_TOKEN, TG_CHAT, NTFY_URL
+    global TG_TOKEN, TG_CHAT, NTFY_URL, WATCHDOG_ENABLED, WATCHDOG_TIMEOUT_MIN
     try:
         with open(ALERT_CFG_PATH, "r") as f:
             cfg = json.load(f)
         TG_TOKEN = cfg.get("tg_token", TG_TOKEN) or TG_TOKEN
         TG_CHAT  = cfg.get("tg_chat",  TG_CHAT)  or TG_CHAT
         NTFY_URL = cfg.get("ntfy_url", NTFY_URL) or NTFY_URL
+        if "watchdog_enabled" in cfg:
+            WATCHDOG_ENABLED = bool(cfg.get("watchdog_enabled"))
+        if "watchdog_timeout_min" in cfg:
+            try:
+                WATCHDOG_TIMEOUT_MIN = max(5, min(1440, int(cfg.get("watchdog_timeout_min"))))
+            except (TypeError, ValueError):
+                pass
     except FileNotFoundError:
         pass
     except Exception as e:
@@ -3529,7 +3552,9 @@ def _load_alert_cfg():
 def _save_alert_cfg():
     try:
         with open(ALERT_CFG_PATH, "w") as f:
-            json.dump({"tg_token": TG_TOKEN, "tg_chat": TG_CHAT, "ntfy_url": NTFY_URL}, f)
+            json.dump({"tg_token": TG_TOKEN, "tg_chat": TG_CHAT, "ntfy_url": NTFY_URL,
+                       "watchdog_enabled": WATCHDOG_ENABLED,
+                       "watchdog_timeout_min": WATCHDOG_TIMEOUT_MIN}, f)
     except Exception as e:
         olog(f"⚠ Не удалось сохранить {ALERT_CFG_PATH}: {e}")
 
@@ -3887,6 +3912,68 @@ def _test_alert():
         except Exception as e:
             errs.append(f"ntfy: {e}")
     return ok_any, ("; ".join(errs) if errs else None)
+
+# ─── Watchdog пропажи интернета (v3.52.66) ───────────────────────────────────
+# ВАЖНО: если на устройстве вообще нет интернета (напр. кончились деньги на
+# мобильном трафике), сам скрипт физически не может отправить TG/ntfy алерт
+# В ТОТ МОМЕНТ — слать некуда, соединения нет. Поэтому смысл этого таймера
+# не "мгновенное" уведомление, а (1) попытка отправить алерт сразу по
+# истечении таймаута и затем ПОВТОРНО каждый цикл простоя — сработает, если
+# пропал именно Gate.io (а общий интернет/Telegram живы), и (2) обязательное
+# уведомление "связь восстановлена, простой был X мин" в момент, когда
+# соединение реально появится снова — это в любом случае дойдёт, т.к.
+# отправляется уже при наличии сети, и сообщит, что бот молчал N минут.
+_watchdog_lock       = threading.Lock()
+_watchdog_down_since = None   # time.time() момента первого разрыва, либо None
+_watchdog_alerted    = False  # уже отправляли хотя бы один алерт на этот разрыв
+_watchdog_last_alert = None   # time.time() последней отправки — для повторов
+WATCHDOG_CHECK_SEC   = 60     # как часто проверять связь
+
+def _check_connectivity():
+    """Лёгкая проверка доступности Gate.io API — это именно то, от чего
+    зависит работа бота (общий интернет может быть жив, а Gate.io недоступен,
+    и наоборот — не суть, боту в обоих случаях нечем торговать)."""
+    try:
+        r = requests.get(f"{GATE_API}/futures/usdt/contracts/BTC_USDT", timeout=6)
+        return r.ok
+    except Exception:
+        return False
+
+def _watchdog_loop():
+    global _watchdog_down_since, _watchdog_alerted, _watchdog_last_alert
+    while True:
+        time.sleep(WATCHDOG_CHECK_SEC)
+        if not WATCHDOG_ENABLED:
+            continue
+        online = _check_connectivity()
+        now = time.time()
+        with _watchdog_lock:
+            if online:
+                if _watchdog_alerted and _watchdog_down_since:
+                    down_min = max(1, int((now - _watchdog_down_since) / 60))
+                    _send_alert(f"🟢 Связь восстановлена. Не было интернета/Gate.io ~{down_min} мин.")
+                    olog(f"🟢 watchdog: связь восстановлена, простой ~{down_min} мин")
+                _watchdog_down_since = None
+                _watchdog_alerted    = False
+                _watchdog_last_alert = None
+            else:
+                if _watchdog_down_since is None:
+                    _watchdog_down_since = now
+                    olog("⚠ watchdog: нет связи с интернетом/Gate.io — таймер запущен")
+                    continue
+                elapsed_min = (now - _watchdog_down_since) / 60
+                if elapsed_min < WATCHDOG_TIMEOUT_MIN:
+                    continue
+                # первый алерт — по истечении таймаута; дальше повторяем раз в
+                # WATCHDOG_TIMEOUT_MIN минут, пока простой продолжается — на
+                # случай если первая попытка не смогла уйти из-за отсутствия сети
+                if (not _watchdog_alerted) or \
+                   (now - (_watchdog_last_alert or 0) >= WATCHDOG_TIMEOUT_MIN * 60):
+                    _send_alert(f"🔴 Нет связи с интернетом/Gate.io уже {int(elapsed_min)} мин.")
+                    _watchdog_alerted    = True
+                    _watchdog_last_alert = now
+
+
 
 def _fmt_px(v):
     if v is None: return "—"
@@ -4980,6 +5067,12 @@ input:focus,select:focus{outline:none;border-color:var(--accent)}
     <label>TG Token</label><input id="tgToken" type="password" placeholder="1234567890:AA...">
     <label>TG Chat ID</label><input id="tgChat" placeholder="123456789">
     <label>ntfy URL (необязательно)</label><input id="ntfyUrl" placeholder="https://ntfy.sh/your-topic">
+    <div style="display:flex;align-items:center;gap:6px;margin:2px 0 8px">
+      <input type="checkbox" id="wdEnabled" style="width:auto;margin:0" checked>
+      <label style="margin:0;font-size:11px;color:var(--text3);flex:1">Увед. если пропал интернет дольше</label>
+      <input id="wdTimeout" type="number" value="60" min="5" max="1440" style="width:52px;margin:0">
+      <span style="font-size:11px;color:var(--text3)">мин</span>
+    </div>
     <div style="display:flex;gap:6px">
       <button class="btn btn-sm" style="flex:1" onclick="saveAlertCfg()">💾 Сохранить</button>
       <button class="btn btn-sm" style="flex:1" onclick="testAlertCfg()">📨 Тест</button>
@@ -5671,6 +5764,8 @@ function loadAlertCfg(){
     document.getElementById('tgToken').value = d.tg_token||'';
     document.getElementById('tgChat').value  = d.tg_chat||'';
     document.getElementById('ntfyUrl').value = d.ntfy_url||'';
+    document.getElementById('wdEnabled').checked = d.watchdog_enabled!==false;
+    document.getElementById('wdTimeout').value   = d.watchdog_timeout_min||60;
     if(d.tg_token||d.tg_chat||d.ntfy_url) alertCfgStatus('Загружено из сохранённых настроек');
   }).catch(function(){});
 }
@@ -5679,7 +5774,9 @@ function saveAlertCfg(){
   var body={
     tg_token: document.getElementById('tgToken').value.trim(),
     tg_chat:  document.getElementById('tgChat').value.trim(),
-    ntfy_url: document.getElementById('ntfyUrl').value.trim()
+    ntfy_url: document.getElementById('ntfyUrl').value.trim(),
+    watchdog_enabled: document.getElementById('wdEnabled').checked,
+    watchdog_timeout_min: parseInt(document.getElementById('wdTimeout').value)||60
   };
   alertCfgStatus('Сохраняем...');
   fetch('/alert_cfg',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
@@ -5702,7 +5799,9 @@ function saveAlertCfgSync(){
   var body={
     tg_token: document.getElementById('tgToken').value.trim(),
     tg_chat:  document.getElementById('tgChat').value.trim(),
-    ntfy_url: document.getElementById('ntfyUrl').value.trim()
+    ntfy_url: document.getElementById('ntfyUrl').value.trim(),
+    watchdog_enabled: document.getElementById('wdEnabled').checked,
+    watchdog_timeout_min: parseInt(document.getElementById('wdTimeout').value)||60
   };
   return fetch('/alert_cfg',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
 }
@@ -7042,7 +7141,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             with chart_mon_lock:
                 self._json({k:v for k,v in chart_mon_state.items() if k != "params"})
         elif self.path == "/alert_cfg":
-            self._json({"tg_token": TG_TOKEN, "tg_chat": TG_CHAT, "ntfy_url": NTFY_URL})
+            self._json({"tg_token": TG_TOKEN, "tg_chat": TG_CHAT, "ntfy_url": NTFY_URL,
+                        "watchdog_enabled": WATCHDOG_ENABLED,
+                        "watchdog_timeout_min": WATCHDOG_TIMEOUT_MIN})
         elif self.path == "/fitness_weights":
             with fitness_w_lock:
                 self._json(dict(FITNESS_WEIGHTS))
@@ -7167,10 +7268,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json({"ok": True})
 
         elif self.path == "/alert_cfg":
-            global TG_TOKEN, TG_CHAT, NTFY_URL
+            global TG_TOKEN, TG_CHAT, NTFY_URL, WATCHDOG_ENABLED, WATCHDOG_TIMEOUT_MIN
             TG_TOKEN = (body.get("tg_token") or "").strip()
             TG_CHAT  = (body.get("tg_chat")  or "").strip()
             NTFY_URL = (body.get("ntfy_url") or "").strip()
+            if "watchdog_enabled" in body:
+                WATCHDOG_ENABLED = bool(body.get("watchdog_enabled"))
+            if "watchdog_timeout_min" in body:
+                try:
+                    WATCHDOG_TIMEOUT_MIN = max(5, min(1440, int(body.get("watchdog_timeout_min"))))
+                except (TypeError, ValueError):
+                    pass
             _save_alert_cfg()
             self._json({"ok": True})
 
@@ -7355,6 +7463,7 @@ def main():
     _load_gate_cfg()
     _load_fitness_weights()
     _load_last_symbol()
+    threading.Thread(target=_watchdog_loop, daemon=True).start()
 
     server = http.server.ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print(f"{_C_GRN}SMC Optimizer v{APP_VERSION} — http://0.0.0.0:{PORT}{_C_RST}", flush=True)
