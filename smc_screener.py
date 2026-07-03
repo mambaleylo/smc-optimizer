@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 """
-SMC Optimizer v3.52.68
+SMC Optimizer v3.52.69
+- v3.52.69: Метка PnL на графике сделок — переделка после неудачной попытки
+  в v3.52.68 (тёмная подложка сбоку от точки выхода всё равно цепляла
+  соседние свечи). Теперь метка стоит по ЦЕНТРУ всей зоны сделки (по X —
+  середина между входом и выходом, по Y — середина между ценой входа и
+  ценой TP/SL) — там, где и так залита полупрозрачная зона сделки, поэтому
+  меньше шанс наложения на посторонние свечи. Плашка — сплошного цвета
+  исхода (зелёная clrTP в прибыль, красная clrSL в стоп) вместо тёмной
+  полупрозрачной, текст белый, шрифт увеличен 9px→11px.
 - v3.52.68: Читаемость графика сделок. (1) Пунктирная линия входа (entry)
   раньше рисовалась только у последней (самой правой) сделки — у всех
   остальных были видны TP/SL, но не было видно, где именно был вход. Теперь
@@ -1418,7 +1426,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.68"
+APP_VERSION  = "3.52.69"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -6478,22 +6486,22 @@ function drawChart(){
       ctx2.beginPath();ctx2.arc(exitX,exitY,3.5,0,Math.PI*2);ctx2.fill();
       if(sg.dep_pct!==undefined){
         var lbl=(sg.dep_pct>0?'+':'')+sg.dep_pct+'%';
-        ctx2.font='bold 9px monospace';
-        var alignRight = exitX > W*0.85;
-        ctx2.textAlign = alignRight ? 'right' : 'left';
-        var lx = alignRight ? exitX-6 : exitX+6;
-        var ly = sg.win ? exitY-20 : exitY+28;
-        // v3.52.68: тёмная плашка-фон под текстом — раньше процент терялся
-        // на фоне свечей. Смещаем метку по ВЕРТИКАЛИ (дальше от точки
-        // выхода вверх/вниз), а не по горизонтали — сдвиг вбок всё равно
-        // упирается в соседние свечи, а вертикальный отступ выводит метку
-        // за пределы тела/фитилей.
-        var tw = ctx2.measureText(lbl).width;
-        var bx = alignRight ? lx-tw-3 : lx-3;
-        ctx2.fillStyle='rgba(0,0,0,0.6)';
-        ctx2.fillRect(bx, ly-9, tw+6, 12);
+        // v3.52.69: метка теперь по центру всей зоны сделки (между входом
+        // и выходом, между entry-ценой и TP/SL-ценой) — раньше липла к
+        // точке выхода сбоку/сверху и упиралась то в фитили, то в текст
+        // TP/SL. Плашка — сплошной цвет исхода (зелёная в прибыль,
+        // красная в стоп), текст белый — вместо тёмного полупрозрачного фона.
+        var zcx=(xe+Math.min(xe2,W-PAD.r))/2;
+        var zcy=(ye+exitY)/2;
+        ctx2.font='bold 11px monospace';
+        var tw=ctx2.measureText(lbl).width;
+        var boxW=tw+12, boxH=17;
         ctx2.fillStyle=sg.win?clrTP:clrSL;
-        ctx2.fillText(lbl,lx,ly);
+        ctx2.fillRect(zcx-boxW/2, zcy-boxH/2, boxW, boxH);
+        ctx2.fillStyle='#fff';
+        ctx2.textAlign='center'; ctx2.textBaseline='middle';
+        ctx2.fillText(lbl, zcx, zcy+0.5);
+        ctx2.textBaseline='alphabetic';
       }
     }
   });
