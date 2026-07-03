@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
 """
-SMC Optimizer v3.52.71
+SMC Optimizer v3.52.72
+- v3.52.72: Потолок Profit Factor в fitness-формуле поднят с 5.0 до 10.0
+  (строка ~3361). Причина: конфиги с PF=7-10 на выборках 20-22 сделок
+  получали тот же вклад в fitness, что и PF=5.14, т.к. min(pf,5.0) резал
+  всё, что выше 5, до одного и того же log(5.0). Разница в PF от 5 до 10
+  на таком числе сделок уже не микро-выброс от одного везучего трейда
+  (потолок изначально был анти-overfit guard'ом против единичной
+  почти-нулевой убыточной сделки при малой выборке, см. min 5 trades
+  gate), так что 10.0 даёт больше репрезентативности без открытия
+  двери шумовым выбросам PF=50+.
 - v3.52.71: Баг логики сигналов в _simulate() — вход в новую сделку на ТОЙ ЖЕ
   свече, где закрылась предыдущая. Раньше `if in_trade: continue` пропускал
   переход к следующему бару только если позиция осталась открытой; если
@@ -1439,7 +1448,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.71"
+APP_VERSION  = "3.52.72"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -3358,7 +3367,7 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
     _eps = 1e-6
     log_fit = (
         fw.get("wr",     1.0) * math.log(max(wr, _eps)) +
-        fw.get("pf",     1.0) * math.log(max(min(pf, 5.0), _eps)) +
+        fw.get("pf",     1.0) * math.log(max(min(pf, 10.0), _eps)) +
         fw.get("trades", 1.0) * math.log(max(trade_factor, _eps)) +
         fw.get("rr",     1.0) * math.log(max(rr_bonus, _eps)) +
         fw.get("ret",    1.0) * math.log(max(equity / init_deposit, _eps)) -
