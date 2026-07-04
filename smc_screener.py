@@ -1,5 +1,27 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.78
+- v3.52.78: Аудит системы авто-торговли на баги, три находки:
+  1) КРИТИЧНО: маркет-ордер входа отправлялся через обычный _gate_req() с
+     авто-повтором (3 попытки) — при таймауте ответа (Gate исполнил ордер,
+     но ответ не дошёл — обычное дело на мобильной сети) бот слепо слал
+     ВТОРОЙ такой же ордер, задваивая позицию. Теперь на входе один запрос
+     без авто-повтора + явная проверка факта открытия на бирже перед тем,
+     как считать попытку неудачной.
+  2) _gate_get_position() любую сетевую ошибку молча превращал в тот же
+     None, что и честное "позиции нет" — вызывающий код не мог отличить
+     "биржа пуста" от "не смогли спросить". Из-за этого один сетевой сбой
+     мог: (а) заставить бота посчитать реально ОТКРЫТУЮ позицию закрытой и
+     снять её настоящие TP/SL ордера, оставив сделку без защиты; (б)
+     заставить бота открыть НОВУЮ позицию, думая что биржа пуста, хотя
+     на ней уже был реальный ордер. Теперь ошибка запроса пробрасывается
+     исключением, и оба места явно трактуют "не смогли проверить" как
+     "ничего не трогаем, повторим позже" — никогда не как "значит пусто".
+  3) Неудачное открытие позиции (баланс/сеть/ошибка API) всё равно помечало
+     сигнал как "обработанный" (last_entry_ts) — бот терял этот сигнал
+     навсегда, даже если причина сбоя была временной. Теперь last_entry_ts
+     коммитится только при подтверждённом успехе — при неудаче тот же
+     сигнал будет замечен заново на следующем тике.
 SMC Optimizer v3.52.77
 - v3.52.77: Архитектурный фикс, а не заплатка. Раньше /chart_data и
   _auto_trade_loop() были ДВУМЯ независимыми прогонами одного и того же
@@ -1539,7 +1561,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.77"
+APP_VERSION  = "3.52.78"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -1766,19 +1788,34 @@ def _gate_req(method, path, params=None, body=None, _retries=3, _retry_delay=2.0
     raise last_exc
 
 def _gate_get_position(symbol):
-    """Текущая позиция по символу (None если нет)."""
-    try:
-        data = _gate_req("GET", f"/futures/usdt/positions/{symbol}")
-        size = float(data.get("size", 0))
-        if size == 0: return None
-        return {
-            "dir":    "long" if size > 0 else "short",
-            "size":   abs(size),
-            "entry":  float(data.get("entry_price", 0)),
-        }
-    except Exception as e:
-        olog(f"⚠ gate_get_position: {e}")
-        return None
+    """Текущая позиция по символу (None если ПОДТВЕРЖДЁННО нет).
+    v3.52.78: КРИТИЧНЫЙ ФИКС — раньше любая ошибка запроса (сеть, таймаут,
+    5xx от Gate) молча ловилась и превращалась в тот же None, что и честное
+    "позиции нет" (size==0). Вызывающий код физически не мог отличить эти
+    два случая и везде трактовал None как "на бирже пусто". Реальные
+    последствия:
+      1) _check_position_closed_and_alert() при таком None объявлял РЕАЛЬНО
+         ОТКРЫТУЮ позицию закрытой из-за одного сетевого сбоя — слал ложный
+         алерт "закрыта", сбрасывал auto_trade_state["position"]=None и (что
+         хуже всего) вызывал _gate_cancel_orders(), СНИМАЯ настоящие живые
+         TP/SL с позиции, которая на самом деле осталась висеть без защиты.
+      2) Ветка нового сигнала (`existing = _gate_get_position(sym)`) при
+         таком None считала биржу пустой и могла открыть НОВУЮ позицию, даже
+         если на бирже уже была открыта настоящая (наша же, потерянная из
+         виду из-за сбоя проверки).
+    Теперь при ошибке запроса исключение ПРОБРАСЫВАЕТСЯ дальше — вызывающий
+    код обязан явно решить, что делать при "не смогли проверить" (см. правки
+    в _check_position_closed_and_alert и в обработке нового сигнала:
+    оба теперь НЕ считают биржу пустой/позицию закрытой при таком сбое —
+    пропускают цикл и повторяют проверку позже, вместо тихого предположения)."""
+    data = _gate_req("GET", f"/futures/usdt/positions/{symbol}")
+    size = float(data.get("size", 0))
+    if size == 0: return None
+    return {
+        "dir":    "long" if size > 0 else "short",
+        "size":   abs(size),
+        "entry":  float(data.get("entry_price", 0)),
+    }
 
 def _gate_inspect_open_orders(symbol):
     """Смотрит открытые price_orders (TP/SL) по символу на бирже.
@@ -1963,7 +2000,22 @@ def _check_position_closed_and_alert(sym, our_pos_now):
     одинаково использоваться и в основном цикле сигналов (раз в свечу), и
     в быстром опросе во время ожидания (раз в POS_POLL_SEC секунд) — иначе
     уведомление о закрытии приходило только когда дожидались следующей свечи."""
-    still_open = _gate_get_position(sym)
+    # v3.52.78: раньше _gate_get_position(sym) при сетевой ошибке молча
+    # возвращал None — неотличимо от честного "позиции нет". Один сбой сети
+    # во время проверки приводил к ложному алерту "закрыта" и, что опаснее
+    # всего, к вызову _gate_cancel_orders() ниже по коду вызывающей стороны —
+    # снятию РЕАЛЬНЫХ TP/SL с позиции, которая на самом деле осталась
+    # открытой и незащищённой. Теперь _gate_get_position пробрасывает
+    # исключение при сбое запроса — здесь ловим его отдельно от честного
+    # "нет позиции" и возвращаем False (треактуем как "всё ещё открыта,
+    # просто не смогли проверить прямо сейчас") — вызывающий код ничего не
+    # трогает и повторит проверку на следующем тике.
+    try:
+        still_open = _gate_get_position(sym)
+    except Exception as e:
+        olog(f"⚠ Не удалось проверить статус позиции {sym} ({e}) — "
+             f"считаем ещё открытой, проверим на следующем тике")
+        return False
     if still_open:
         return False
     dirru = our_pos_now.get("dir", "?").upper()
@@ -2095,14 +2147,44 @@ def _gate_open_position(symbol, direction, entry_px, sl_px, tp_px, risk_pct, **k
         _gate_cancel_orders(symbol)
 
         # 6. Маркет-ордер на вход
+        # v3.52.78: КРИТИЧНЫЙ ФИКС — раньше этот вызов шёл через обычный
+        # _gate_req() с дефолтными _retries=3. Маркет-ордер НЕ идемпотентен:
+        # если Gate.io успел исполнить его на своей стороне, а наш HTTP-ответ
+        # просто не дошёл (ReadTimeout/обрыв — обычное дело на мобильной
+        # сети Termux), автоматический повтор _gate_req реально отправлял
+        # ВТОРОЙ такой же ордер поверх уже открытой позиции — задваивая
+        # размер сделки вслепую. Теперь на входе _retries=1 (без слепого
+        # авто-повтора), а при сетевой ошибке — прямая проверка факта
+        # открытия позиции на бирже перед тем, как решить, что делать дальше.
         is_long = (direction == "long")
-        _gate_req("POST", "/futures/usdt/orders", body={
-            "contract": contract,
-            "size":     size if is_long else -size,
-            "price":    "0",
-            "tif":      "ioc",
-            "text":     "t-smc-open",
-        })
+        try:
+            _gate_req("POST", "/futures/usdt/orders", body={
+                "contract": contract,
+                "size":     size if is_long else -size,
+                "price":    "0",
+                "tif":      "ioc",
+                "text":     "t-smc-open",
+            }, _retries=1)
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+                requests.exceptions.ReadTimeout) as _e_net:
+            olog(f"⚠ Таймаут/сеть при отправке ордера на вход ({_e_net}) — "
+                 f"проверяю на бирже, прошёл ли ордер, прежде чем считать "
+                 f"попытку неудачной (чтобы не задвоить позицию повтором)")
+            time.sleep(2.0)
+            try:
+                _check = _gate_get_position(contract)
+            except Exception:
+                _check = None
+            if not _check:
+                # Позиции на бирже действительно нет — ордер реально не
+                # прошёл, это настоящая сетевая неудача. Поднимаем исключение
+                # дальше — сработает except в конце функции, вызывающий код
+                # (v3.52.78, см. auto_trade_loop) теперь НЕ помечает сигнал
+                # обработанным при таком провале, повторит на следующем тике.
+                raise
+            olog(f"✓ Ордер на вход всё же исполнился на бирже несмотря на "
+                 f"таймаут ответа — продолжаю как при успехе, повтор не нужен")
         time.sleep(1.0)
 
         # Позиция открыта — дальше TP/SL в отдельном блоке,
@@ -2577,7 +2659,25 @@ def _auto_trade_loop():
                             sl_px         = sig["sl"]
                             tp_px         = sig["tp"]
 
-                            existing = _gate_get_position(sym)
+                            # v3.52.78: раньше сбой этого запроса (сеть/таймаут)
+                            # молча возвращал None — неотличимо от честного "на
+                            # бирже пусто". Дальше по коду это приводило к тому,
+                            # что бот считал биржу свободной и открывал НОВУЮ
+                            # позицию рыночным ордером, даже не зная реального
+                            # состояния счёта — например когда там уже висела
+                            # наша же позиция, которую просто не удалось
+                            # прочитать из-за обрыва связи. Теперь при сбое
+                            # явно помечаем это флагом и ниже (в ветке "чистый
+                            # новый вход") НЕ открываем позицию вслепую.
+                            _pos_check_failed = False
+                            try:
+                                existing = _gate_get_position(sym)
+                            except Exception as _pge:
+                                olog(f"⚠ Не удалось проверить текущую позицию на бирже перед "
+                                     f"обработкой сигнала {direction.upper()} ({_pge}) — "
+                                     f"состояние счёта неизвестно, вход отложен до следующего тика")
+                                existing = None
+                                _pos_check_failed = True
 
                             with auto_trade_lock:
                                 our_pos = auto_trade_state.get("position")
@@ -2749,92 +2849,125 @@ def _auto_trade_loop():
                                     with auto_trade_lock:
                                         auto_trade_state["last_entry_ts"] = entry_ts
                                 else:
-                                    with opt_lock:
-                                        cur_cycle = opt_state.get("cycle", 0)
-                                    if cur_cycle < MIN_CYCLES_BEFORE_TRADE:
-                                        olog(f"🚫 Сигнал {direction.upper()} отфильтрован — "
-                                             f"оптимизатор прошёл только {cur_cycle}/"
-                                             f"{MIN_CYCLES_BEFORE_TRADE} циклов на тренировочном "
-                                             f"окне — рано, поиск ещё не сошёлся. Сигнал помечается "
-                                             f"обработанным и НЕ откроет сделку, даже когда порог "
-                                             f"будет пройден — только следующий новый сигнал.")
-                                        if not cycle_gate_alerted:
-                                            _send_alert(
-                                                f"🚫 <b>{sym}</b> — сигнал {direction.upper()} "
-                                                f"отфильтрован: оптимизатор прошёл только "
-                                                f"{cur_cycle}/{MIN_CYCLES_BEFORE_TRADE} циклов. "
-                                                f"Авто-трейд начнёт открывать сделки только по "
-                                                f"сигналам, которые появятся ПОСЛЕ достижения порога."
-                                            )
-                                            cycle_gate_alerted = True
-                                        # Помечаем сигнал как обработанный (как при обычном входе),
-                                        # чтобы он не "ждал" и не открылся задним числом, когда
-                                        # порог циклов будет пройден — это была бы сделка по
-                                        # параметрам, которые на момент сигнала ещё не были
-                                        # достаточно оптимизированы.
-                                        with auto_trade_lock:
-                                            auto_trade_state["last_entry_ts"] = entry_ts
-                                    elif (_wf_result := _wf_validate(sym, tf, p, risk_pct, train_days=days, train_offset=0))[0] is False:
-                                        # v3.52.22: настоящая OOS-проверка — params прогнаны через
-                                        # _simulate на окне, которое оптимизатор НЕ видел во время
-                                        # поиска. None (мало OOS-данных/ошибка фетча) не блокирует —
-                                        # это проблема данных, а не качества стратегии; блокирует
-                                        # только явный False (PF<1 на незнакомых данных).
-                                        # v3.52.43: вызываем ОДИН раз, результат сохраняем —
-                                        # раньше было 3 вызова: каждый делал отдельный HTTP-запрос
-                                        # за свечами, при нестабильной сети второй/третий мог
-                                        # вернуть None вместо False и пропустить сигнал-мусор.
-                                        _wf_passed, _wf_detail = _wf_result
-                                        olog(f"🚫 Сигнал {direction.upper()} отфильтрован — "
-                                             f"провалена walk-forward проверка на OOS-окне: "
-                                             f"{_wf_detail}. Сделка не открыта, ждём следующий сигнал.")
-                                        if not wf_gate_alerted:
-                                            _send_alert(
-                                                f"🚫 <b>{sym}</b> — сигнал {direction.upper()} "
-                                                f"отфильтрован walk-forward'ом: {_wf_detail}. "
-                                                f"Текущие params не подтвердились на данных, которые "
-                                                f"оптимизатор не видел — торговать ими рискованно."
-                                            )
-                                            wf_gate_alerted = True
-                                        with auto_trade_lock:
-                                            auto_trade_state["last_entry_ts"] = entry_ts
+                                    if _pos_check_failed:
+                                        # v3.52.78: не открываем позицию вслепую,
+                                        # не зная реального состояния счёта —
+                                        # ждём следующий тик, где проверка,
+                                        # скорее всего, снова успешно пройдёт.
+                                        # last_entry_ts НЕ фиксируем в
+                                        # auto_trade_state (только локальная
+                                        # переменная выше уже продвинута) —
+                                        # откатываем её, чтобы следующий цикл
+                                        # заново увидел этот же сигнал как новый
+                                        # и повторил попытку, а не пропустил его
+                                        # навсегда.
+                                        olog(f"⏸ Вход по сигналу {direction.upper()} отложен — "
+                                             f"не удалось проверить состояние биржи")
+                                        last_entry_ts = None
                                     else:
-                                        _wf_passed, _wf_detail = _wf_result
-                                        if _wf_detail:
-                                            olog(f"✅ Walk-forward: {_wf_detail}"
-                                                 + ("" if _wf_passed else " (не проверено, торгуем дальше)"))
-                                        olog(f"🤖 Новый сигнал: {direction.upper()} "
-                                             f"entry={_fmt_px(entry_px)} sl={_fmt_px(sl_px)} tp={_fmt_px(tp_px)}")
-
-                                        # Закрываем старую позицию (если есть, и направление другое)
-                                        if existing:
-                                            olog(f"🔄 Закрываем старую позицию {existing['dir'].upper()} "
-                                                 f"перед открытием новой ({direction.upper()})")
-                                            _gate_close_position(sym)
-                                            time.sleep(1.0)
-
-                                        # Открываем новую
-                                        with auto_trade_lock:
-                                            pos_pct = auto_trade_state.get("position_pct", risk_pct)
-                                        pos_info = _gate_open_position(
-                                            sym, direction, entry_px, sl_px, tp_px, risk_pct,
-                                            position_pct=pos_pct)
-                                        with auto_trade_lock:
-                                            auto_trade_state["position"] = pos_info
-                                            auto_trade_state["last_entry_ts"] = entry_ts
-                                        # Пишем сигнал в chart чтобы он отобразился
-                                        # на вкладке График при следующем открытии
                                         with opt_lock:
-                                            opt_state["chart"] = {
-                                                "sym": sym, "tf": tf, "days": days,
-                                                "auto_trade_sig": {
-                                                    "dir": direction,
-                                                    "entry": entry_px,
-                                                    "sl": sl_px,
-                                                    "tp": tp_px,
-                                                    "ts": entry_ts,
-                                                }
-                                            }
+                                            cur_cycle = opt_state.get("cycle", 0)
+                                        if cur_cycle < MIN_CYCLES_BEFORE_TRADE:
+                                            olog(f"🚫 Сигнал {direction.upper()} отфильтрован — "
+                                                 f"оптимизатор прошёл только {cur_cycle}/"
+                                                 f"{MIN_CYCLES_BEFORE_TRADE} циклов на тренировочном "
+                                                 f"окне — рано, поиск ещё не сошёлся. Сигнал помечается "
+                                                 f"обработанным и НЕ откроет сделку, даже когда порог "
+                                                 f"будет пройден — только следующий новый сигнал.")
+                                            if not cycle_gate_alerted:
+                                                _send_alert(
+                                                    f"🚫 <b>{sym}</b> — сигнал {direction.upper()} "
+                                                    f"отфильтрован: оптимизатор прошёл только "
+                                                    f"{cur_cycle}/{MIN_CYCLES_BEFORE_TRADE} циклов. "
+                                                    f"Авто-трейд начнёт открывать сделки только по "
+                                                    f"сигналам, которые появятся ПОСЛЕ достижения порога."
+                                                )
+                                                cycle_gate_alerted = True
+                                            # Помечаем сигнал как обработанный (как при обычном входе),
+                                            # чтобы он не "ждал" и не открылся задним числом, когда
+                                            # порог циклов будет пройден — это была бы сделка по
+                                            # параметрам, которые на момент сигнала ещё не были
+                                            # достаточно оптимизированы.
+                                            with auto_trade_lock:
+                                                auto_trade_state["last_entry_ts"] = entry_ts
+                                        elif (_wf_result := _wf_validate(sym, tf, p, risk_pct, train_days=days, train_offset=0))[0] is False:
+                                            # v3.52.22: настоящая OOS-проверка — params прогнаны через
+                                            # _simulate на окне, которое оптимизатор НЕ видел во время
+                                            # поиска. None (мало OOS-данных/ошибка фетча) не блокирует —
+                                            # это проблема данных, а не качества стратегии; блокирует
+                                            # только явный False (PF<1 на незнакомых данных).
+                                            # v3.52.43: вызываем ОДИН раз, результат сохраняем —
+                                            # раньше было 3 вызова: каждый делал отдельный HTTP-запрос
+                                            # за свечами, при нестабильной сети второй/третий мог
+                                            # вернуть None вместо False и пропустить сигнал-мусор.
+                                            _wf_passed, _wf_detail = _wf_result
+                                            olog(f"🚫 Сигнал {direction.upper()} отфильтрован — "
+                                                 f"провалена walk-forward проверка на OOS-окне: "
+                                                 f"{_wf_detail}. Сделка не открыта, ждём следующий сигнал.")
+                                            if not wf_gate_alerted:
+                                                _send_alert(
+                                                    f"🚫 <b>{sym}</b> — сигнал {direction.upper()} "
+                                                    f"отфильтрован walk-forward'ом: {_wf_detail}. "
+                                                    f"Текущие params не подтвердились на данных, которые "
+                                                    f"оптимизатор не видел — торговать ими рискованно."
+                                                )
+                                                wf_gate_alerted = True
+                                            with auto_trade_lock:
+                                                auto_trade_state["last_entry_ts"] = entry_ts
+                                        else:
+                                            _wf_passed, _wf_detail = _wf_result
+                                            if _wf_detail:
+                                                olog(f"✅ Walk-forward: {_wf_detail}"
+                                                     + ("" if _wf_passed else " (не проверено, торгуем дальше)"))
+                                            olog(f"🤖 Новый сигнал: {direction.upper()} "
+                                                 f"entry={_fmt_px(entry_px)} sl={_fmt_px(sl_px)} tp={_fmt_px(tp_px)}")
+
+                                            # Закрываем старую позицию (если есть, и направление другое)
+                                            if existing:
+                                                olog(f"🔄 Закрываем старую позицию {existing['dir'].upper()} "
+                                                     f"перед открытием новой ({direction.upper()})")
+                                                _gate_close_position(sym)
+                                                time.sleep(1.0)
+
+                                            # Открываем новую
+                                            with auto_trade_lock:
+                                                pos_pct = auto_trade_state.get("position_pct", risk_pct)
+                                            pos_info = _gate_open_position(
+                                                sym, direction, entry_px, sl_px, tp_px, risk_pct,
+                                                position_pct=pos_pct)
+                                            if pos_info is not None:
+                                                with auto_trade_lock:
+                                                    auto_trade_state["position"] = pos_info
+                                                    auto_trade_state["last_entry_ts"] = entry_ts
+                                                # Пишем сигнал в chart чтобы он отобразился
+                                                # на вкладке График при следующем открытии
+                                                with opt_lock:
+                                                    opt_state["chart"] = {
+                                                        "sym": sym, "tf": tf, "days": days,
+                                                        "auto_trade_sig": {
+                                                            "dir": direction,
+                                                            "entry": entry_px,
+                                                            "sl": sl_px,
+                                                            "tp": tp_px,
+                                                            "ts": entry_ts,
+                                                        }
+                                                    }
+                                            else:
+                                                # v3.52.78: раньше last_entry_ts фиксировался
+                                                # В ЛЮБОМ случае, даже когда _gate_open_position
+                                                # вернул None (баланс/сеть/API-ошибка — см. её
+                                                # except-блок). Реальная сделка НЕ открывалась, но
+                                                # сигнал навсегда помечался "обработанным" — бот
+                                                # больше никогда не пытался войти по этому сигналу,
+                                                # даже когда причина сбоя (например временная
+                                                # сетевая ошибка) давно исчезла. Теперь при неудаче
+                                                # last_entry_ts НЕ коммитится в auto_trade_state —
+                                                # следующий тик увидит тот же сигнал как новый и
+                                                # повторит попытку открытия.
+                                                olog(f"⚠ Открытие позиции не удалось — сигнал "
+                                                     f"{direction.upper()} НЕ помечен обработанным, "
+                                                     f"попробуем снова на следующем тике")
+                                                last_entry_ts = None
                         else:
                             # Тот же сигнал — проверяем не закрылась ли позиция по TP/SL
                             with auto_trade_lock:
