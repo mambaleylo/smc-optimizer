@@ -1,5 +1,34 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.79
+- v3.52.79: Серия из 7 улучшений устойчивости конфигов против переобучения.
+  1) _wf_validate теперь проверяет НЕСКОЛЬКО непересекающихся OOS-окон
+     (WF_N_WINDOWS=3) вместо одного, требует строгое большинство прошедших —
+     единичная удача/неудача на одном срезе больше не решает всё.
+  2) _flatness_score: перед синком нового best в живой авто-трейд сверяем
+     fitness нескольких соседних по параметрам конфигов со найденным пиком —
+     острый одиночный пик (соседи резко хуже) блокирует автосинк, плоское
+     плато — пропускает. fail-open при невозможности посчитать.
+  3) Штраф за сложность конфига в fitness: каждый активный булевый фильтр
+     (tl/st/vol_filter, choch_only, require_fvg_confirm) сверх одного режет
+     fitness на 3% (максимум -15%) — подталкивает поиск к более простым,
+     обобщаемым решениям при прочих равных.
+  4) Дефляция порога OOS-прохождения в _wf_validate пропорционально
+     log10(число проверенных конфигов за прогон) — грубая поправка на
+     data snooping: чем больше конфигов перебрано, тем выше планка
+     подтверждения нужна перед реальным входом.
+  5) Живой мониторинг деградации: раз в 4 часа боевой конфиг авто-трейда
+     форсированно перепроверяется на свежем OOS-окне; при провале — алерт
+     (без автоостановки торговли) вместо узнавания постфактум по слитым
+     сделкам.
+  6) _fee_stress_check: конфиг прогоняется дополнительно с удвоенной
+     комиссией — если PF при этом падает ниже 1.0, синк в авто-трейд
+     блокируется как хрупкий к издержкам/проскальзыванию.
+  7) _ensemble_agree: перед реальным входом сверяем направление сигнала
+     ещё с до 3 других конфигов из top20 (не идентичных текущему) — при
+     явном несогласии большинства вход блокируется, чтобы не зависеть от
+     единственной, возможно случайной, точки поиска.
+  Бэкап перед этой серией: smc_screener.py.backup_20260704_193634_pre_stability_upgrade.
 SMC Optimizer v3.52.78
 - v3.52.78: Аудит системы авто-торговли на баги, три находки:
   1) КРИТИЧНО: маркет-ордер входа отправлялся через обычный _gate_req() с
@@ -1561,7 +1590,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.78"
+APP_VERSION  = "3.52.79"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -2331,52 +2360,80 @@ def _bootstrap_ci(trades, n_resamples=1000, ci=0.80):
 # "повезло на этом конкретном наборе сделок".
 _wf_cache = {"key": None, "passed": None, "detail": ""}
 
-def _wf_validate(sym, tf, params, risk_pct, train_days, train_offset=0):
-    """Возвращает (passed, detail). passed: True/False — проверка прошла/не
-    прошла, None — не удалось проверить (мало OOS-данных/ошибка фетча, в
-    этом случае сделку лучше не блокировать навсегда — fail-open с пометкой
-    в логе, а не fail-closed по причине нехватки истории).
+# v3.52.79: множественные непересекающиеся OOS-окна вместо одного. Один
+# срез мог случайно оказаться удачным/неудачным независимо от реального
+# качества стратегии — тот же класс проблемы, что уже решён для автотюнинга
+# весов эквалайзера через n_windows (см. _run_weight_tune). Здесь применяем
+# ту же идею к самому геиту перед реальным входом в сделку: WF_N_WINDOWS
+# окон подряд, уходящих в прошлое от тренировочного, требуем строгое
+# большинство прошедших (а не единственный бросок кости).
+WF_N_WINDOWS = 3
 
-    v3.52.49: train_days/train_offset раньше читались из глобального
-    opt_state["days"]/["offset_days"] — полей формы ОДИНОЧНОГО оптимизатора
-    (вкладка "Оптимизатор"), которые перезаписываются при каждом запуске
-    /scan под ЛЮБОЙ символ. Если пока авто-трейд торгует символ A, на
-    вкладке "Оптимизатор" запускался прогон для другого символа B — OOS-окно
-    проверки сигналов символа A тихо начинало считаться по days/offset
-    символа B. Теперь окно передаётся явно вызывающим кодом (auto-trade
-    использует собственное auto_trade_state["days"], независимо от того,
-    что сейчас происходит в форме одиночного оптимизатора)."""
+def _wf_validate(sym, tf, params, risk_pct, train_days, train_offset=0,
+                  n_windows=WF_N_WINDOWS, n_trials=None):
+    """Возвращает (passed, detail). passed: True/False — проверка прошла/не
+    прошла, None — не удалось проверить ни на одном окне (мало OOS-данных/
+    ошибка фетча везде — fail-open, не блокируем сделку навсегда по причине
+    нехватки истории).
+
+    v3.52.79: раньше проверялось ОДНО окно сразу перед тренировочным.
+    Теперь берём n_windows непересекающихся окон подряд, уходящих дальше в
+    прошлое (train_offset + train_days*1, *2, *3, ...), и проходим каждое
+    через тот же bootstrap-CI критерий (см. _bootstrap_ci). passed = True
+    только если решаемых (не-None) окон большинство прошло — единичная
+    удача/неудача на одном окне больше не решает всё.
+
+    n_trials (v3.52.79, дефляция): за один прогон Basin Hopping проверяет
+    тысячи конфигов — чем больше попыток, тем выше шанс найти конфиг,
+    который просто случайно хорошо лёг на конкретное окно, без всякой
+    реальной закономерности (data snooping/множественное сравнение). Грубая
+    поправка по духу deflated Sharpe ratio: требуемый порог PF нижней
+    границы бутстрап-ДИ растёт с log10(n_trials) вместо фиксированного 1.0 —
+    чем больше конфигов перебрано перед тем как найден этот, тем выше планка
+    подтверждения на OOS. n_trials=None (не передан) — планка остаётся 1.0,
+    как раньше (обратная совместимость для прочих вызывающих)."""
     global _wf_cache
+    _req_pf_lo = 1.0
+    if n_trials is not None and n_trials > 10:
+        _req_pf_lo = 1.0 + min(0.15, 0.02 * math.log10(max(10, n_trials)))
     key = (sym, tf, tuple(sorted((k, str(v)) for k, v in params.items())),
-           train_days, train_offset)
+           train_days, train_offset, n_windows, round(_req_pf_lo, 4))
     if _wf_cache["key"] == key:
         return _wf_cache["passed"], _wf_cache["detail"]
-    oos_offset = train_offset + train_days
-    try:
-        oos_candles = _fetch_candles(sym, tf, train_days, offset_days=oos_offset)
-    except Exception as e:
-        detail = f"OOS-фетч не удался: {e}"
+
+    per_window = []  # (True/False/None, detail_str)
+    for w in range(n_windows):
+        oos_offset = train_offset + train_days * (w + 1)
+        try:
+            oos_candles = _fetch_candles(sym, tf, train_days, offset_days=oos_offset)
+        except Exception as e:
+            per_window.append((None, f"окно{w+1}[-{oos_offset}дн]: фетч не удался ({e})"))
+            continue
+        if not oos_candles or len(oos_candles) < 100:
+            per_window.append((None, f"окно{w+1}[-{oos_offset}дн]: мало данных"))
+            continue
+        oos_result = _simulate(oos_candles, params, risk_pct=risk_pct, return_trades=True)
+        if not oos_result:
+            per_window.append((None, f"окно{w+1}[-{oos_offset}дн]: <5 сделок"))
+            continue
+        boot = _bootstrap_ci(oos_result["trades_raw"])
+        if boot is None:
+            per_window.append((None, f"окно{w+1}[-{oos_offset}дн]: бутстрап неинформативен"))
+            continue
+        ok = boot["pf_lo"] >= _req_pf_lo
+        per_window.append((ok, f"окно{w+1}[-{oos_offset}дн]: PF={oos_result['profit_factor']} "
+                               f"(ДИ {boot['pf_lo']}-{boot['pf_hi']}, порог≥{_req_pf_lo:.3f}) "
+                               f"WR={oos_result['winrate']}% T={oos_result['trades']}"))
+
+    decisive = [r for r in per_window if r[0] is not None]
+    if not decisive:
+        detail = " | ".join(r[1] for r in per_window)
         _wf_cache = {"key": key, "passed": None, "detail": detail}
         return None, detail
-    if not oos_candles or len(oos_candles) < 100:
-        detail = "недостаточно OOS-данных (символ молодой / короткая история)"
-        _wf_cache = {"key": key, "passed": None, "detail": detail}
-        return None, detail
-    oos_result = _simulate(oos_candles, params, risk_pct=risk_pct, return_trades=True)
-    if not oos_result:
-        detail = "на OOS-окне <5 сделок — недостаточно для оценки"
-        _wf_cache = {"key": key, "passed": None, "detail": detail}
-        return None, detail
-    boot = _bootstrap_ci(oos_result["trades_raw"])
-    if boot is None:
-        detail = "на OOS-окне <5 сделок — бутстрап не информативен"
-        _wf_cache = {"key": key, "passed": None, "detail": detail}
-        return None, detail
-    passed = boot["pf_lo"] >= 1.0
-    detail = (f"OOS[{train_days}д, смещ.-{oos_offset}дн]: "
-              f"PF={oos_result['profit_factor']} (бутстрап {int(boot['ci']*100)}% ДИ: "
-              f"{boot['pf_lo']}-{boot['pf_hi']}) WR={oos_result['winrate']}% "
-              f"trades={oos_result['trades']}")
+    n_passed = sum(1 for r in decisive if r[0])
+    passed = n_passed * 2 > len(decisive)  # строгое большинство решаемых окон
+    detail = (f"{n_passed}/{len(decisive)} OOS-окон прошли — "
+              + " | ".join(r[1] for r in per_window))
     _wf_cache = {"key": key, "passed": passed, "detail": detail}
     return passed, detail
 
@@ -2524,6 +2581,22 @@ def _auto_trade_loop():
     MIN_CYCLES_BEFORE_TRADE = 150
     cycle_gate_alerted = False  # чтобы не спамить алертом каждую свечу
     wf_gate_alerted    = False  # отдельный алерт-флаг для провала OOS walk-forward (п.2)
+    ensemble_gate_alerted = False  # v3.52.79: алерт-флаг для провала ансамблевой сверки
+
+    # v3.52.79: живой мониторинг деградации уже торгующего конфига. Раньше
+    # _wf_validate проверял params только ОДИН РАЗ — в момент входа в
+    # конкретную сделку. Дальше ничего не следило, не "протух" ли боевой
+    # конфиг за неделю работы (рынок сменил режим) — это узнавалось только
+    # постфактум, по слитым сделкам. Раз в DEGRADE_CHECK_INTERVAL_SEC
+    # перепрогоняем walk-forward на СВЕЖЕМ окне (форсируя пересчёт мимо
+    # _wf_cache — иначе кэш по params никогда не увидел бы, что календарное
+    # время и данные изменились) для текущих params и шлём алерт, если
+    # свежий OOS-результат уже не проходит — не блокирует торговлю
+    # автоматически (чтобы не быть более резким, чем сам вход по сигналу),
+    # только предупреждает раньше, чем это станет видно по факту слитых сделок.
+    DEGRADE_CHECK_INTERVAL_SEC = 4 * 3600
+    _last_degrade_check = time.time()
+    _degrade_alerted    = False
 
     while not _auto_trade_stop.is_set():
         try:
@@ -2545,7 +2618,42 @@ def _auto_trade_loop():
                          f"swing={new_p.get('swing_len')} SL={new_p.get('sl_pct')}% TP={new_p.get('tp_pct')}%")
                     p = new_p
                     wf_gate_alerted = False  # новые params — провал старых не должен душить алерт новых
+                    ensemble_gate_alerted = False
             candles = _fetch_candles(sym, tf, days)
+
+            # v3.52.79: живой мониторинг деградации — раз в
+            # DEGRADE_CHECK_INTERVAL_SEC форсируем свежий walk-forward на
+            # текущих боевых params (мимо _wf_cache, который иначе отдал бы
+            # старый ответ на те же params) и предупреждаем, если конфиг уже
+            # не проходит OOS-проверку на свежих данных, не дожидаясь, пока
+            # это станет видно по факту слитых сделок.
+            if time.time() - _last_degrade_check >= DEGRADE_CHECK_INTERVAL_SEC:
+                _last_degrade_check = time.time()
+                try:
+                    global _wf_cache
+                    _wf_cache = {"key": None, "passed": None, "detail": ""}  # форс пересчёта
+                    _deg_passed, _deg_detail = _wf_validate(
+                        sym, tf, p, risk_pct, train_days=days, train_offset=0,
+                        n_trials=opt_state.get("trials", 0))
+                    if _deg_passed is False:
+                        if not _degrade_alerted:
+                            olog(f"⚠ Мониторинг деградации: боевой конфиг {sym} {tf} "
+                                 f"больше не проходит свежую OOS-проверку: {_deg_detail}")
+                            _send_alert(
+                                f"⚠️ <b>{sym} {tf}</b> — мониторинг деградации\n"
+                                f"Текущий торгующий конфиг перестал подтверждаться на "
+                                f"свежих данных: {_deg_detail}\n"
+                                f"Авто-трейд продолжает работать (не останавливается "
+                                f"автоматически) — стоит проверить/переобучить вручную."
+                            )
+                            _degrade_alerted = True
+                    elif _deg_passed is True:
+                        olog(f"✓ Мониторинг деградации: боевой конфиг {sym} {tf} "
+                             f"всё ещё подтверждается: {_deg_detail}")
+                        _degrade_alerted = False
+                except Exception as _dege:
+                    olog(f"⚠ Мониторинг деградации: ошибка проверки ({_dege})")
+
             if candles and len(candles) > 50:
                 result = _simulate(candles, p, sl_pct=p.get("sl_pct"),
                                    tp_pct=p.get("tp_pct"), _collect=True)
@@ -2890,7 +2998,8 @@ def _auto_trade_loop():
                                             # достаточно оптимизированы.
                                             with auto_trade_lock:
                                                 auto_trade_state["last_entry_ts"] = entry_ts
-                                        elif (_wf_result := _wf_validate(sym, tf, p, risk_pct, train_days=days, train_offset=0))[0] is False:
+                                        elif (_wf_result := _wf_validate(sym, tf, p, risk_pct, train_days=days, train_offset=0,
+                                                                          n_trials=opt_state.get("trials", 0)))[0] is False:
                                             # v3.52.22: настоящая OOS-проверка — params прогнаны через
                                             # _simulate на окне, которое оптимизатор НЕ видел во время
                                             # поиска. None (мало OOS-данных/ошибка фетча) не блокирует —
@@ -2919,55 +3028,91 @@ def _auto_trade_loop():
                                             if _wf_detail:
                                                 olog(f"✅ Walk-forward: {_wf_detail}"
                                                      + ("" if _wf_passed else " (не проверено, торгуем дальше)"))
-                                            olog(f"🤖 Новый сигнал: {direction.upper()} "
-                                                 f"entry={_fmt_px(entry_px)} sl={_fmt_px(sl_px)} tp={_fmt_px(tp_px)}")
 
-                                            # Закрываем старую позицию (если есть, и направление другое)
-                                            if existing:
-                                                olog(f"🔄 Закрываем старую позицию {existing['dir'].upper()} "
-                                                     f"перед открытием новой ({direction.upper()})")
-                                                _gate_close_position(sym)
-                                                time.sleep(1.0)
+                                            # v3.52.79: ансамблевая сверка — прежде чем реально
+                                            # войти в рынок по top-1 конфигу, спрашиваем ещё до
+                                            # 3 других конфигов из top20 (не идентичных текущему),
+                                            # согласны ли они с направлением. Строгое меньшинство
+                                            # (agree*2 <= checked, т.е. согласных не больше половины
+                                            # при наличии хоть одного несогласного) — сигнал слишком
+                                            # завязан на единственную точку поиска, пропускаем вход.
+                                            # checked==0 (в top20 нет других непохожих конфигов) —
+                                            # fail-open, не блокируем.
+                                            with opt_lock:
+                                                _top20_snap = list(opt_state.get("top20") or [])
+                                            _ens_agree, _ens_checked, _ens_detail = _ensemble_agree(
+                                                candles, p, direction, risk_pct, _top20_snap)
+                                            _ensemble_ok = _ens_checked == 0 or _ens_agree * 2 > _ens_checked
 
-                                            # Открываем новую
-                                            with auto_trade_lock:
-                                                pos_pct = auto_trade_state.get("position_pct", risk_pct)
-                                            pos_info = _gate_open_position(
-                                                sym, direction, entry_px, sl_px, tp_px, risk_pct,
-                                                position_pct=pos_pct)
-                                            if pos_info is not None:
+                                            if not _ensemble_ok:
+                                                olog(f"🚫 Сигнал {direction.upper()} отфильтрован — "
+                                                     f"ансамблевая сверка топ20 не согласна: {_ens_detail}. "
+                                                     f"Сделка не открыта, ждём следующий сигнал.")
+                                                if not ensemble_gate_alerted:
+                                                    _send_alert(
+                                                        f"🚫 <b>{sym}</b> — сигнал {direction.upper()} "
+                                                        f"отфильтрован ансамблем: {_ens_detail}. Слишком "
+                                                        f"похоже на сигнал одного случайного конфига."
+                                                    )
+                                                    ensemble_gate_alerted = True
                                                 with auto_trade_lock:
-                                                    auto_trade_state["position"] = pos_info
                                                     auto_trade_state["last_entry_ts"] = entry_ts
-                                                # Пишем сигнал в chart чтобы он отобразился
-                                                # на вкладке График при следующем открытии
-                                                with opt_lock:
-                                                    opt_state["chart"] = {
-                                                        "sym": sym, "tf": tf, "days": days,
-                                                        "auto_trade_sig": {
-                                                            "dir": direction,
-                                                            "entry": entry_px,
-                                                            "sl": sl_px,
-                                                            "tp": tp_px,
-                                                            "ts": entry_ts,
-                                                        }
-                                                    }
+                                                candles_for_open_skip = True
                                             else:
-                                                # v3.52.78: раньше last_entry_ts фиксировался
-                                                # В ЛЮБОМ случае, даже когда _gate_open_position
-                                                # вернул None (баланс/сеть/API-ошибка — см. её
-                                                # except-блок). Реальная сделка НЕ открывалась, но
-                                                # сигнал навсегда помечался "обработанным" — бот
-                                                # больше никогда не пытался войти по этому сигналу,
-                                                # даже когда причина сбоя (например временная
-                                                # сетевая ошибка) давно исчезла. Теперь при неудаче
-                                                # last_entry_ts НЕ коммитится в auto_trade_state —
-                                                # следующий тик увидит тот же сигнал как новый и
-                                                # повторит попытку открытия.
-                                                olog(f"⚠ Открытие позиции не удалось — сигнал "
-                                                     f"{direction.upper()} НЕ помечен обработанным, "
-                                                     f"попробуем снова на следующем тике")
-                                                last_entry_ts = None
+                                                if _ens_checked:
+                                                    olog(f"✅ Ансамбль: {_ens_detail}")
+                                                candles_for_open_skip = False
+
+                                            if not candles_for_open_skip:
+                                                olog(f"🤖 Новый сигнал: {direction.upper()} "
+                                                     f"entry={_fmt_px(entry_px)} sl={_fmt_px(sl_px)} tp={_fmt_px(tp_px)}")
+
+                                                # Закрываем старую позицию (если есть, и направление другое)
+                                                if existing:
+                                                    olog(f"🔄 Закрываем старую позицию {existing['dir'].upper()} "
+                                                         f"перед открытием новой ({direction.upper()})")
+                                                    _gate_close_position(sym)
+                                                    time.sleep(1.0)
+
+                                                # Открываем новую
+                                                with auto_trade_lock:
+                                                    pos_pct = auto_trade_state.get("position_pct", risk_pct)
+                                                pos_info = _gate_open_position(
+                                                    sym, direction, entry_px, sl_px, tp_px, risk_pct,
+                                                    position_pct=pos_pct)
+                                                if pos_info is not None:
+                                                    with auto_trade_lock:
+                                                        auto_trade_state["position"] = pos_info
+                                                        auto_trade_state["last_entry_ts"] = entry_ts
+                                                    # Пишем сигнал в chart чтобы он отобразился
+                                                    # на вкладке График при следующем открытии
+                                                    with opt_lock:
+                                                        opt_state["chart"] = {
+                                                            "sym": sym, "tf": tf, "days": days,
+                                                            "auto_trade_sig": {
+                                                                "dir": direction,
+                                                                "entry": entry_px,
+                                                                "sl": sl_px,
+                                                                "tp": tp_px,
+                                                                "ts": entry_ts,
+                                                            }
+                                                        }
+                                                else:
+                                                    # v3.52.78: раньше last_entry_ts фиксировался
+                                                    # В ЛЮБОМ случае, даже когда _gate_open_position
+                                                    # вернул None (баланс/сеть/API-ошибка — см. её
+                                                    # except-блок). Реальная сделка НЕ открывалась, но
+                                                    # сигнал навсегда помечался "обработанным" — бот
+                                                    # больше никогда не пытался войти по этому сигналу,
+                                                    # даже когда причина сбоя (например временная
+                                                    # сетевая ошибка) давно исчезла. Теперь при неудаче
+                                                    # last_entry_ts НЕ коммитится в auto_trade_state —
+                                                    # следующий тик увидит тот же сигнал как новый и
+                                                    # повторит попытку открытия.
+                                                    olog(f"⚠ Открытие позиции не удалось — сигнал "
+                                                         f"{direction.upper()} НЕ помечен обработанным, "
+                                                         f"попробуем снова на следующем тике")
+                                                    last_entry_ts = None
                         else:
                             # Тот же сигнал — проверяем не закрылась ли позиция по TP/SL
                             with auto_trade_lock:
@@ -3309,10 +3454,14 @@ def _pivot_low(candles, length):
 # ─── SMC симуляция ──────────────────────────────────────────────────────────
 def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
               init_deposit=1000.0, _collect=False, fitness_weights=None,
-              return_trades=False):
+              return_trades=False, fee_pct_override=None):
     """
     Симуляция SMC стратегии по параметрам p.
     Возвращает dict с метриками или None если мало данных.
+    fee_pct_override (v3.52.79): подставить другую комиссию вместо
+    ROUNDTRIP_FEE_PCT — используется стресс-тестом устойчивости к комиссии/
+    проскальзыванию (_fee_stress_check), который прогоняет тот же конфиг с
+    завышенной комиссией и смотрит, насколько сильно проседает результат.
     """
     if sl_pct is None: sl_pct = p["sl_pct"]
     if tp_pct is None: tp_pct = p["tp_pct"]
@@ -3322,8 +3471,9 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
     # leverage=round(risk_pct/sl_pct), notional=margin*leverage. Раньше
     # fitness/pnl вообще не знал о комиссии — оптимизатор спокойно выбирал
     # tight SL/TP (0.3-0.5%), где round-trip комиссия съедает 20-30% движения.
+    _fee_pct  = ROUNDTRIP_FEE_PCT if fee_pct_override is None else fee_pct_override
     _fee_lev  = max(1, round(risk_pct / sl_pct)) if sl_pct > 0 else 1
-    _fee_mult = (risk_pct / 100.0) * _fee_lev * (ROUNDTRIP_FEE_PCT / 100.0)
+    _fee_mult = (risk_pct / 100.0) * _fee_lev * (_fee_pct / 100.0)
 
     swing_len     = int(p["swing_len"])
     internal_len  = int(p.get("internal_len", 5))
@@ -3772,6 +3922,26 @@ def _simulate(candles, p, sl_pct=None, tp_pct=None, risk_pct=10.0,
         fw.get("dd",     1.0) * math.log(max(1 + max_dd, _eps))
     )
     fitness = math.exp(log_fit)
+    # v3.52.79: штраф за сложность конфига. Каждый включённый булевый фильтр
+    # (tl_filter/st_filter/vol_filter/choch_only/require_fvg_confirm) — лишняя
+    # степень свободы для подгонки под конкретное окно свечей. При РАВНОМ
+    # fitness конфиг с 4-5 одновременно включёнными фильтрами почти всегда
+    # более переобучен под шум конкретных данных, чем конфиг с 1-2 — но без
+    # явного штрафа Basin Hopping об этом никак не узнаёт и с одинаковой
+    # готовностью выбирает оба. Небольшой мультипликативный штраф (3% за
+    # каждый активный фильтр сверху одного, максимум -15%) подталкивает
+    # поиск к более простым и обобщаемым решениям при прочих равных, не
+    # запрещая сложные конфиги совсем — если сложный конфиг действительно
+    # намного лучше, штраф в 3-15% он всё равно перевесит с запасом.
+    _n_active_filters = sum([
+        bool(p.get("tl_filter", False)),
+        bool(p.get("st_filter", False)),
+        bool(p.get("vol_filter", False)),
+        bool(p.get("choch_only", False)),
+        bool(p.get("require_fvg_confirm", False)),
+    ])
+    _complexity_penalty = max(0.85, 1.0 - 0.03 * max(0, _n_active_filters - 1))
+    fitness *= _complexity_penalty
     result["fitness"] = round(fitness, 6)
     result["rr"] = round(tp_pct / sl_pct if sl_pct > 0 else 1.0, 2)
 
@@ -3897,7 +4067,98 @@ def _neighbour(p, temp=0.1):
             q[k] = vals[(vals.index(p[k]) + 1) % len(vals)]
     return q
 
-def _crossover(p1, p2):
+# v3.52.79: проверка "плоскости" найденного оптимума. Basin Hopping находит
+# точечный максимум fitness на конкретном окне свечей — острый локальный пик
+# (fitness резко падает от малейшего изменения параметра) почти всегда
+# означает, что стратегия подогналась под шум конкретных баров, а не нашла
+# настоящую закономерность. Плоское плато вокруг найденной точки — признак
+# устойчивого паттерна, который не развалится от одной новой свечи. Берём
+# несколько соседей с небольшим шагом (низкий temp — точечная подстройка,
+# как при "холодном" _neighbour) и сравниваем средний fitness соседей с
+# fitness самой найденной точки.
+def _flatness_score(candles, params, risk_pct, peak_fitness, fitness_weights=None, n_neighbours=6):
+    """Возвращает (score, detail) — score = среднийFitness(соседи) / peak_fitness,
+    в диапазоне (0, 1+]. Ближе к 1.0 — оптимум плоский/устойчивый, заметно
+    ниже 1.0 — острый пик, вероятно переобучение. None если peak_fitness<=0
+    или не удалось посчитать ни одного соседа (не блокируем в этом случае —
+    fail-open, как и остальные диагностические геиты в этом файле)."""
+    if not peak_fitness or peak_fitness <= 0:
+        return None, "peak fitness<=0, пропуск"
+    fits = []
+    for _ in range(n_neighbours):
+        nb_p = _neighbour(params, temp=0.08)  # холодная точечная мутация, 1 параметр
+        nb_r = _simulate(candles, nb_p, risk_pct=risk_pct, fitness_weights=fitness_weights)
+        if nb_r:
+            fits.append(nb_r["fitness"])
+    if not fits:
+        return None, "не удалось посчитать соседей"
+    avg_neighbour_fit = sum(fits) / len(fits)
+    score = avg_neighbour_fit / peak_fitness
+    detail = f"flatness={score:.3f} ({len(fits)} соседей, средний fit={avg_neighbour_fit:.4f} vs пик={peak_fitness:.4f})"
+    return score, detail
+
+# v3.52.79: стресс-тест устойчивости к комиссии/проскальзыванию. _simulate
+# честно считает комиссию (v3.52.22), но не проверяет ЧУВСТВИТЕЛЬНОСТЬ к
+# ней — конфиг, который держится на плаву при текущей комиссии, но
+# разваливается при +100% (реалистичный сценарий проскальзывания на
+# волатильном рынке или смены тарифа биржи), хрупкий и рискованный. Гоняем
+# тот же конфиг дважды: с обычной и с удвоенной комиссией.
+def _fee_stress_check(candles, params, risk_pct, fitness_weights=None, fee_multiplier=2.0):
+    """Возвращает (ok, detail). ok=True если PF при удвоенной комиссии
+    остаётся >= 1.0 (сделка в среднем всё ещё не убыточна даже при худшем
+    сценарии издержек), False если проваливается, None если не удалось
+    посчитать (fail-open)."""
+    normal = _simulate(candles, params, risk_pct=risk_pct, fitness_weights=fitness_weights)
+    if not normal:
+        return None, "нет базового результата для сравнения"
+    stressed = _simulate(candles, params, risk_pct=risk_pct, fitness_weights=fitness_weights,
+                          fee_pct_override=ROUNDTRIP_FEE_PCT * fee_multiplier)
+    if not stressed:
+        return None, "не удалось посчитать со стресс-комиссией"
+    ok = stressed["profit_factor"] >= 1.0
+    detail = (f"комиссия×{fee_multiplier:.0f}: PF {normal['profit_factor']}→{stressed['profit_factor']}, "
+              f"Return {normal['total_return']}%→{stressed['total_return']}%")
+    return ok, detail
+
+# v3.52.79: ансамблевая сверка перед реальным входом. Торговля строго по
+# top-1 означает, что вся ставка держится на одном конкретном конфиге —
+# если это именно тот случайный переобученный пик, который отвалится
+# завтра, узнаём об этом только по слитым сделкам. Берём ещё несколько
+# конфигов из top20 (не идентичных текущему по параметрам) и проверяем,
+# совпадает ли их последний сигнал по направлению с тем, что торгует бот —
+# согласие большинства снижает зависимость от единственной точки поиска.
+def _ensemble_agree(candles, current_params, current_dir, risk_pct, top20,
+                     fitness_weights=None, top_k=3):
+    """Возвращает (agree, total_checked, detail). Сверяет current_dir с
+    направлением ПОСЛЕДНЕГО сигнала (открытого или закрытого) у до top_k
+    других конфигов из top20 (пропускает те, что params-идентичны текущему).
+    total_checked=0 (в top20 попросту нет других непохожих конфигов, например
+    только что стартовавший перебор) — не блокирует, вызывающий код должен
+    трактовать это как fail-open."""
+    checked = 0
+    agree   = 0
+    details = []
+    for entry in top20:
+        if checked >= top_k:
+            break
+        cand_p = entry.get("params")
+        if not cand_p or _params_equal(cand_p, current_params):
+            continue
+        r = _simulate(candles, cand_p, risk_pct=risk_pct, fitness_weights=fitness_weights, _collect=True)
+        if not r:
+            continue
+        sigs = r.get("signals") or []
+        if not sigs:
+            continue
+        cand_dir = sigs[-1]["dir"]
+        checked += 1
+        if cand_dir == current_dir:
+            agree += 1
+        details.append(f"{cand_dir}")
+    detail = f"{agree}/{checked} конфигов из топ20 согласны ({', '.join(details) if details else '—'})"
+    return agree, checked, detail
+
+
     """Блочный кросс-овер двух конфигов из top20. В отличие от попарного
     uniform crossover (каждый ключ независимо), здесь параметры разбиты на
     смысловые группы — группа целиком берётся от одного родителя. Это
@@ -5125,10 +5386,36 @@ def run_optimizer():
                                 _at_tf  = auto_trade_state["tf"]
                                 _at_syn = auto_trade_state.get("auto_sync")
                             if _at_on and _at_syn and _at_sym == sym and _at_tf == tf:
-                                with auto_trade_lock:
-                                    auto_trade_state["params"] = dict(nb_p)
-                                olog(f"🔁 Новый best отправлен в авто-трейд {sym} {tf} "
-                                     f"(swing={nb_p['swing_len']} SL={nb_p['sl_pct']}% TP={nb_p['tp_pct']}%)")
+                                # v3.52.79: перед тем как отдать живому авто-трейду
+                                # новый "лучший" конфиг, проверяем не острый ли это
+                                # одиночный пик (см. _flatness_score выше) — если
+                                # соседние по параметрам конфиги резко проседают по
+                                # fitness, это симптом подгонки под шум конкретного
+                                # окна, а не устойчивой закономерности. fail-open:
+                                # если проверка не смогла посчитаться (None) — не
+                                # блокируем, ведём себя как раньше.
+                                with fitness_w_lock:
+                                    _fw_flat = dict(FITNESS_WEIGHTS)
+                                _flat_score, _flat_detail = _flatness_score(
+                                    candles, nb_p, risk, nb_r["fitness"], fitness_weights=_fw_flat)
+                                _fee_ok, _fee_detail = _fee_stress_check(
+                                    candles, nb_p, risk, fitness_weights=_fw_flat)
+                                if _flat_score is not None and _flat_score < 0.55:
+                                    olog(f"⏸ Новый best НЕ отправлен в авто-трейд {sym} {tf} — "
+                                         f"похоже на острый переобученный пик ({_flat_detail}), "
+                                         f"живой конфиг оставлен прежним")
+                                elif _fee_ok is False:
+                                    olog(f"⏸ Новый best НЕ отправлен в авто-трейд {sym} {tf} — "
+                                         f"не проходит стресс-тест по комиссии ({_fee_detail}), "
+                                         f"живой конфиг оставлен прежним")
+                                else:
+                                    with auto_trade_lock:
+                                        auto_trade_state["params"] = dict(nb_p)
+                                    _flat_note = f" | {_flat_detail}" if _flat_score is not None else ""
+                                    _fee_note  = f" | {_fee_detail}" if _fee_ok is not None else ""
+                                    olog(f"🔁 Новый best отправлен в авто-трейд {sym} {tf} "
+                                         f"(swing={nb_p['swing_len']} SL={nb_p['sl_pct']}% TP={nb_p['tp_pct']}%)"
+                                         f"{_flat_note}{_fee_note}")
 
                     steps_done += batch_size
                     if eco_mode:
