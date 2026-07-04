@@ -1,5 +1,20 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.77
+- v3.52.77: Архитектурный фикс, а не заплатка. Раньше /chart_data и
+  _auto_trade_loop() были ДВУМЯ независимыми прогонами одного и того же
+  кода (_fetch_candles + _simulate) — при совпавших параметрах они обязаны
+  были давать одинаковый результат, но оставалась структурная возможность
+  разойтись (гонка по времени, будущий баг, третий похожий путь). Теперь
+  _auto_trade_loop() после каждого своего расчёта кэширует ПОЛНЫЙ результат
+  (свечи, сигналы, OB/FVG-зоны, метрики) в opt_state["auto_trade_live"].
+  /chart_data при запросе с ТЕМИ ЖЕ sym/tf/days/params, что сейчас реально
+  использует бот, не считает ничего сама — отдаёт напрямую этот кэш (см.
+  live_source:true в ответе). Это не "два одинаковых результата", это
+  буквально ОДИН результат на двоих — расхождению неоткуда взяться в
+  принципе, а не только "маловероятно". Кэш используется только пока
+  свежий (< 3 таймфрейма) — если бот встал/упал, /chart_data сама
+  пересчитывает как раньше (live_source:false), ничего не ломается.
 SMC Optimizer v3.52.76
 - v3.52.76: Убрал ручную кнопку "🔗 Синк с авто-трейдом" — вкладка "График"
   теперь САМА следует за живым конфигом авто-трейда (символ/tf/days/все
@@ -1524,7 +1539,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.76"
+APP_VERSION  = "3.52.77"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -1635,7 +1650,7 @@ opt_state  = {
     "sl_pct": 0.6, "tp_pct": 1.0, "risk_pct": 10.0,
     "offset_days": 0,
     "chart": None, "fetch_pct": 0, "logs_dropped": 0,
-    "eco_mode": False,
+    "eco_mode": False, "auto_trade_live": None,
 }
 _stop_flag = threading.Event()
 _opt_thread = None
@@ -2454,6 +2469,33 @@ def _auto_trade_loop():
                                    tp_pct=p.get("tp_pct"), _collect=True)
                 with auto_trade_lock:
                     auto_trade_state["last_check"] = time.time()
+
+                # v3.52.77: кэшируем ПОЛНЫЙ результат ровно этого прогона —
+                # те же свечи, те же сигналы/зоны/метрики, что видел бот
+                # ПРЯМО СЕЙЧАС принимая решение. /chart_data в LIVE-режиме
+                # (см. ниже) будет отдавать ЭТОТ объект напрямую, а не
+                # пересчитывать заново — тогда график и авто-трейд физически
+                # не смогут разойтись, потому что это буквально один и тот
+                # же расчёт, а не два одинаковых кода с шансом на дрейф.
+                if result:
+                    _slim = [{"t":c["t"],"o":c["open"],"h":c["high"],"l":c["low"],
+                              "c":c["close"],"v":c.get("vol",0)} for c in candles]
+                    with opt_lock:
+                        opt_state["auto_trade_live"] = {
+                            "sym": sym, "tf": tf, "days": days, "params": dict(p),
+                            "computed_at": time.time(),
+                            "candles": _slim,
+                            "signals": (result.get("signals") or [])[-200:],
+                            "bull_obs": (result.get("bull_obs") or [])[-50:],
+                            "bear_obs": (result.get("bear_obs") or [])[-50:],
+                            "fvg_bull": (result.get("fvg_bull") or [])[-50:],
+                            "fvg_bear": (result.get("fvg_bear") or [])[-50:],
+                            "tl_upper": result.get("tl_upper", []), "tl_lower": result.get("tl_lower", []),
+                            "tl_upos": result.get("tl_upos", []), "tl_dnos": result.get("tl_dnos", []),
+                            "metrics": {k: float(result[k]) for k in
+                                        ("trades","winrate","profit_factor","max_dd","total_return","fitness","rr")
+                                        if k in result},
+                        }
 
                 if result:
                     sigs = result.get("signals") or []
@@ -7646,9 +7688,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
             days = int(float(qf("days", 7)))
             sl_p = float(qf("sl",  0.8))
             tp_p = float(qf("tp",  1.6))
-            candles = _fetch_candles(sym, tf, days)
-            if not candles:
-                self._json({"error": "no data"}); return
             p = {"swing_len": int(float(qf("swing", 10))),
                  "internal_len": int(float(qf("internal_len", 5))),
                  "ob_filter": qf("ob_filter", "atr"),
@@ -7668,6 +7707,65 @@ class Handler(http.server.BaseHTTPRequestHandler):
                  "st_period": int(float(qf("st_period", 10))),
                  "st_mult": float(qf("st_mult", 3.0)),
                  "sl_pct": sl_p, "tp_pct": tp_p}
+
+            # v3.52.77: раньше /chart_data ВСЕГДА гоняла свой собственный
+            # _fetch_candles()+_simulate() — даже когда запрошенный конфиг
+            # 1-в-1 совпадал с тем, чем прямо сейчас торгует _auto_trade_loop().
+            # Два независимых вычисления одного и того же — это и была
+            # структурная причина, по которой они вообще могли разойтись
+            # (см. v3.52.75/76). Если это тот же sym/tf/days/params — просто
+            # отдаём объект, который auto_trade_loop уже посчитал и закэшировал
+            # (opt_state.auto_trade_live) в этом же цикле, вместо пересчёта.
+            # Тогда график и авто-трейд физически не два разных прогона, а
+            # ОДИН и тот же результат — расхождению неоткуда взяться. Кэш
+            # используется только пока свежий (< 3 таймфрейма) — если бот
+            # завис/упал, просто считаем сами как раньше.
+            def _p_matches_live(live_p, chart_p, tol=1e-6):
+                # auto_trade_state["params"] строится из PARAM_SPACE и НЕ
+                # содержит internal_len/ob_filter/use_internal — это
+                # зарезервированные на будущее поля _simulate, они всегда
+                # берутся по дефолту с обеих сторон одинаково (_params_equal
+                # с его строгим сравнением set(keys()) тут не подходит —
+                # ключей заведомо разное число). Сверяем только ключи,
+                # которые реально есть в живых параметрах бота.
+                for k, lv in live_p.items():
+                    cv = chart_p.get(k)
+                    if isinstance(lv, float) or isinstance(cv, float):
+                        try:
+                            if abs(float(lv) - float(cv)) > tol: return False
+                        except (TypeError, ValueError):
+                            return False
+                    elif lv != cv:
+                        return False
+                return True
+            live = None
+            with opt_lock:
+                _live = opt_state.get("auto_trade_live")
+            if (_live and _live.get("sym") == sym and _live.get("tf") == tf
+                    and _live.get("days") == days
+                    and _p_matches_live(_live.get("params") or {}, p)
+                    and time.time() - _live.get("computed_at", 0) < TF_SECONDS.get(tf, 900) * 3):
+                live = _live
+
+            if live is not None:
+                with opt_lock:
+                    chart_state = opt_state.get("chart") or {}
+                at_sig = chart_state.get("auto_trade_sig") if chart_state.get("sym") == sym else None
+                try:
+                    self._json({"candles": live["candles"], "signals": live["signals"],
+                                "bull_obs": live["bull_obs"], "bear_obs": live["bear_obs"],
+                                "fvg_bull": live["fvg_bull"], "fvg_bear": live["fvg_bear"],
+                                "tl_upper": live["tl_upper"], "tl_lower": live["tl_lower"],
+                                "tl_upos": live["tl_upos"], "tl_dnos": live["tl_dnos"],
+                                "metrics": live["metrics"],
+                                "auto_trade_sig": at_sig, "live_source": True})
+                except Exception as e:
+                    self._json({"error": "serialize error: " + str(e)})
+                return
+
+            candles = _fetch_candles(sym, tf, days)
+            if not candles:
+                self._json({"error": "no data"}); return
             result = _simulate(candles, p, sl_pct=sl_p, tp_pct=tp_p, _collect=True)
             if not result:
                 self._json({"error": "simulation failed"}); return
@@ -7689,7 +7787,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                             "tl_upper": result.get("tl_upper",[]), "tl_lower": result.get("tl_lower",[]),
                             "tl_upos": result.get("tl_upos",[]), "tl_dnos": result.get("tl_dnos",[]),
                             "metrics": {k: float(result[k]) for k in ("trades","winrate","profit_factor","max_dd","total_return","fitness","rr") if k in result},
-                            "auto_trade_sig": at_sig})
+                            "auto_trade_sig": at_sig, "live_source": False})
             except Exception as e:
                 self._json({"error": "serialize error: " + str(e)})
         elif self.path == "/gate_cfg":
