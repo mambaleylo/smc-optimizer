@@ -1,5 +1,21 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.83
+- v3.52.83: Правки №1 и №3 из списка находок самопроверки серии v3.52.79.
+  1) _save_best_config больше не сравнивает новый fitness с сырым числом,
+     записанным в JSON под старой формулой (до штрафа за сложность). Если
+     переданы candles+risk_pct (сейчас — в живом run_optimizer), старый
+     сохранённый конфиг пересчитывается заново на том же окне под текущую
+     формулу перед сравнением — яблоки к яблокам. Без них (сканер многих
+     монет) — прежнее поведение.
+  3) _ensemble_agree больше не берёт последний сигнал кандидата вслепую —
+     теперь считается только currently-open позиция или сигнал не старше
+     fresh_tolerance_bars=2 баров от конца окна. Протухший сигнал (сделка
+     закрылась давно, случайно совпало направление) просто исключается из
+     подсчёта — это не согласие и не несогласие, у кандидата попросту нет
+     мнения о текущем моменте.
+  Автопроверка AST по всему файлу (все вызовы _xxx(...) сверены со списком
+  реально определённых функций) — других осиротевших кусков не найдено.
 SMC Optimizer v3.52.82
 - v3.52.82: Именно та ошибка, которую v3.52.81 теперь умеет ловить и
   показывать вместо тихого зависания: NameError: name '_crossover' is not
@@ -1627,7 +1643,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.82"
+APP_VERSION  = "3.52.83"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -4165,13 +4181,26 @@ def _fee_stress_check(candles, params, risk_pct, fitness_weights=None, fee_multi
 # совпадает ли их последний сигнал по направлению с тем, что торгует бот —
 # согласие большинства снижает зависимость от единственной точки поиска.
 def _ensemble_agree(candles, current_params, current_dir, risk_pct, top20,
-                     fitness_weights=None, top_k=3):
+                     fitness_weights=None, top_k=3, fresh_tolerance_bars=2):
     """Возвращает (agree, total_checked, detail). Сверяет current_dir с
     направлением ПОСЛЕДНЕГО сигнала (открытого или закрытого) у до top_k
     других конфигов из top20 (пропускает те, что params-идентичны текущему).
     total_checked=0 (в top20 попросту нет других непохожих конфигов, например
     только что стартовавший перебор) — не блокирует, вызывающий код должен
-    трактовать это как fail-open."""
+    трактовать это как fail-open.
+
+    v3.52.83: раньше брался sigs[-1] БЕЗ проверки свежести — это могла быть
+    закрытая сделка недельной давности, случайно совпавшая направлением, а
+    вовсе не "конфиг X СЕЙЧАС тоже считает это валидной точкой входа".
+    Теперь считается согласным/несогласным только кандидат, чей последний
+    сигнал либо всё ещё открыт (open=True — реально держит позицию прямо
+    сейчас), либо вошёл не позже fresh_tolerance_bars баров назад от конца
+    текущего окна свечей — то же самое "сейчас" с точностью до пары баров,
+    а не "когда-то в истории". Кандидаты с протухшим последним сигналом
+    просто исключаются из подсчёта (не идут ни в agree, ни в checked) —
+    у них попросту нет мнения о текущем моменте, это не то же самое, что
+    несогласие."""
+    n = len(candles)
     checked = 0
     agree   = 0
     details = []
@@ -4187,11 +4216,17 @@ def _ensemble_agree(candles, current_params, current_dir, risk_pct, top20,
         sigs = r.get("signals") or []
         if not sigs:
             continue
-        cand_dir = sigs[-1]["dir"]
+        last_sig = sigs[-1]
+        _is_open  = bool(last_sig.get("open"))
+        _entry_i  = last_sig.get("entry_i", -10**9)
+        _is_fresh = _is_open or (n - 1 - _entry_i) <= fresh_tolerance_bars
+        if not _is_fresh:
+            continue  # протухший сигнал — у кандидата нет мнения о СЕЙЧАС, не считаем
+        cand_dir = last_sig["dir"]
         checked += 1
         if cand_dir == current_dir:
             agree += 1
-        details.append(f"{cand_dir}")
+        details.append(f"{cand_dir}{'(откр.)' if _is_open else ''}")
     detail = f"{agree}/{checked} конфигов из топ20 согласны ({', '.join(details) if details else '—'})"
     return agree, checked, detail
 
@@ -4404,9 +4439,23 @@ def _load_best_config_for(symbol, tf):
     data = _load_best_configs()
     return data.get(_best_cfg_key(symbol, tf))
 
-def _save_best_config(symbol, tf, params, result):
+def _save_best_config(symbol, tf, params, result, candles=None, risk_pct=None):
     """Сохраняет params+result, если они лучше уже сохранённых для этого symbol+tf
-    (сравнение по fitness). Атомарная запись через .tmp + os.replace()."""
+    (сравнение по fitness). Атомарная запись через .tmp + os.replace().
+
+    v3.52.83: раньше new_fit сравнивался напрямую с числом, буквально
+    записанным в JSON много версий назад — под СТАРОЙ формулой fitness. С
+    v3.52.79 в формулу входит штраф за сложность конфига (2+ активных
+    фильтра режут fitness на 3-15%). Конфиги, сохранённые ДО этого штрафа,
+    имели fitness завышенным относительно новой формулы — из-за этого
+    новые, честно посчитанные (со штрафом) кандидаты почти никогда не
+    проходили сравнение `new_fit <= old_fit`, даже будучи объективно лучше:
+    файл теплого старта "залипал" на устаревшем числе. Если переданы
+    candles+risk_pct — старый сохранённый конфиг пересчитывается ЗАНОВО на
+    ТОМ ЖЕ окне свечей, что и новый кандидат, под ТЕКУЩУЮ формулу — сравнение
+    честное, яблоки к яблокам, а не старое число к новому. Без candles/
+    risk_pct (например у сканера множества монет, где это неудобно
+    прокидывать) — прежнее поведение, сравнение с сырым числом из файла."""
     if not result or not isinstance(result, dict):
         return
     try:
@@ -4415,7 +4464,16 @@ def _save_best_config(symbol, tf, params, result):
         with _best_cfg_lock:
             data = _load_best_configs()
             old = data.get(key)
-            old_fit = float(old["result"].get("fitness", 0.0)) if old else -1e18
+            old_fit = -1e18
+            if old is not None:
+                old_fit = float(old["result"].get("fitness", 0.0))
+                if candles is not None and risk_pct is not None and old.get("params"):
+                    try:
+                        _old_fresh = _simulate(candles, old["params"], risk_pct=risk_pct)
+                        if _old_fresh:
+                            old_fit = float(_old_fresh["fitness"])
+                    except Exception:
+                        pass  # не пересчиталось — сравниваем со старым сырым числом, не блокируем сохранение
             if old is not None and new_fit <= old_fit:
                 return  # не лучше — не перезаписываем
             data[key] = {
@@ -5404,7 +5462,7 @@ def run_optimizer():
                             _pending_announce = (nb_p, nb_r)
                             # v3.52.32: персистим лучший конфиг для symbol+tf на диск —
                             # следующий запуск перебора стартует от него.
-                            _save_best_config(sym, tf, nb_p, nb_r)
+                            _save_best_config(sym, tf, nb_p, nb_r, candles=candles, risk_pct=risk)
                             # v3.52.38: обновляем элиты по отдельным метрикам
                             if _elite_wr is None or nb_r.get("winrate",0) > _elite_wr["result"].get("winrate",0):
                                 _elite_wr = {"params": nb_p, "result": nb_r}
