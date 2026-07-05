@@ -1,5 +1,21 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.87
+- v3.52.87: Ещё два места того же класса проблемы, что и v3.52.86 (алерт
+  раньше времени / без дедупликации), найдены по прямому запросу — "есть
+  подобные проблемы очередности?":
+  1) У перенесённой в v3.52.86 проверки чужой позиции по другой паре не
+     было флага-дедупликации (foreign_gate_alerted) — пока висит ОДНА И ТА
+     ЖЕ чужая позиция, каждый новый сигнал, прошедший все гейты, слал
+     ОТДЕЛЬНЫЙ алерт про одно и то же условие. Добавлена дедупликация по
+     аналогии с cycle/wf/ensemble_gate_alerted, со сбросом когда чужих
+     позиций больше не найдено (чтобы будущий НОВЫЙ конфликт снова
+     заалертил).
+  2) Ветка "чужая позиция на своём же символе, но против сигнала" (кто-то
+     вручную открыл позицию в другую сторону) вообще не проходит через
+     MIN_CYCLES/walk-forward/ансамбль (структурно другая ветка) И не имела
+     дедупликации — алертила на каждую смену сырого сигнала. Добавлен
+     conflict_gate_alerted с тем же сбросом при исчезновении конфликта.
 SMC Optimizer v3.52.86
 - v3.52.86: Проверка "нет ли позиции по другой паре" перенесена в самый
   конец — после MIN_CYCLES/walk-forward/ансамбля, прямо перед реальным
@@ -1667,7 +1683,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.86"
+APP_VERSION  = "3.52.87"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -2659,6 +2675,8 @@ def _auto_trade_loop():
     cycle_gate_alerted = False  # чтобы не спамить алертом каждую свечу
     wf_gate_alerted    = False  # отдельный алерт-флаг для провала OOS walk-forward (п.2)
     ensemble_gate_alerted = False  # v3.52.79: алерт-флаг для провала ансамблевой сверки
+    foreign_gate_alerted  = False  # v3.52.87: алерт-флаг для чужой позиции по другой паре
+    conflict_gate_alerted = False  # v3.52.87: алерт-флаг для чужой позиции ПРОТИВ сигнала на своём же символе
 
     # v3.52.79: живой мониторинг деградации уже торгующего конфига. Раньше
     # _wf_validate проверял params только ОДИН РАЗ — в момент входа в
@@ -2696,6 +2714,8 @@ def _auto_trade_loop():
                     p = new_p
                     wf_gate_alerted = False  # новые params — провал старых не должен душить алерт новых
                     ensemble_gate_alerted = False
+                    foreign_gate_alerted  = False
+                    conflict_gate_alerted = False
             candles = _fetch_candles(sym, tf, days)
 
             # v3.52.79: живой мониторинг деградации — раз в
@@ -2985,11 +3005,18 @@ def _auto_trade_loop():
                                         # просто предупреждаем
                                         olog(f"⚠ Чужая позиция {existing['dir'].upper()} против "
                                              f"сигнала {direction.upper()} — не трогаем")
-                                        _send_alert(
-                                            f"⚠️ <b>{sym}</b> — чужая позиция "
-                                            f"{existing['dir'].upper()} против сигнала "
-                                            f"{direction.upper()}\nЗакрой вручную или отключи авто-трейд"
-                                        )
+                                        # v3.52.87: та же дедупликация, что у cycle/wf/ensemble/
+                                        # foreign_gate_alerted — раньше здесь алерт слался на
+                                        # КАЖДУЮ смену сырого сигнала, пока висит одна и та же
+                                        # встречная позиция на этом же символе (например открытая
+                                        # вручную) — спам о фактически одном и том же условии.
+                                        if not conflict_gate_alerted:
+                                            _send_alert(
+                                                f"⚠️ <b>{sym}</b> — чужая позиция "
+                                                f"{existing['dir'].upper()} против сигнала "
+                                                f"{direction.upper()}\nЗакрой вручную или отключи авто-трейд"
+                                            )
+                                            conflict_gate_alerted = True
                                         with auto_trade_lock:
                                             auto_trade_state["last_entry_ts"] = entry_ts
                                 elif existing and existing["dir"] == direction:
@@ -3026,6 +3053,7 @@ def _auto_trade_loop():
                                     else:
                                         with opt_lock:
                                             cur_cycle = opt_state.get("cycle", 0)
+                                        conflict_gate_alerted = False  # v3.52.87: конфликта на своём символе сейчас нет — сброс для будущего
                                         if cur_cycle < MIN_CYCLES_BEFORE_TRADE:
                                             olog(f"🚫 Сигнал {direction.upper()} отфильтрован — "
                                                  f"оптимизатор прошёл только {cur_cycle}/"
@@ -3139,21 +3167,31 @@ def _auto_trade_loop():
                                                             if _sz != 0 and _c != contract_us:
                                                                 olog(f"⚠ Пропуск сигнала — на бирже "
                                                                      f"открыта позиция по другой паре: {_c}")
-                                                                _send_alert(
-                                                                    f"⚠️ <b>{sym}</b> — сигнал "
-                                                                    f"{direction.upper()} пропущен\n"
-                                                                    f"Entry {_fmt_px(entry_px)} · "
-                                                                    f"SL {_fmt_px(sl_px)} · TP {_fmt_px(tp_px)}\n"
-                                                                    f"Прошёл все проверки (циклы/walk-forward/"
-                                                                    f"ансамбль), но на бирже уже открыта "
-                                                                    f"позиция по другой паре: {_c}\n"
-                                                                    f"Закрой её вручную чтобы авто-трейд мог "
-                                                                    f"работать."
-                                                                )
+                                                                # v3.52.87: дедупликация как у cycle/wf/
+                                                                # ensemble_gate_alerted — иначе пока висит
+                                                                # ОДНА И ТА ЖЕ чужая позиция, каждый новый
+                                                                # сигнал, прошедший гейты, шлёт ОТДЕЛЬНЫЙ
+                                                                # алерт про одно и то же условие.
+                                                                if not foreign_gate_alerted:
+                                                                    _send_alert(
+                                                                        f"⚠️ <b>{sym}</b> — сигнал "
+                                                                        f"{direction.upper()} пропущен\n"
+                                                                        f"Entry {_fmt_px(entry_px)} · "
+                                                                        f"SL {_fmt_px(sl_px)} · TP {_fmt_px(tp_px)}\n"
+                                                                        f"Прошёл все проверки (циклы/walk-forward/"
+                                                                        f"ансамбль), но на бирже уже открыта "
+                                                                        f"позиция по другой паре: {_c}\n"
+                                                                        f"Закрой её вручную чтобы авто-трейд мог "
+                                                                        f"работать."
+                                                                    )
+                                                                    foreign_gate_alerted = True
                                                                 _foreign_skip = True
                                                                 break
                                                 except Exception as _fe:
                                                     olog(f"⚠ Проверка чужих позиций: {_fe}")
+
+                                                if not _foreign_skip:
+                                                    foreign_gate_alerted = False  # v3.52.87: чужих позиций сейчас нет — сброс для будущего
 
                                                 if _foreign_skip:
                                                     with auto_trade_lock:
