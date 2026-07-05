@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.86
+- v3.52.86: Проверка "нет ли позиции по другой паре" перенесена в самый
+  конец — после MIN_CYCLES/walk-forward/ансамбля, прямо перед реальным
+  открытием. Раньше она стояла в начале обработки любого нового сигнала и
+  алертила на каждый сырой sigs[-1], включая мимолётные сигналы, которые
+  сам бот всё равно отфильтровал бы циклами/OOS/ансамблем на следующем шаге
+  — из-за этого при висящей чужой позиции подряд прилетало несколько разных
+  "сигнал X пропущен", хотя ни один из них реально не дошёл бы до открытия.
+  Теперь алерт только для сигнала, который ДЕЙСТВИТЕЛЬНО был бы открыт
+  прямо сейчас, если бы не чужая позиция — и текст явно об этом говорит
+  ("прошёл все проверки, но...").
 SMC Optimizer v3.52.85
 - v3.52.85: Алерт "сигнал пропущен — позиция по другой паре" теперь
   показывает Entry/SL/TP, а не только направление — по одному слову
@@ -1656,7 +1667,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.85"
+APP_VERSION  = "3.52.86"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -2856,43 +2867,7 @@ def _auto_trade_loop():
                             with auto_trade_lock:
                                 our_pos = auto_trade_state.get("position")
 
-                            # ── Позиция по другой паре ─────────────────────
-                            # Если на бирже открыта позиция НЕ по нашему
-                            # символу (другой телефон торгует ETH пока мы
-                            # смотрим BTC) — просто пропускаем сигнал,
-                            # не трогаем чужую сделку.
-                            contract_us = sym.replace("/", "_").upper()
                             _foreign_skip = False
-                            try:
-                                all_pos = _gate_req("GET", "/futures/usdt/positions")
-                                if isinstance(all_pos, list):
-                                    for _p in all_pos:
-                                        _c = _p.get("contract", "")
-                                        _sz = float(_p.get("size", 0))
-                                        if _sz != 0 and _c != contract_us:
-                                            olog(f"⚠ Пропуск сигнала — на бирже открыта "
-                                                 f"позиция по другой паре: {_c}")
-                                            # v3.52.85: раньше алерт показывал только
-                                            # направление ("сигнал SHORT пропущен") без
-                                            # entry/SL/TP — по такому сообщению нельзя
-                                            # было отличить реально найденный сетап от
-                                            # гипотетического глюка. entry_px/sl_px/tp_px
-                                            # уже вычислены чуть выше по коду (это те же
-                                            # числа, что бот использовал бы для реального
-                                            # входа) — просто добавляем их в текст.
-                                            _send_alert(
-                                                f"⚠️ <b>{sym}</b> — сигнал {direction.upper()} пропущен\n"
-                                                f"Entry {_fmt_px(entry_px)} · SL {_fmt_px(sl_px)} · "
-                                                f"TP {_fmt_px(tp_px)}\n"
-                                                f"На бирже уже открыта позиция по другой паре: {_c}\n"
-                                                f"Закрой её вручную чтобы авто-трейд мог работать."
-                                            )
-                                            _foreign_skip = True
-                                            break
-                            except Exception as _fe:
-                                olog(f"⚠ Проверка чужих позиций: {_fe}")
-
-
                             if not _foreign_skip:
                                 if existing and our_pos is None:
                                     same_dir = existing["dir"] == direction
@@ -3138,6 +3113,52 @@ def _auto_trade_loop():
                                                 if _ens_checked:
                                                     olog(f"✅ Ансамбль: {_ens_detail}")
                                                 candles_for_open_skip = False
+
+                                            if not candles_for_open_skip:
+                                                # v3.52.86: проверку "нет ли открытой позиции по
+                                                # другой паре" перенесли СЮДА — в самый конец,
+                                                # после MIN_CYCLES/walk-forward/ансамбля. Раньше
+                                                # она стояла в начале обработки любого нового
+                                                # сигнала и алертила на КАЖДЫЙ сырой sigs[-1] —
+                                                # включая мимолётные сигналы, которые сам бот бы
+                                                # всё равно отфильтровал циклами/OOS/ансамблем на
+                                                # следующем шаге. С учётом того что sigs[-1] может
+                                                # меняться от свечи к свече ещё до полного
+                                                # подтверждения, это давало нескольких разных
+                                                # "сигнал X пропущен" подряд, хотя ни один из них
+                                                # реально не дошёл бы до открытия. Теперь алерт
+                                                # только для сигнала, который ДЕЙСТВИТЕЛЬНО был бы
+                                                # открыт прямо сейчас, если бы не чужая позиция.
+                                                contract_us = sym.replace("/", "_").upper()
+                                                try:
+                                                    all_pos = _gate_req("GET", "/futures/usdt/positions")
+                                                    if isinstance(all_pos, list):
+                                                        for _p in all_pos:
+                                                            _c = _p.get("contract", "")
+                                                            _sz = float(_p.get("size", 0))
+                                                            if _sz != 0 and _c != contract_us:
+                                                                olog(f"⚠ Пропуск сигнала — на бирже "
+                                                                     f"открыта позиция по другой паре: {_c}")
+                                                                _send_alert(
+                                                                    f"⚠️ <b>{sym}</b> — сигнал "
+                                                                    f"{direction.upper()} пропущен\n"
+                                                                    f"Entry {_fmt_px(entry_px)} · "
+                                                                    f"SL {_fmt_px(sl_px)} · TP {_fmt_px(tp_px)}\n"
+                                                                    f"Прошёл все проверки (циклы/walk-forward/"
+                                                                    f"ансамбль), но на бирже уже открыта "
+                                                                    f"позиция по другой паре: {_c}\n"
+                                                                    f"Закрой её вручную чтобы авто-трейд мог "
+                                                                    f"работать."
+                                                                )
+                                                                _foreign_skip = True
+                                                                break
+                                                except Exception as _fe:
+                                                    olog(f"⚠ Проверка чужих позиций: {_fe}")
+
+                                                if _foreign_skip:
+                                                    with auto_trade_lock:
+                                                        auto_trade_state["last_entry_ts"] = entry_ts
+                                                    candles_for_open_skip = True
 
                                             if not candles_for_open_skip:
                                                 olog(f"🤖 Новый сигнал: {direction.upper()} "
