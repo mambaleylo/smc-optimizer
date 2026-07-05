@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.80
+- v3.52.80: КРИТИЧНЫЙ ХОТФИКС на серию v3.52.79. Найден при самопроверке +
+  подтверждён живым зависанием перебора на 64-й попытке. Причина: новый
+  flatness/fee-stress-check блок (синк best в авто-трейд) не был обёрнут в
+  try/except, а весь run_optimizer() и без того не имеет внешнего
+  try/except вокруг тела цикла (защищён только fut.result() отдельно).
+  Любое исключение внутри этого блока — молча убивало ВЕСЬ поток
+  оптимизатора насмерть; opt_state["running"] при этом никогда не
+  сбрасывался в False (это делается только в конце функции), так что UI
+  вечно показывал "цикл N / M попыток" замороженным ровно на том месте,
+  где поток умер. Снаружи выглядело как "завис на попытке N" — молча,
+  без единого сообщения об ошибке в логе. Теперь этот блок обёрнут в
+  try/except: любая ошибка здесь просто пропускает синк в авто-трейд в
+  этот раз (с логом причины) вместо смерти всего перебора.
 SMC Optimizer v3.52.79
 - v3.52.79: Серия из 7 улучшений устойчивости конфигов против переобучения.
   1) _wf_validate теперь проверяет НЕСКОЛЬКО непересекающихся OOS-окон
@@ -1590,7 +1604,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.79"
+APP_VERSION  = "3.52.80"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -5386,20 +5400,37 @@ def run_optimizer():
                                 _at_tf  = auto_trade_state["tf"]
                                 _at_syn = auto_trade_state.get("auto_sync")
                             if _at_on and _at_syn and _at_sym == sym and _at_tf == tf:
-                                # v3.52.79: перед тем как отдать живому авто-трейду
-                                # новый "лучший" конфиг, проверяем не острый ли это
-                                # одиночный пик (см. _flatness_score выше) — если
-                                # соседние по параметрам конфиги резко проседают по
-                                # fitness, это симптом подгонки под шум конкретного
-                                # окна, а не устойчивой закономерности. fail-open:
-                                # если проверка не смогла посчитаться (None) — не
-                                # блокируем, ведём себя как раньше.
-                                with fitness_w_lock:
-                                    _fw_flat = dict(FITNESS_WEIGHTS)
-                                _flat_score, _flat_detail = _flatness_score(
-                                    candles, nb_p, risk, nb_r["fitness"], fitness_weights=_fw_flat)
-                                _fee_ok, _fee_detail = _fee_stress_check(
-                                    candles, nb_p, risk, fitness_weights=_fw_flat)
+                                # v3.52.80: КРИТИЧНЫЙ ФИКС — этот блок (введён в
+                                # v3.52.79) не был обёрнут в try/except, а весь
+                                # остальной цикл run_optimizer тоже без внешнего
+                                # try/except (защищён только fut.result() чуть
+                                # выше). Любое необработанное исключение здесь —
+                                # например ValueError из _neighbour()'s
+                                # vals.index(p[k]), если у какого-то categorical/
+                                # bool параметра значение не найдено в списке
+                                # PARAM_SPACE (могло случиться на конфиге,
+                                # загруженном из старого сохранённого файла с
+                                # другой схемой) — тихо убивало ВЕСЬ поток
+                                # оптимизатора насмерть. opt_state["running"]
+                                # при этом никогда не сбрасывался в False (это
+                                # делается только в конце функции), так что UI
+                                # вечно показывал "цикл N / M попыток" замороженным
+                                # на том месте, где поток умер — снаружи выглядит
+                                # как "завис на попытке N". Теперь любая ошибка
+                                # здесь — это просто "не смогли проверить, пропускаем
+                                # эту защиту в этот раз", а не смерть всего перебора.
+                                try:
+                                    with fitness_w_lock:
+                                        _fw_flat = dict(FITNESS_WEIGHTS)
+                                    _flat_score, _flat_detail = _flatness_score(
+                                        candles, nb_p, risk, nb_r["fitness"], fitness_weights=_fw_flat)
+                                    _fee_ok, _fee_detail = _fee_stress_check(
+                                        candles, nb_p, risk, fitness_weights=_fw_flat)
+                                except Exception as _stab_e:
+                                    olog(f"⚠ Проверка стабильности перед синком в авто-трейд "
+                                         f"не удалась ({_stab_e}) — синкаю без неё")
+                                    _flat_score, _flat_detail = None, None
+                                    _fee_ok, _fee_detail = None, None
                                 if _flat_score is not None and _flat_score < 0.55:
                                     olog(f"⏸ Новый best НЕ отправлен в авто-трейд {sym} {tf} — "
                                          f"похоже на острый переобученный пик ({_flat_detail}), "
