@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.88
+- v3.52.88: Мониторинг батареи устройства. Фоновый поток раз в 60с читает
+  заряд через `termux-battery-status` (пакет termux-api + приложение
+  Termux:API — без него мониторинг молча выключается, ничего не ломая).
+  При заряде <10% и НЕ на зарядке — форсирует эко-режим перебора (меньше
+  параллелизма, паузы между циклами — то же самое, что и обычный эко-режим
+  от стагнации, просто другой триггер) и шлёт алерт в Телеграм/ntfy. При
+  возврате заряда ≥10% (или подключении зарядки) — форсирование снимается,
+  управление эко-режимом возвращается к обычной логике цикл/стагнация,
+  алерт о восстановлении тоже шлётся. Порог и интервал проверки —
+  константы BATTERY_LOW_THRESHOLD_PCT/BATTERY_CHECK_INTERVAL_SEC.
 SMC Optimizer v3.52.87
 - v3.52.87: Ещё два места того же класса проблемы, что и v3.52.86 (алерт
   раньше времени / без дедупликации), найдены по прямому запросу — "есть
@@ -1663,7 +1674,7 @@ SMC Optimizer v3.43
   (а не просто фиксирует факт отправки HTTP-запроса), для ntfy — код ответа.
   Эндпоинты: GET /alert_cfg, POST /alert_cfg, POST /alert_test.
 """
-import os, sys, json, time, math, random, threading, base64, hashlib
+import os, sys, json, time, math, random, threading, base64, hashlib, subprocess
 import multiprocessing
 import http.server, urllib.request, urllib.parse
 from functools import lru_cache
@@ -1683,7 +1694,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.87"
+APP_VERSION  = "3.52.88"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -1798,6 +1809,14 @@ opt_state  = {
 }
 _stop_flag = threading.Event()
 _opt_thread = None
+
+# v3.52.88: глобальный флаг "батарея разряжена" — читается run_optimizer()
+# (форсирует эко-режим) и пишется фоновым _battery_monitor_loop(). Event, а
+# не просто bool под локом — набор потоков читает его на каждом цикле,
+# is_set()/set()/clear() атомарны сами по себе, отдельный лок не нужен.
+_battery_low = threading.Event()
+BATTERY_LOW_THRESHOLD_PCT  = 10
+BATTERY_CHECK_INTERVAL_SEC = 60
 
 screener_lock  = threading.Lock()
 screener_state = {
@@ -4408,6 +4427,79 @@ def _send_alert(msg):
             time.sleep(5)
     threading.Thread(target=_do_send, daemon=True).start()
 
+# v3.52.88: мониторинг батареи устройства (Termux). Читаем через
+# `termux-battery-status` (часть пакета Termux:API — `pkg install
+# termux-api` + отдельное приложение Termux:API из F-Droid/GitHub; без него
+# команда просто не найдётся, и мониторинг молча выключается, ничего не
+# ломая). При заряде ниже BATTERY_LOW_THRESHOLD_PCT% и НЕ на зарядке —
+# форсируем эко-режим перебора (run_optimizer читает _battery_low через
+# `eco_mode = _stagnation_eco or _battery_low.is_set()`) и шлём алерт.
+# При возврате заряда выше порога (или подключении зарядки) — снимаем
+# форсирование, эко-режим возвращается под управление обычной логики
+# цикл/стагнация, шлём алерт о восстановлении.
+def _get_battery_pct():
+    """Возвращает (percentage:int|None, plugged:bool). None — не удалось
+    прочитать (Termux:API не установлен, таймаут, битый JSON и т.п.)."""
+    try:
+        r = subprocess.run(["termux-battery-status"], capture_output=True,
+                            text=True, timeout=8)
+        if r.returncode != 0 or not r.stdout.strip():
+            return None, False
+        data = json.loads(r.stdout)
+        pct = int(data.get("percentage", -1))
+        status = str(data.get("status", "")).upper()  # CHARGING/DISCHARGING/FULL/NOT_CHARGING
+        plugged = status in ("CHARGING", "FULL")
+        if pct < 0:
+            return None, False
+        return pct, plugged
+    except FileNotFoundError:
+        return None, False  # Termux:API не установлен
+    except Exception:
+        return None, False
+
+def _battery_monitor_loop():
+    _was_low       = False
+    _no_api_warned = False
+    while True:
+        try:
+            pct, plugged = _get_battery_pct()
+            if pct is None:
+                if not _no_api_warned:
+                    olog("⚠ Мониторинг батареи выключен — termux-battery-status "
+                         "недоступен (нужен пакет termux-api + приложение Termux:API)")
+                    _no_api_warned = True
+            elif pct < BATTERY_LOW_THRESHOLD_PCT and not plugged:
+                _battery_low.set()
+                if not _was_low:
+                    _was_low = True
+                    olog(f"🔋 Батарея {pct}% (не на зарядке) — принудительно "
+                         f"включаю эко-режим перебора")
+                    _send_alert(
+                        f"🔋 <b>Батарея {pct}%</b> — принудительно включён "
+                        f"эконом-режим перебора (меньше параллелизма, паузы "
+                        f"между циклами), чтобы устройство не грелось и дольше "
+                        f"продержалось на разряде.\n"
+                        f"Вернётся в норму сам, когда заряд поднимется выше "
+                        f"{BATTERY_LOW_THRESHOLD_PCT}% или подключится зарядка."
+                    )
+            else:
+                if _was_low:
+                    _was_low = False
+                    _battery_low.clear()
+                    _reason = "заряжается" if plugged else f"{pct}% ≥ {BATTERY_LOW_THRESHOLD_PCT}%"
+                    olog(f"🔋 Батарея восстановлена ({_reason}) — принудительный "
+                         f"эко-режим снят, управление вернулось к обычной логике "
+                         f"цикл/стагнация")
+                    _send_alert(
+                        f"🔋 <b>Батарея {pct}%</b>{' (на зарядке)' if plugged else ''} — "
+                        f"принудительный эконом-режим снят."
+                    )
+                else:
+                    _battery_low.clear()
+        except Exception as e:
+            olog(f"⚠ Мониторинг батареи: {e}")
+        time.sleep(BATTERY_CHECK_INTERVAL_SEC)
+
 def _load_alert_cfg():
     """Подхватывает сохранённые TG/ntfy настройки из файла (приоритет над env)."""
     global TG_TOKEN, TG_CHAT, NTFY_URL, WATCHDOG_ENABLED, WATCHDOG_TIMEOUT_MIN, HC_URL
@@ -5270,7 +5362,12 @@ def run_optimizer():
             # STEPS адаптируется к температуре: горячо → широкое покрытие
             # (меньше шагов в одной точке), холодно → глубокая эксплуатация
             STEPS = int(STEPS_MIN + (STEPS_MAX - STEPS_MIN) * (1.0 - min(temp, 1.0)))
-            eco_mode = (cycle >= ECO_MIN_CYCLE) and (no_improve >= ECO_AFTER_STAGNATION)
+            _stagnation_eco = (cycle >= ECO_MIN_CYCLE) and (no_improve >= ECO_AFTER_STAGNATION)
+            # v3.52.88: при разряженной батарее эко-режим форсируется
+            # независимо от цикла/стагнации — см. _battery_monitor_loop().
+            # Эффекты те же самые (меньше воркеров, паузы между циклами),
+            # что и так экономят энергию/тепло — просто триггер другой.
+            eco_mode = _stagnation_eco or _battery_low.is_set()
             with opt_lock:
                 opt_state["cycle"] = cycle
                 opt_state["eco_mode"] = eco_mode
@@ -5335,8 +5432,12 @@ def run_optimizer():
 
             if eco_mode and not _eco_announced:
                 _eco_announced = True
-                olog(f"🌡 Цикл {cycle}: стагнация {no_improve} циклов — включён эко-режим "
-                     f"(меньше параллелизма, паузы между циклами)")
+                if _battery_low.is_set():
+                    olog(f"🔋 Цикл {cycle}: эко-режим включён (низкий заряд батареи) — "
+                         f"меньше параллелизма, паузы между циклами")
+                else:
+                    olog(f"🌡 Цикл {cycle}: стагнация {no_improve} циклов — включён эко-режим "
+                         f"(меньше параллелизма, паузы между циклами)")
             elif not eco_mode and _eco_announced:
                 _eco_announced = False
                 olog(f"⚡ Цикл {cycle}: новый best — эко-режим выключен, возврат к полной скорости")
@@ -8827,6 +8928,7 @@ def main():
     _load_last_symbol()
     threading.Thread(target=_watchdog_loop, daemon=True).start()
     threading.Thread(target=_heartbeat_loop, daemon=True).start()
+    threading.Thread(target=_battery_monitor_loop, daemon=True).start()
 
     server = http.server.ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print(f"{_C_GRN}SMC Optimizer v{APP_VERSION} — http://0.0.0.0:{PORT}{_C_RST}", flush=True)
