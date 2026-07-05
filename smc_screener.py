@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.90
+- v3.52.90: Мониторинг батареи (v3.52.88) не срабатывал, если Termux:API
+  не установлен — единственный способ чтения был через
+  termux-battery-status. Теперь основной способ — прямое чтение sysfs
+  (/sys/class/power_supply/battery/capacity + .../status), которое НЕ
+  требует Termux:API вообще (тот же подход, что в wickfill/screener_pro.py)
+  и работает без рута на большинстве Android. termux-battery-status остался
+  как fallback, если sysfs недоступен на конкретной прошивке.
 SMC Optimizer v3.52.89
 - v3.52.89: Дефолт "Дней истории" изменён с 30 на 60 везде, где он был
   захардкожен — поле на вкладке Оптимизатор, поле "Дней" на графике,
@@ -1701,7 +1709,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.89"
+APP_VERSION  = "3.52.90"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -4446,7 +4454,34 @@ def _send_alert(msg):
 # цикл/стагнация, шлём алерт о восстановлении.
 def _get_battery_pct():
     """Возвращает (percentage:int|None, plugged:bool). None — не удалось
-    прочитать (Termux:API не установлен, таймаут, битый JSON и т.п.)."""
+    прочитать никаким способом.
+
+    v3.52.90: сначала пробуем читать sysfs напрямую
+    (/sys/class/power_supply/battery/capacity) — это НЕ требует Termux:API
+    вообще, обычный файл, читаемый без рута на большинстве Android (тот же
+    подход, что и в wickfill/screener_pro.py). termux-battery-status
+    используем только как fallback — если sysfs недоступен (некоторые
+    прошивки/ROM закрывают путь через SELinux), а Termux:API всё же
+    установлен."""
+    for cap_path, status_path in (
+        ("/sys/class/power_supply/battery/capacity", "/sys/class/power_supply/battery/status"),
+        ("/sys/class/power_supply/bms/capacity",     "/sys/class/power_supply/bms/status"),
+    ):
+        try:
+            with open(cap_path) as f:
+                pct = int(f.read().strip())
+            if not (0 <= pct <= 100):
+                continue
+            plugged = False
+            try:
+                with open(status_path) as f:
+                    plugged = f.read().strip().upper() in ("CHARGING", "FULL")
+            except Exception:
+                pass  # статус не прочитался — считаем "не на зарядке" (безопаснее для порога)
+            return pct, plugged
+        except Exception:
+            continue
+    # Fallback — требует пакета termux-api + приложения Termux:API
     try:
         r = subprocess.run(["termux-battery-status"], capture_output=True,
                             text=True, timeout=8)
@@ -4460,7 +4495,7 @@ def _get_battery_pct():
             return None, False
         return pct, plugged
     except FileNotFoundError:
-        return None, False  # Termux:API не установлен
+        return None, False  # Termux:API не установлен — и sysfs не сработал
     except Exception:
         return None, False
 
@@ -4472,8 +4507,10 @@ def _battery_monitor_loop():
             pct, plugged = _get_battery_pct()
             if pct is None:
                 if not _no_api_warned:
-                    olog("⚠ Мониторинг батареи выключен — termux-battery-status "
-                         "недоступен (нужен пакет termux-api + приложение Termux:API)")
+                    olog("⚠ Мониторинг батареи выключен — не удалось прочитать "
+                         "ни /sys/class/power_supply/battery/capacity, ни "
+                         "termux-battery-status (для второго нужен пакет termux-api "
+                         "+ приложение Termux:API)")
                     _no_api_warned = True
             elif pct < BATTERY_LOW_THRESHOLD_PCT and not plugged:
                 _battery_low.set()
