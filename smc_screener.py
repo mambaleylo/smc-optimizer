@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.91
+- v3.52.91: И sysfs, и termux-battery-status (хотя Termux:API стоял)
+  провалились у пользователя — сообщение в логе было общей фразой без
+  причины, продиагностировать было невозможно. Два фикса:
+  1) sysfs-часть больше не проверяет только фиксированные имена
+     battery/bms — перебирает ВСЕ записи /sys/class/power_supply/ и берёт
+     ту, чей файл `type` равен "Battery". Разные вендоры называют его
+     по-разному (battery/bms/fg/main/...) — фиксированный список имён не
+     мог покрыть все устройства.
+  2) Добавлена диагностика (_battery_diag) — при провале обоих способов лог
+     теперь показывает КОНКРЕТНУЮ причину: какие power_supply были найдены
+     и почему не подошли, какой exit-код/stderr у termux-battery-status,
+     таймаут это или файл не найден. Сбрасывается при следующем успешном
+     чтении, чтобы будущий сбой с новой причиной не потерялся молча.
 SMC Optimizer v3.52.90
 - v3.52.90: Мониторинг батареи (v3.52.88) не срабатывал, если Termux:API
   не установлен — единственный способ чтения был через
@@ -1709,7 +1723,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.90"
+APP_VERSION  = "3.52.91"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -4452,51 +4466,81 @@ def _send_alert(msg):
 # При возврате заряда выше порога (или подключении зарядки) — снимаем
 # форсирование, эко-режим возвращается под управление обычной логики
 # цикл/стагнация, шлём алерт о восстановлении.
+_battery_diag = ""  # v3.52.91: последняя причина сбоя чтения батареи, для диагностики в логе
+
 def _get_battery_pct():
     """Возвращает (percentage:int|None, plugged:bool). None — не удалось
-    прочитать никаким способом.
+    прочитать никаким способом. Причина последнего сбоя кладётся в
+    глобальный _battery_diag — раньше при провале обоих способов лог
+    показывал одну и ту же общую фразу без объяснения, что именно не так
+    (нет такого пути в sysfs? termux-api стоит, но падает с ошибкой?),
+    и продиагностировать по логу было невозможно.
 
-    v3.52.90: сначала пробуем читать sysfs напрямую
-    (/sys/class/power_supply/battery/capacity) — это НЕ требует Termux:API
-    вообще, обычный файл, читаемый без рута на большинстве Android (тот же
-    подход, что и в wickfill/screener_pro.py). termux-battery-status
-    используем только как fallback — если sysfs недоступен (некоторые
-    прошивки/ROM закрывают путь через SELinux), а Termux:API всё же
-    установлен."""
-    for cap_path, status_path in (
-        ("/sys/class/power_supply/battery/capacity", "/sys/class/power_supply/battery/status"),
-        ("/sys/class/power_supply/bms/capacity",     "/sys/class/power_supply/bms/status"),
-    ):
+    v3.52.91: sysfs-часть переписана — раньше проверялись только два
+    ЗАФИКСИРОВАННЫХ имени (battery/bms), которых просто может не быть на
+    конкретном устройстве (у разных вендоров это battery/bms/fg/main и
+    т.п.). Теперь перебираются ВСЕ записи /sys/class/power_supply/ и
+    выбирается та, чей файл `type` равен "Battery" — не зависит от того,
+    как конкретный вендор назвал сам power_supply."""
+    global _battery_diag
+    # 1) sysfs — не требует Termux:API вообще, обычные файлы, читаемые без
+    # рута на большинстве Android (тот же подход, что в wickfill/screener_pro.py).
+    try:
+        base = "/sys/class/power_supply"
+        entries = os.listdir(base)
+    except Exception as e:
+        entries = []
+        _battery_diag = f"sysfs: {base} недоступен ({e})"
+    for name in entries:
         try:
-            with open(cap_path) as f:
+            with open(f"{base}/{name}/type") as f:
+                if f.read().strip().upper() != "BATTERY":
+                    continue
+            with open(f"{base}/{name}/capacity") as f:
                 pct = int(f.read().strip())
             if not (0 <= pct <= 100):
                 continue
             plugged = False
             try:
-                with open(status_path) as f:
+                with open(f"{base}/{name}/status") as f:
                     plugged = f.read().strip().upper() in ("CHARGING", "FULL")
             except Exception:
                 pass  # статус не прочитался — считаем "не на зарядке" (безопаснее для порога)
             return pct, plugged
-        except Exception:
+        except Exception as e:
+            _battery_diag = f"sysfs {name}: {e}"
             continue
-    # Fallback — требует пакета termux-api + приложения Termux:API
+    if not entries:
+        pass  # диагностика уже записана выше
+    elif not _battery_diag:
+        _battery_diag = (f"sysfs: ни один из {len(entries)} power_supply "
+                          f"({', '.join(entries) or '—'}) не дал type=Battery")
+    # 2) Fallback — требует пакета termux-api + приложения Termux:API
     try:
         r = subprocess.run(["termux-battery-status"], capture_output=True,
                             text=True, timeout=8)
-        if r.returncode != 0 or not r.stdout.strip():
+        if r.returncode != 0:
+            _battery_diag += f" | termux-battery-status: код {r.returncode}, stderr={r.stderr.strip()[:200]}"
+            return None, False
+        if not r.stdout.strip():
+            _battery_diag += " | termux-battery-status: пустой вывод (не подтверждён доступ в приложении Termux:API?)"
             return None, False
         data = json.loads(r.stdout)
         pct = int(data.get("percentage", -1))
         status = str(data.get("status", "")).upper()  # CHARGING/DISCHARGING/FULL/NOT_CHARGING
         plugged = status in ("CHARGING", "FULL")
         if pct < 0:
+            _battery_diag += f" | termux-battery-status: нет поля percentage в ответе ({r.stdout.strip()[:200]})"
             return None, False
         return pct, plugged
     except FileNotFoundError:
-        return None, False  # Termux:API не установлен — и sysfs не сработал
-    except Exception:
+        _battery_diag += " | termux-battery-status: команда не найдена (пакет termux-api не установлен)"
+        return None, False
+    except subprocess.TimeoutExpired:
+        _battery_diag += " | termux-battery-status: таймаут 8с (приложение Termux:API не отвечает)"
+        return None, False
+    except Exception as e:
+        _battery_diag += f" | termux-battery-status: {e}"
         return None, False
 
 def _battery_monitor_loop():
@@ -4505,12 +4549,11 @@ def _battery_monitor_loop():
     while True:
         try:
             pct, plugged = _get_battery_pct()
+            if pct is not None:
+                _no_api_warned = False  # v3.52.91: успех — сброс, чтобы будущий сбой снова залогировался
             if pct is None:
                 if not _no_api_warned:
-                    olog("⚠ Мониторинг батареи выключен — не удалось прочитать "
-                         "ни /sys/class/power_supply/battery/capacity, ни "
-                         "termux-battery-status (для второго нужен пакет termux-api "
-                         "+ приложение Termux:API)")
+                    olog(f"⚠ Мониторинг батареи не смог прочитать заряд: {_battery_diag or 'причина неизвестна'}")
                     _no_api_warned = True
             elif pct < BATTERY_LOW_THRESHOLD_PCT and not plugged:
                 _battery_low.set()
