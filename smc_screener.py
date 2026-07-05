@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.84
+- v3.52.84: Косметика, не баг. При Ctrl+C ProcessPoolExecutor'а воркеры тоже
+  получают SIGINT (вся группа процессов) прямо посреди _simulate — это
+  порождало страшную портянку RemoteTraceback/KeyboardInterrupt в терминале
+  из потока run_optimizer (это BaseException, не Exception — except из
+  v3.52.81 его сознательно не ловил, и правильно: это ожидаемая остановка).
+  Теперь отдельный except KeyboardInterrupt печатает один спокойный лог
+  вместо трейсбека. Поведение при Ctrl+C не изменилось — только вывод.
 SMC Optimizer v3.52.83
 - v3.52.83: Правки №1 и №3 из списка находок самопроверки серии v3.52.79.
   1) _save_best_config больше не сравнивает новый fitness с сырым числом,
@@ -1643,7 +1651,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.83"
+APP_VERSION  = "3.52.84"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -5539,6 +5547,17 @@ def run_optimizer():
             if eco_mode:
                 _stop_flag.wait(timeout=ECO_CYCLE_PAUSE)
 
+    except KeyboardInterrupt:
+        # v3.52.84: Ctrl+C шлёт SIGINT всей группе процессов — не только
+        # главному, но и дочерним воркерам ProcessPoolExecutor, которые в
+        # этот момент считают _simulate. Воркер получает свой KeyboardInterrupt,
+        # concurrent.futures заворачивает его в RemoteTraceback и перевыбрасывает
+        # здесь при fut.result() — раньше это печаталось в терминал как
+        # страшная портянка необработанного трейсбека потока (KeyboardInterrupt
+        # это BaseException, не Exception — except ниже его не ловит и
+        # правильно делает, это ожидаемая остановка, а не баг). Теперь вместо
+        # портянки — один спокойный лог.
+        olog("⏹ Перебор остановлен (Ctrl+C)")
     except Exception as e:
         # v3.52.80: КОРНЕВОЙ ФИКС категории бага "зависает на попытке N".
         # Раньше у этого try было только finally — БЕЗ except. Любое
