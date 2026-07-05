@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.89
+- v3.52.89: Дефолт "Дней истории" изменён с 30 на 60 везде, где он был
+  захардкожен — поле на вкладке Оптимизатор, поле "Дней" на графике,
+  дефолты /scan, /scan_all, /chart_monitor_start, /auto_trade_start,
+  /chart_data, и начальные значения opt_state/screener_state/
+  chart_mon_state/auto_trade_state. "Окно обуч. дней" (simTrainDays, другая
+  сущность — окно для вкладки "Симуляция") намеренно не тронуто.
 SMC Optimizer v3.52.88
 - v3.52.88: Мониторинг батареи устройства. Фоновый поток раз в 60с читает
   заряд через `termux-battery-status` (пакет termux-api + приложение
@@ -1694,7 +1701,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.88"
+APP_VERSION  = "3.52.89"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -1801,7 +1808,7 @@ _weight_tune_thread = None
 opt_state  = {
     "running": False, "logs": [], "best": None, "top20": [],
     "cycle": 0, "trials": 0, "progress": 0,
-    "symbol": "BTC_USDT", "tf": "15m", "days": 30,
+    "symbol": "BTC_USDT", "tf": "15m", "days": 60,
     "sl_pct": 0.6, "tp_pct": 1.0, "risk_pct": 10.0,
     "offset_days": 0,
     "chart": None, "fetch_pct": 0, "logs_dropped": 0,
@@ -1823,7 +1830,7 @@ screener_state = {
     "running": False, "done": False,
     "current_sym": "", "sym_index": 0, "sym_total": 0,
     "current_cycle": 0, "max_cycles": 100,
-    "results": [], "tf":"15m", "days":30,
+    "results": [], "tf":"15m", "days":60,
     "sl_pct":0.6, "tp_pct":1.0, "risk_pct":10.0,
     "active_workers": {},  # sym -> {"cycle": N, "max_cycles": 100, "phase": "fetch"|"opt"}
 }
@@ -1848,7 +1855,7 @@ _periodstab_thread = None
 # и шлёт алерт в Telegram (по аналогии с WickFill)
 chart_mon_lock  = threading.Lock()
 chart_mon_state = {
-    "active": False, "symbol": None, "tf": None, "days": 30,
+    "active": False, "symbol": None, "tf": None, "days": 60,
     "params": None, "armed": False,
     "last_entry_ts": None, "last_dir": None, "last_check": 0,
     "start_ts": 0,   # время запуска монитора — сигналы старше не считаются новыми
@@ -1861,7 +1868,7 @@ import hmac, hashlib, urllib.parse as _uparse
 
 auto_trade_lock  = threading.Lock()
 auto_trade_state = {
-    "enabled": False, "symbol": None, "tf": None, "days": 30, "params": None,
+    "enabled": False, "symbol": None, "tf": None, "days": 60, "params": None,
     "risk_pct": 10.0,         # риск на сделку %
     "position_pct": 95.0,     # % депозита в маржу
     "position": None,         # текущая открытая позиция: {dir, entry, sl, tp, size, order_ids}
@@ -6118,7 +6125,7 @@ input:focus,select:focus{outline:none;border-color:var(--accent)}
       <option>1m</option><option>5m</option><option selected>15m</option>
       <option>30m</option><option>1h</option><option>4h</option><option>1d</option>
     </select>
-    <label>Дней истории</label><input id="days" type="number" value="30" min="7" max="365">
+    <label>Дней истории</label><input id="days" type="number" value="60" min="7" max="365">
     <label title="Смещение окна в прошлое: 0 = последние N дней, 30 = N дней заканчивающихся 30 дней назад. Используй для OOS: обучи на [now-60д..now-30д] поставив Дней=30 Смещение=30, затем проверь в Симуляции на [now-30д..now].">Смещение (дней назад)</label><input id="offset_days" type="number" value="0" min="0" max="365" title="0 = последние N дней. N = окно заканчивается N дней назад.">
     <label>SL % (мин)</label><input id="sl_pct" type="number" value="0.6" step="0.05">
     <label>SL % (макс)</label><input id="max_sl_pct" type="number" value="1" step="0.05">
@@ -6223,7 +6230,7 @@ input:focus,select:focus{outline:none;border-color:var(--accent)}
       <option value="1m">1m</option><option value="5m">5m</option><option value="15m" selected>15m</option>
       <option value="30m">30m</option><option value="1h">1h</option><option value="4h">4h</option><option value="1d">1d</option>
     </select></label>
-    <label>Дней<input id="cDays" type="number" value="30" min="1" max="60" style="width:60px" oninput="_chartBreakFollow()"></label>
+    <label>Дней<input id="cDays" type="number" value="60" min="1" max="60" style="width:60px" oninput="_chartBreakFollow()"></label>
     <label>Swing<input id="cSwing" type="number" value="10" min="3" max="50" style="width:60px" oninput="_chartBreakFollow()"></label>
     <label>SL%<input id="cSl" type="number" value="0.6" step="0.1" style="width:60px" oninput="_chartBreakFollow()"></label>
     <label>TP%<input id="cTp" type="number" value="1.0" step="0.1" style="width:60px" oninput="_chartBreakFollow()"></label>
@@ -8431,7 +8438,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return qf(name, default).lower() in ("true","1","yes")
             sym  = qf("sym",  "BTC_USDT")
             tf   = qf("tf",   "15m")
-            days = int(float(qf("days", 7)))
+            days = int(float(qf("days", 60)))
             sl_p = float(qf("sl",  0.8))
             tp_p = float(qf("tp",  1.6))
             p = {"swing_len": int(float(qf("swing", 10))),
@@ -8625,7 +8632,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "eco_mode": False,
                     "symbol": _scan_symbol,
                     "tf":     body.get("tf","15m"),
-                    "days":   body.get("days",30),
+                    "days":   body.get("days",60),
                     "sl_pct": body.get("sl_pct",0.6),
                     "tp_pct": body.get("tp_pct",1.0),
                     "max_sl_pct": body.get("max_sl_pct",1.0),
@@ -8653,7 +8660,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     screener_state.update({
                         "running":True,"done":False,
                         "tf":body.get("tf","15m"),
-                        "days":int(body.get("days",30)),
+                        "days":int(body.get("days",60)),
                         "sl_pct":float(body.get("sl_pct",0.6)),
                         "tp_pct":float(body.get("tp_pct",1.0)),
                         "max_sl_pct":float(body.get("max_sl_pct",1.0)),
@@ -8677,7 +8684,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             global _chart_mon_thread
             sym  = body.get("sym", "BTC_USDT")
             tf   = body.get("tf", "15m")
-            days = int(body.get("days", 30))
+            days = int(body.get("days", 60))
             p    = dict(body.get("params") or {})
             if "sl_pct" not in p: p["sl_pct"] = body.get("sl", 0.8)
             if "tp_pct" not in p: p["tp_pct"] = body.get("tp", 1.6)
@@ -8819,7 +8826,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             global _auto_trade_thread
             sym      = body.get("sym",      "BTC_USDT")
             tf       = body.get("tf",       "15m")
-            days     = int(body.get("days", 30))
+            days     = int(body.get("days", 60))
             risk_pct     = float(body.get("risk_pct",     2.0))
             position_pct = float(body.get("position_pct", 10.0))
             auto_sync    = bool(body.get("auto_sync", False))
