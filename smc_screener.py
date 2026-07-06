@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.94
+- v3.52.94: Найдена вероятная реальная причина "сигнал был, а уведомления
+  про блокировку не было" — cycle/wf/ensemble/foreign/conflict_gate_alerted
+  (v3.52.79/86/87) были ОДНОРАЗОВЫМИ bool-флагами: "уже алертили — больше
+  никогда, пока не сменятся params". Если блокирующее условие (реальная
+  чужая позиция, реальный провал walk-forward) держится часами — после
+  самого первого алерта наступала полная тишина навсегда, хотя сигналы
+  продолжали появляться и блокироваться. Заменены на timestamp последнего
+  алерта каждого типа + GATE_ALERT_COOLDOWN_SEC=2ч — теперь напоминание
+  повторяется раз в 2 часа, если условие всё ещё держится, вместо
+  однократного и тишины после.
 SMC Optimizer v3.52.93
 - v3.52.93: КРИТИЧНЫЙ ФИКС — у РЕАЛЬНОГО успешного открытия сделки (чистый
   новый вход, самый частый путь) не было ВООБЩЕ НИКАКОГО Телеграм-алерта.
@@ -1747,7 +1758,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.93"
+APP_VERSION  = "3.52.94"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -2744,11 +2755,19 @@ def _auto_trade_loop():
     # Запрет на открытие сделки пока оптимизатор не прошёл достаточно
     # циклов — параметры на малом числе циклов недостаточно проверены.
     MIN_CYCLES_BEFORE_TRADE = 150
-    cycle_gate_alerted = False  # чтобы не спамить алертом каждую свечу
-    wf_gate_alerted    = False  # отдельный алерт-флаг для провала OOS walk-forward (п.2)
-    ensemble_gate_alerted = False  # v3.52.79: алерт-флаг для провала ансамблевой сверки
-    foreign_gate_alerted  = False  # v3.52.87: алерт-флаг для чужой позиции по другой паре
-    conflict_gate_alerted = False  # v3.52.87: алерт-флаг для чужой позиции ПРОТИВ сигнала на своём же символе
+    GATE_ALERT_COOLDOWN_SEC = 2 * 3600  # v3.52.94: раз в 2 часа напоминаем, если условие блокировки всё ещё держится
+    # v3.52.94: раньше это были одноразовые bool-флаги ("уже алертили —
+    # больше никогда, пока не сменятся params") — если блокирующее
+    # условие держится часами (реальная чужая позиция, реальный провал
+    # walk-forward), после первого алерта наступала полная тишина,
+    # хотя сигналы продолжали блокироваться. Теперь это timestamp
+    # последнего алерта каждого типа — GATE_ALERT_COOLDOWN_SEC ниже
+    # решает, когда можно напомнить снова, а не "только один раз".
+    cycle_gate_alert_ts    = 0
+    wf_gate_alert_ts       = 0
+    ensemble_gate_alert_ts = 0
+    foreign_gate_alert_ts  = 0
+    conflict_gate_alert_ts = 0
 
     # v3.52.79: живой мониторинг деградации уже торгующего конфига. Раньше
     # _wf_validate проверял params только ОДИН РАЗ — в момент входа в
@@ -2784,10 +2803,10 @@ def _auto_trade_loop():
                     olog(f"🔁 Авто-трейд: параметры обновлены (синк с оптимизатором) — "
                          f"swing={new_p.get('swing_len')} SL={new_p.get('sl_pct')}% TP={new_p.get('tp_pct')}%")
                     p = new_p
-                    wf_gate_alerted = False  # новые params — провал старых не должен душить алерт новых
-                    ensemble_gate_alerted = False
-                    foreign_gate_alerted  = False
-                    conflict_gate_alerted = False
+                    wf_gate_alert_ts = 0  # новые params — провал старых не должен душить алерт новых
+                    ensemble_gate_alert_ts = 0
+                    foreign_gate_alert_ts  = 0
+                    conflict_gate_alert_ts = 0
             candles = _fetch_candles(sym, tf, days)
 
             # v3.52.79: живой мониторинг деградации — раз в
@@ -3082,13 +3101,13 @@ def _auto_trade_loop():
                                         # КАЖДУЮ смену сырого сигнала, пока висит одна и та же
                                         # встречная позиция на этом же символе (например открытая
                                         # вручную) — спам о фактически одном и том же условии.
-                                        if not conflict_gate_alerted:
+                                        if time.time() - conflict_gate_alert_ts > GATE_ALERT_COOLDOWN_SEC:
                                             _send_alert(
                                                 f"⚠️ <b>{sym}</b> — чужая позиция "
                                                 f"{existing['dir'].upper()} против сигнала "
                                                 f"{direction.upper()}\nЗакрой вручную или отключи авто-трейд"
                                             )
-                                            conflict_gate_alerted = True
+                                            conflict_gate_alert_ts = time.time()
                                         with auto_trade_lock:
                                             auto_trade_state["last_entry_ts"] = entry_ts
                                 elif existing and existing["dir"] == direction:
@@ -3125,7 +3144,7 @@ def _auto_trade_loop():
                                     else:
                                         with opt_lock:
                                             cur_cycle = opt_state.get("cycle", 0)
-                                        conflict_gate_alerted = False  # v3.52.87: конфликта на своём символе сейчас нет — сброс для будущего
+                                        conflict_gate_alert_ts = 0  # v3.52.87: конфликта на своём символе сейчас нет — сброс кулдауна
                                         if cur_cycle < MIN_CYCLES_BEFORE_TRADE:
                                             olog(f"🚫 Сигнал {direction.upper()} отфильтрован — "
                                                  f"оптимизатор прошёл только {cur_cycle}/"
@@ -3133,7 +3152,7 @@ def _auto_trade_loop():
                                                  f"окне — рано, поиск ещё не сошёлся. Сигнал помечается "
                                                  f"обработанным и НЕ откроет сделку, даже когда порог "
                                                  f"будет пройден — только следующий новый сигнал.")
-                                            if not cycle_gate_alerted:
+                                            if time.time() - cycle_gate_alert_ts > GATE_ALERT_COOLDOWN_SEC:
                                                 _send_alert(
                                                     f"🚫 <b>{sym}</b> — сигнал {direction.upper()} "
                                                     f"отфильтрован: оптимизатор прошёл только "
@@ -3141,7 +3160,7 @@ def _auto_trade_loop():
                                                     f"Авто-трейд начнёт открывать сделки только по "
                                                     f"сигналам, которые появятся ПОСЛЕ достижения порога."
                                                 )
-                                                cycle_gate_alerted = True
+                                                cycle_gate_alert_ts = time.time()
                                             # Помечаем сигнал как обработанный (как при обычном входе),
                                             # чтобы он не "ждал" и не открылся задним числом, когда
                                             # порог циклов будет пройден — это была бы сделка по
@@ -3164,14 +3183,14 @@ def _auto_trade_loop():
                                             olog(f"🚫 Сигнал {direction.upper()} отфильтрован — "
                                                  f"провалена walk-forward проверка на OOS-окне: "
                                                  f"{_wf_detail}. Сделка не открыта, ждём следующий сигнал.")
-                                            if not wf_gate_alerted:
+                                            if time.time() - wf_gate_alert_ts > GATE_ALERT_COOLDOWN_SEC:
                                                 _send_alert(
                                                     f"🚫 <b>{sym}</b> — сигнал {direction.upper()} "
                                                     f"отфильтрован walk-forward'ом: {_wf_detail}. "
                                                     f"Текущие params не подтвердились на данных, которые "
                                                     f"оптимизатор не видел — торговать ими рискованно."
                                                 )
-                                                wf_gate_alerted = True
+                                                wf_gate_alert_ts = time.time()
                                             with auto_trade_lock:
                                                 auto_trade_state["last_entry_ts"] = entry_ts
                                         else:
@@ -3199,13 +3218,13 @@ def _auto_trade_loop():
                                                 olog(f"🚫 Сигнал {direction.upper()} отфильтрован — "
                                                      f"ансамблевая сверка топ20 не согласна: {_ens_detail}. "
                                                      f"Сделка не открыта, ждём следующий сигнал.")
-                                                if not ensemble_gate_alerted:
+                                                if time.time() - ensemble_gate_alert_ts > GATE_ALERT_COOLDOWN_SEC:
                                                     _send_alert(
                                                         f"🚫 <b>{sym}</b> — сигнал {direction.upper()} "
                                                         f"отфильтрован ансамблем: {_ens_detail}. Слишком "
                                                         f"похоже на сигнал одного случайного конфига."
                                                     )
-                                                    ensemble_gate_alerted = True
+                                                    ensemble_gate_alert_ts = time.time()
                                                 with auto_trade_lock:
                                                     auto_trade_state["last_entry_ts"] = entry_ts
                                                 candles_for_open_skip = True
@@ -3244,7 +3263,7 @@ def _auto_trade_loop():
                                                                 # ОДНА И ТА ЖЕ чужая позиция, каждый новый
                                                                 # сигнал, прошедший гейты, шлёт ОТДЕЛЬНЫЙ
                                                                 # алерт про одно и то же условие.
-                                                                if not foreign_gate_alerted:
+                                                                if time.time() - foreign_gate_alert_ts > GATE_ALERT_COOLDOWN_SEC:
                                                                     _send_alert(
                                                                         f"⚠️ <b>{sym}</b> — сигнал "
                                                                         f"{direction.upper()} пропущен\n"
@@ -3256,14 +3275,14 @@ def _auto_trade_loop():
                                                                         f"Закрой её вручную чтобы авто-трейд мог "
                                                                         f"работать."
                                                                     )
-                                                                    foreign_gate_alerted = True
+                                                                    foreign_gate_alert_ts = time.time()
                                                                 _foreign_skip = True
                                                                 break
                                                 except Exception as _fe:
                                                     olog(f"⚠ Проверка чужих позиций: {_fe}")
 
                                                 if not _foreign_skip:
-                                                    foreign_gate_alerted = False  # v3.52.87: чужих позиций сейчас нет — сброс для будущего
+                                                    foreign_gate_alert_ts = 0  # v3.52.87: чужих позиций сейчас нет — сброс кулдауна
 
                                                 if _foreign_skip:
                                                     with auto_trade_lock:
