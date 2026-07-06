@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.92
+- v3.52.92: У пользователя ни sysfs (Permission denied — прошивка не
+  пускает даже листинг /sys/class/power_supply), ни termux-battery-status
+  (Termux:API не установлен как отдельное приложение, только пакет) не
+  работали — сервер был слеп к заряду батареи в принципе. В wickfill/
+  screener_pro.py та же задача решена иначе — батарея читается в БРАУЗЕРЕ
+  через navigator.getBattery() (Battery Status API), без всякого
+  Termux/sysfs. Добавлен тот же путь как ещё один источник: JS на странице
+  шлёт заряд на новый /battery_report при каждом изменении и раз в 60с,
+  сервер хранит последний отчёт (_battery_client) и использует его в
+  _get_battery_pct() как финальный fallback, если sysfs и termux-api оба
+  не сработали — с проверкой свежести (BATTERY_CLIENT_STALE_SEC=150с),
+  чтобы закрытая вкладка не давала протухшие показания навечно. Работает,
+  пока открыта хотя бы одна вкладка с интерфейсом в браузере.
 SMC Optimizer v3.52.91
 - v3.52.91: И sysfs, и termux-battery-status (хотя Termux:API стоял)
   провалились у пользователя — сообщение в логе было общей фразой без
@@ -1723,7 +1737,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.91"
+APP_VERSION  = "3.52.92"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -4468,6 +4482,19 @@ def _send_alert(msg):
 # цикл/стагнация, шлём алерт о восстановлении.
 _battery_diag = ""  # v3.52.91: последняя причина сбоя чтения батареи, для диагностики в логе
 
+# v3.52.92: раньше единственным источником заряда был сам сервер (sysfs /
+# termux-battery-status) — на устройствах, где ни то ни другое не работает
+# (permission denied на sysfs, Termux:API не отвечает — ровно случай
+# пользователя), мониторинг батареи был просто мёртв. В wickfill/
+# screener_pro.py батарея читается СОВСЕМ ИНАЧЕ — в браузере через
+# navigator.getBattery() (Battery Status API), без всякого Termux/sysfs.
+# Добавляем тот же путь как источник: браузер сам знает заряд и шлёт его
+# на /battery_report, пока открыта вкладка. _battery_monitor_loop ниже
+# использует это как ещё один источник, если sysfs/termux-api не сработали.
+_battery_client_lock = threading.Lock()
+_battery_client = {"pct": None, "plugged": False, "ts": 0}
+BATTERY_CLIENT_STALE_SEC = 150  # отчёт браузера считается свежим не дольше этого
+
 def _get_battery_pct():
     """Возвращает (percentage:int|None, plugged:bool). None — не удалось
     прочитать никаким способом. Причина последнего сбоя кладётся в
@@ -4521,27 +4548,47 @@ def _get_battery_pct():
                             text=True, timeout=8)
         if r.returncode != 0:
             _battery_diag += f" | termux-battery-status: код {r.returncode}, stderr={r.stderr.strip()[:200]}"
-            return None, False
+            return _battery_client_fallback()
         if not r.stdout.strip():
             _battery_diag += " | termux-battery-status: пустой вывод (не подтверждён доступ в приложении Termux:API?)"
-            return None, False
+            return _battery_client_fallback()
         data = json.loads(r.stdout)
         pct = int(data.get("percentage", -1))
         status = str(data.get("status", "")).upper()  # CHARGING/DISCHARGING/FULL/NOT_CHARGING
         plugged = status in ("CHARGING", "FULL")
         if pct < 0:
             _battery_diag += f" | termux-battery-status: нет поля percentage в ответе ({r.stdout.strip()[:200]})"
-            return None, False
+            return _battery_client_fallback()
         return pct, plugged
     except FileNotFoundError:
         _battery_diag += " | termux-battery-status: команда не найдена (пакет termux-api не установлен)"
-        return None, False
+        return _battery_client_fallback()
     except subprocess.TimeoutExpired:
         _battery_diag += " | termux-battery-status: таймаут 8с (приложение Termux:API не отвечает)"
-        return None, False
+        return _battery_client_fallback()
     except Exception as e:
         _battery_diag += f" | termux-battery-status: {e}"
+        return _battery_client_fallback()
+
+def _battery_client_fallback():
+    """v3.52.92: последний рубеж — свежий отчёт из браузера (см.
+    /battery_report и navigator.getBattery() в JS). Если ни sysfs, ни
+    termux-api не сработали (случай пользователя: sysfs Permission denied,
+    Termux:API вообще не установлен как приложение), но открыта вкладка в
+    браузере — используем её отчёт, пока он не старше BATTERY_CLIENT_STALE_SEC."""
+    global _battery_diag
+    with _battery_client_lock:
+        pct  = _battery_client["pct"]
+        plug = _battery_client["plugged"]
+        ts   = _battery_client["ts"]
+    if pct is None:
+        _battery_diag += " | браузер: отчётов ещё не было (открой вкладку с сайтом)"
         return None, False
+    age = time.time() - ts
+    if age > BATTERY_CLIENT_STALE_SEC:
+        _battery_diag += f" | браузер: последний отчёт устарел ({int(age)}с назад — вкладка закрыта?)"
+        return None, False
+    return pct, plug
 
 def _battery_monitor_loop():
     _was_low       = False
@@ -7434,6 +7481,32 @@ function pollGlobalStatus(){
 pollGlobalStatus();
 setInterval(pollGlobalStatus, 2000);
 
+// v3.52.92: батарея с браузера. На устройствах, где серверу недоступны ни
+// sysfs (Permission denied на некоторых прошивках), ни Termux:API (если не
+// поставлено отдельное приложение) — сервер сам заряд узнать не может.
+// В wickfill/screener_pro.py эта же задача решена иначе: браузер читает
+// заряд через navigator.getBattery() (Battery Status API) и просто
+// показывает его в шапке. Здесь дополнительно отсылаем это на сервер —
+// тогда фоновый _battery_monitor_loop() тоже видит заряд (пока открыта эта
+// вкладка) и может форсировать эко-режим/слать алерт, как и было задумано.
+(function(){
+  function _reportBattery(b){
+    fetch('/battery_report', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({pct: Math.round(b.level*100), plugged: !!b.charging})
+    }).catch(function(){});
+  }
+  if('getBattery' in navigator){
+    navigator.getBattery().then(function(b){
+      _reportBattery(b);
+      b.addEventListener('levelchange', function(){ _reportBattery(b); });
+      b.addEventListener('chargingchange', function(){ _reportBattery(b); });
+      setInterval(function(){ _reportBattery(b); }, 60000);
+    }).catch(function(){});
+  }
+})();
+
 /* ── Optimizer polling ── */
 var polling=null, lastLogTotal=0, logsDropped=0;
 
@@ -8728,6 +8801,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif self.path == "/scan_stop":
             _stop_flag.set()
             self._json({"ok":True})
+
+        elif self.path == "/battery_report":
+            # v3.52.92: браузер (navigator.getBattery(), см. JS) шлёт сюда
+            # заряд — используется как fallback-источник в _get_battery_pct(),
+            # если sysfs/termux-battery-status на сервере не работают
+            # (типичный случай: Termux:API не установлен как приложение,
+            # sysfs закрыт SELinux'ом конкретной прошивки).
+            try:
+                pct = int(body.get("pct", -1))
+                plugged = bool(body.get("plugged", False))
+                if 0 <= pct <= 100:
+                    with _battery_client_lock:
+                        _battery_client["pct"] = pct
+                        _battery_client["plugged"] = plugged
+                        _battery_client["ts"] = time.time()
+                self._json({"ok": True})
+            except Exception as e:
+                self._json({"ok": False, "error": str(e)})
 
         elif self.path == "/scan_all":
             try:
