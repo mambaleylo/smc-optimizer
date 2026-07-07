@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.95
+- v3.52.95: По замечанию пользователя — 2-часовой кулдаун (v3.52.94)
+  избыточен для foreign/conflict_gate: они и так срабатывают только на
+  КАЖДУЮ смену entry_ts (новый сигнал), не на каждую свечу, а foreign_gate
+  вдобавок стоит ПОСЛЕ MIN_CYCLES/walk-forward/ансамбля — то есть сигналы,
+  доходящие до него, уже редкие и значимые сами по себе. Убран таймер для
+  этих двух — теперь алертят на каждый новый сигнал напрямую. cycle/wf/
+  ensemble_gate остались на 2-часовом кулдауне — они цепляются к более
+  сырым, чаще меняющимся сигналам (до полной валидации), где алерт на
+  каждую смену рисковал бы спамом.
 SMC Optimizer v3.52.94
 - v3.52.94: Найдена вероятная реальная причина "сигнал был, а уведомления
   про блокировку не было" — cycle/wf/ensemble/foreign/conflict_gate_alerted
@@ -1758,7 +1768,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.94"
+APP_VERSION  = "3.52.95"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -2766,8 +2776,9 @@ def _auto_trade_loop():
     cycle_gate_alert_ts    = 0
     wf_gate_alert_ts       = 0
     ensemble_gate_alert_ts = 0
-    foreign_gate_alert_ts  = 0
-    conflict_gate_alert_ts = 0
+    # v3.52.95: foreign/conflict_gate больше не используют кулдаун вообще —
+    # алертят на каждый новый сигнал напрямую (см. ниже), переменные-таймеры
+    # для них убраны как мёртвые.
 
     # v3.52.79: живой мониторинг деградации уже торгующего конфига. Раньше
     # _wf_validate проверял params только ОДИН РАЗ — в момент входа в
@@ -2805,8 +2816,6 @@ def _auto_trade_loop():
                     p = new_p
                     wf_gate_alert_ts = 0  # новые params — провал старых не должен душить алерт новых
                     ensemble_gate_alert_ts = 0
-                    foreign_gate_alert_ts  = 0
-                    conflict_gate_alert_ts = 0
             candles = _fetch_candles(sym, tf, days)
 
             # v3.52.79: живой мониторинг деградации — раз в
@@ -3096,18 +3105,18 @@ def _auto_trade_loop():
                                         # просто предупреждаем
                                         olog(f"⚠ Чужая позиция {existing['dir'].upper()} против "
                                              f"сигнала {direction.upper()} — не трогаем")
-                                        # v3.52.87: та же дедупликация, что у cycle/wf/ensemble/
-                                        # foreign_gate_alerted — раньше здесь алерт слался на
-                                        # КАЖДУЮ смену сырого сигнала, пока висит одна и та же
-                                        # встречная позиция на этом же символе (например открытая
-                                        # вручную) — спам о фактически одном и том же условии.
-                                        if time.time() - conflict_gate_alert_ts > GATE_ALERT_COOLDOWN_SEC:
-                                            _send_alert(
-                                                f"⚠️ <b>{sym}</b> — чужая позиция "
-                                                f"{existing['dir'].upper()} против сигнала "
-                                                f"{direction.upper()}\nЗакрой вручную или отключи авто-трейд"
-                                            )
-                                            conflict_gate_alert_ts = time.time()
+                                        # v3.52.95: раньше был кулдаун 2ч (v3.52.94), как у
+                                        # cycle/wf/ensemble — но пользователь справедливо
+                                        # заметил: раз бот и так подходит к этому алерту только
+                                        # на КАЖДУЮ смену entry_ts (новый сигнал), а не на
+                                        # каждую свечу — таймер сверху лишний, естественная
+                                        # частота уже задаётся частотой появления новых
+                                        # сигналов. Алертим на каждый новый сигнал напрямую.
+                                        _send_alert(
+                                            f"⚠️ <b>{sym}</b> — чужая позиция "
+                                            f"{existing['dir'].upper()} против сигнала "
+                                            f"{direction.upper()}\nЗакрой вручную или отключи авто-трейд"
+                                        )
                                         with auto_trade_lock:
                                             auto_trade_state["last_entry_ts"] = entry_ts
                                 elif existing and existing["dir"] == direction:
@@ -3144,7 +3153,6 @@ def _auto_trade_loop():
                                     else:
                                         with opt_lock:
                                             cur_cycle = opt_state.get("cycle", 0)
-                                        conflict_gate_alert_ts = 0  # v3.52.87: конфликта на своём символе сейчас нет — сброс кулдауна
                                         if cur_cycle < MIN_CYCLES_BEFORE_TRADE:
                                             olog(f"🚫 Сигнал {direction.upper()} отфильтрован — "
                                                  f"оптимизатор прошёл только {cur_cycle}/"
@@ -3258,31 +3266,28 @@ def _auto_trade_loop():
                                                             if _sz != 0 and _c != contract_us:
                                                                 olog(f"⚠ Пропуск сигнала — на бирже "
                                                                      f"открыта позиция по другой паре: {_c}")
-                                                                # v3.52.87: дедупликация как у cycle/wf/
-                                                                # ensemble_gate_alerted — иначе пока висит
-                                                                # ОДНА И ТА ЖЕ чужая позиция, каждый новый
-                                                                # сигнал, прошедший гейты, шлёт ОТДЕЛЬНЫЙ
-                                                                # алерт про одно и то же условие.
-                                                                if time.time() - foreign_gate_alert_ts > GATE_ALERT_COOLDOWN_SEC:
-                                                                    _send_alert(
-                                                                        f"⚠️ <b>{sym}</b> — сигнал "
-                                                                        f"{direction.upper()} пропущен\n"
-                                                                        f"Entry {_fmt_px(entry_px)} · "
-                                                                        f"SL {_fmt_px(sl_px)} · TP {_fmt_px(tp_px)}\n"
-                                                                        f"Прошёл все проверки (циклы/walk-forward/"
-                                                                        f"ансамбль), но на бирже уже открыта "
-                                                                        f"позиция по другой паре: {_c}\n"
-                                                                        f"Закрой её вручную чтобы авто-трейд мог "
-                                                                        f"работать."
-                                                                    )
-                                                                    foreign_gate_alert_ts = time.time()
+                                                                # v3.52.95: раньше был кулдаун 2ч (v3.52.94) —
+                                                                # но этот сигнал уже прошёл ВСЕ проверки
+                                                                # (циклы/walk-forward/ансамбль) прежде чем
+                                                                # дойти сюда, так что "новый сигнал" здесь —
+                                                                # это уже значимое, редкое событие само по
+                                                                # себе. Таймер сверху не нужен, алертим на
+                                                                # каждый такой сигнал напрямую.
+                                                                _send_alert(
+                                                                    f"⚠️ <b>{sym}</b> — сигнал "
+                                                                    f"{direction.upper()} пропущен\n"
+                                                                    f"Entry {_fmt_px(entry_px)} · "
+                                                                    f"SL {_fmt_px(sl_px)} · TP {_fmt_px(tp_px)}\n"
+                                                                    f"Прошёл все проверки (циклы/walk-forward/"
+                                                                    f"ансамбль), но на бирже уже открыта "
+                                                                    f"позиция по другой паре: {_c}\n"
+                                                                    f"Закрой её вручную чтобы авто-трейд мог "
+                                                                    f"работать."
+                                                                )
                                                                 _foreign_skip = True
                                                                 break
                                                 except Exception as _fe:
                                                     olog(f"⚠ Проверка чужих позиций: {_fe}")
-
-                                                if not _foreign_skip:
-                                                    foreign_gate_alert_ts = 0  # v3.52.87: чужих позиций сейчас нет — сброс кулдауна
 
                                                 if _foreign_skip:
                                                     with auto_trade_lock:
