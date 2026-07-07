@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.96
+- v3.52.96: "Скриншот сделки" в Телеграм на каждый сигнальный алерт — даже
+  заблокированный (мало циклов, walk-forward/ансамбль не согласны, чужая
+  позиция). Сервер headless в Termux, браузер скриншотить негде — вместо
+  этого _render_signal_chart_png() рисует простую свечную картинку сам
+  (Pillow): окно свечей вокруг сигнала + горизонтальные линии entry/SL/TP.
+  _send_alert_photo() шлёт её через Telegram sendPhoto с тем же текстом в
+  caption; если Pillow не установлен или рендер не удался — тихо
+  откатывается на обычный текстовый _send_alert(), уведомление в любом
+  случае доходит. Подключено к cycle/wf/ensemble/foreign/conflict_gate и к
+  алерту успешного открытия — все 6 сигнальных алертов теперь с картинкой.
+  Требует `pip install pillow --break-system-packages` в Termux.
 SMC Optimizer v3.52.95
 - v3.52.95: По замечанию пользователя — 2-часовой кулдаун (v3.52.94)
   избыточен для foreign/conflict_gate: они и так срабатывают только на
@@ -1748,7 +1760,7 @@ SMC Optimizer v3.43
   (а не просто фиксирует факт отправки HTTP-запроса), для ntfy — код ответа.
   Эндпоинты: GET /alert_cfg, POST /alert_cfg, POST /alert_test.
 """
-import os, sys, json, time, math, random, threading, base64, hashlib, subprocess
+import os, sys, json, time, math, random, threading, base64, hashlib, subprocess, io
 import multiprocessing
 import http.server, urllib.request, urllib.parse
 from functools import lru_cache
@@ -1768,7 +1780,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.95"
+APP_VERSION  = "3.52.96"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -3112,7 +3124,12 @@ def _auto_trade_loop():
                                         # каждую свечу — таймер сверху лишний, естественная
                                         # частота уже задаётся частотой появления новых
                                         # сигналов. Алертим на каждый новый сигнал напрямую.
-                                        _send_alert(
+                                        # v3.52.96: скриншот сделки к каждому сигнальному алерту —
+                                        # даже заблокированному, по прямому запросу пользователя.
+                                        _send_alert_photo(
+                                            _render_signal_chart_png(
+                                                candles, {"dir": direction, "entry": entry_px,
+                                                          "sl": sl_px, "tp": tp_px}, sym, tf),
                                             f"⚠️ <b>{sym}</b> — чужая позиция "
                                             f"{existing['dir'].upper()} против сигнала "
                                             f"{direction.upper()}\nЗакрой вручную или отключи авто-трейд"
@@ -3161,7 +3178,10 @@ def _auto_trade_loop():
                                                  f"обработанным и НЕ откроет сделку, даже когда порог "
                                                  f"будет пройден — только следующий новый сигнал.")
                                             if time.time() - cycle_gate_alert_ts > GATE_ALERT_COOLDOWN_SEC:
-                                                _send_alert(
+                                                _send_alert_photo(
+                                                    _render_signal_chart_png(
+                                                        candles, {"dir": direction, "entry": entry_px,
+                                                                  "sl": sl_px, "tp": tp_px}, sym, tf),
                                                     f"🚫 <b>{sym}</b> — сигнал {direction.upper()} "
                                                     f"отфильтрован: оптимизатор прошёл только "
                                                     f"{cur_cycle}/{MIN_CYCLES_BEFORE_TRADE} циклов. "
@@ -3192,7 +3212,10 @@ def _auto_trade_loop():
                                                  f"провалена walk-forward проверка на OOS-окне: "
                                                  f"{_wf_detail}. Сделка не открыта, ждём следующий сигнал.")
                                             if time.time() - wf_gate_alert_ts > GATE_ALERT_COOLDOWN_SEC:
-                                                _send_alert(
+                                                _send_alert_photo(
+                                                    _render_signal_chart_png(
+                                                        candles, {"dir": direction, "entry": entry_px,
+                                                                  "sl": sl_px, "tp": tp_px}, sym, tf),
                                                     f"🚫 <b>{sym}</b> — сигнал {direction.upper()} "
                                                     f"отфильтрован walk-forward'ом: {_wf_detail}. "
                                                     f"Текущие params не подтвердились на данных, которые "
@@ -3227,7 +3250,10 @@ def _auto_trade_loop():
                                                      f"ансамблевая сверка топ20 не согласна: {_ens_detail}. "
                                                      f"Сделка не открыта, ждём следующий сигнал.")
                                                 if time.time() - ensemble_gate_alert_ts > GATE_ALERT_COOLDOWN_SEC:
-                                                    _send_alert(
+                                                    _send_alert_photo(
+                                                        _render_signal_chart_png(
+                                                            candles, {"dir": direction, "entry": entry_px,
+                                                                      "sl": sl_px, "tp": tp_px}, sym, tf),
                                                         f"🚫 <b>{sym}</b> — сигнал {direction.upper()} "
                                                         f"отфильтрован ансамблем: {_ens_detail}. Слишком "
                                                         f"похоже на сигнал одного случайного конфига."
@@ -3273,7 +3299,10 @@ def _auto_trade_loop():
                                                                 # это уже значимое, редкое событие само по
                                                                 # себе. Таймер сверху не нужен, алертим на
                                                                 # каждый такой сигнал напрямую.
-                                                                _send_alert(
+                                                                _send_alert_photo(
+                                                                    _render_signal_chart_png(
+                                                                        candles, {"dir": direction, "entry": entry_px,
+                                                                                  "sl": sl_px, "tp": tp_px}, sym, tf),
                                                                     f"⚠️ <b>{sym}</b> — сигнал "
                                                                     f"{direction.upper()} пропущен\n"
                                                                     f"Entry {_fmt_px(entry_px)} · "
@@ -3337,7 +3366,10 @@ def _auto_trade_loop():
                                                     # писалось только в olog() браузера, который никто не
                                                     # видит ночью/пока телефон в кармане. Ровно это и было
                                                     # причиной "сигнал был, а уведомление не пришло".
-                                                    _send_alert(
+                                                    _send_alert_photo(
+                                                        _render_signal_chart_png(
+                                                            candles, {"dir": direction, "entry": entry_px,
+                                                                      "sl": sl_px, "tp": tp_px}, sym, tf),
                                                         f"🤖 <b>{sym}</b> — открыта позиция {direction.upper()}\n"
                                                         f"Entry {_fmt_px(entry_px)} · SL {_fmt_px(sl_px)} · "
                                                         f"TP {_fmt_px(tp_px)}"
@@ -4516,6 +4548,131 @@ def _send_alert(msg):
             if sent or attempt == 3:
                 break
             time.sleep(5)
+    threading.Thread(target=_do_send, daemon=True).start()
+
+# v3.52.96: "скриншот сделки" в Телеграм на КАЖДЫЙ сигнал — даже
+# заблокированный (мало циклов, чужая позиция и т.п.), не только реально
+# открытые. Рендерим PNG сами (Pillow), без браузера — сервер headless в
+# Termux, скриншотить browser-canvas было бы негде. Простая свечная
+# картинка вокруг сигнала + горизонтальные линии entry/SL/TP.
+def _render_signal_chart_png(candles, sig, sym, tf):
+    """candles — список свечей (dict с t/open/high/low/close, как из
+    _fetch_candles). sig — dict с dir/entry/sl/tp/entry_i (entry_i
+    опционален — если нет, берём последнюю свечу окна). Возвращает bytes
+    PNG или None, если Pillow не установлен или данных недостаточно —
+    вызывающий код в этом случае просто шлёт текстовый алерт как раньше,
+    ничего не ломается."""
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        return None
+    try:
+        if not candles:
+            return None
+        entry_i = sig.get("entry_i")
+        if entry_i is None or not (0 <= entry_i < len(candles)):
+            entry_i = len(candles) - 1
+        lo = max(0, entry_i - 50)
+        hi = min(len(candles), entry_i + 16)
+        window = candles[lo:hi]
+        if len(window) < 2:
+            return None
+
+        def _g(c, *keys):
+            for k in keys:
+                if k in c: return c[k]
+            return 0
+
+        highs  = [_g(c, "high", "h") for c in window]
+        lows   = [_g(c, "low", "l") for c in window]
+        entry, sl, tp = sig.get("entry"), sig.get("sl"), sig.get("tp")
+        vals = highs + lows + [v for v in (entry, sl, tp) if v]
+        vmax, vmin = max(vals), min(vals)
+        if vmax <= vmin:
+            vmax = vmin + max(abs(vmin) * 0.001, 1e-9)
+
+        W, H = 960, 540
+        pad_l, pad_r, pad_t, pad_b = 16, 90, 46, 30
+        bg, grid, txt = (13, 13, 15), (40, 40, 44), (220, 220, 220)
+        green, red, white = (8, 153, 129), (242, 54, 69), (235, 235, 235)
+
+        img = Image.new("RGB", (W, H), bg)
+        d = ImageDraw.Draw(img)
+        try:
+            font = ImageFont.load_default()
+        except Exception:
+            font = None
+
+        def y_of(v):
+            return pad_t + (vmax - v) / (vmax - vmin) * (H - pad_t - pad_b)
+
+        n = len(window)
+        cw = (W - pad_l - pad_r) / n
+
+        for gy in range(5):
+            yy = pad_t + gy * (H - pad_t - pad_b) / 4
+            d.line([(pad_l, yy), (W - pad_r, yy)], fill=grid, width=1)
+
+        for i, c in enumerate(window):
+            o, h, l, cl = _g(c, "open", "o"), _g(c, "high", "h"), _g(c, "low", "l"), _g(c, "close", "c")
+            x = pad_l + i * cw
+            w = max(cw * 0.6, 1)
+            color = green if cl >= o else red
+            xc = x + w / 2
+            d.line([(xc, y_of(h)), (xc, y_of(l))], fill=color, width=2)
+            ytop, ybot = sorted([y_of(o), y_of(cl)])
+            if ybot - ytop < 1.5:
+                ybot = ytop + 1.5
+            d.rectangle([x, ytop, x + w, ybot], fill=color)
+
+        def hline(v, color, label):
+            if not v:
+                return
+            yy = y_of(v)
+            xseg = pad_l
+            while xseg < W - pad_r:
+                d.line([(xseg, yy), (min(xseg + 8, W - pad_r), yy)], fill=color, width=1)
+                xseg += 14
+            d.text((W - pad_r + 4, yy - 6), label, fill=color, font=font)
+
+        hline(entry, white, f"E {entry:.6g}" if entry else "")
+        hline(sl,    red,   f"SL {sl:.6g}" if sl else "")
+        hline(tp,    green, f"TP {tp:.6g}" if tp else "")
+
+        title = f"{sym} {tf} — {str(sig.get('dir','')).upper()}"
+        d.text((10, 8), title, fill=txt, font=font)
+
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+    except Exception as e:
+        olog(f"⚠ Рендер скриншота сигнала: {e}")
+        return None
+
+def _send_alert_photo(png_bytes, caption):
+    """Как _send_alert, но с картинкой (Telegram sendPhoto). Если
+    png_bytes нет (Pillow не установлен/ошибка рендера) — тихо откатывается
+    на обычный текстовый _send_alert, чтобы уведомление в любом случае
+    дошло хоть как-то."""
+    if not png_bytes:
+        _send_alert(caption)
+        return
+    def _do_send():
+        if TG_TOKEN and TG_CHAT:
+            try:
+                r = requests.post(
+                    f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto",
+                    data={"chat_id": TG_CHAT, "caption": caption, "parse_mode": "HTML"},
+                    files={"photo": ("signal.png", png_bytes, "image/png")},
+                    timeout=20)
+                if not r.ok:
+                    olog(f"⚠ TG фото HTTP {r.status_code} — шлю текстом")
+                    _send_alert(caption)
+            except Exception as e:
+                olog(f"⚠ TG фото: {e} — шлю текстом")
+                _send_alert(caption)
+        else:
+            _send_alert(caption)
     threading.Thread(target=_do_send, daemon=True).start()
 
 # v3.52.88: мониторинг батареи устройства (Termux). Читаем через
