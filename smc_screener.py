@@ -1780,7 +1780,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.97"
+APP_VERSION  = "3.52.96"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
