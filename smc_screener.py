@@ -1,5 +1,24 @@
 #!/usr/bin/env python3
 """
+SMC Optimizer v3.52.97
+- v3.52.97: Гейт на подмену live-конфига авто-трейда оптимизатором (auto_sync).
+  Раньше ЛЮБОЕ nfit>best_fit на тренировочном окне (даже на эпсилон) сразу
+  подменяло auto_trade_state["params"] — единственные проверки были
+  _flatness_score и _fee_stress_check, БЕЗ walk-forward OOS и БЕЗ порога
+  значимости улучшения. Итог (репорт пользователя): после пары стоп-лоссов
+  оптимизатор, продолжая перебор на том же окне (которое теперь включает
+  эти убытки), быстро находит конфиг, переподогнанный под то, чтобы их
+  избежать — и мгновенно подменяет боевые params. Визуально это выглядело
+  как "индикатор перерисовывает историю" — /chart_data берёт
+  auto_trade_live кэш, пересчитанный под новый конфиг, старые сигналы на
+  графике меняются, хотя реальные уже закрытые сделки это не отменяет.
+  Добавлен тройной гейт перед синком: (1) не чаще раза в
+  LIVE_SYNC_COOLDOWN_SEC (2 часа), (2) fitness должен быть лучше текущего
+  live не на эпсилон, а минимум на LIVE_SYNC_MIN_FIT_MARGIN (3%),
+  (3) новый конфиг обязан пройти тот же walk-forward OOS-гейт
+  (_wf_validate), что и реальный вход в сделку — переподгонка под
+  тренировочное окно чаще всего этот гейт не проходит. Любой из трёх
+  провалов — live конфиг остаётся прежним, олог объясняет причину.
 SMC Optimizer v3.52.96
 - v3.52.96: "Скриншот сделки" в Телеграм на каждый сигнальный алерт — даже
   заблокированный (мало циклов, walk-forward/ансамбль не согласны, чужая
@@ -1780,7 +1799,7 @@ except ImportError:
     os.system(f"{sys.executable} -m pip install requests -q")
     import requests
 
-APP_VERSION  = "3.52.96"
+APP_VERSION  = "3.52.97"
 
 # ── Проверка консистентности версии (защита от забытого обновления) ──────────
 def _check_version():
@@ -1967,7 +1986,11 @@ auto_trade_state = {
     "last_entry_ts": None,    # таймстемп свечи последнего сигнала
     "last_check": 0, "last_error": "",
     "auto_sync": True,        # подхватывать новый best от оптимизатора того же sym/tf на ходу
+    "last_sync_ts": 0,        # v3.52.97: когда live params последний раз подменялись
+    "last_sync_fit": None,    # fitness конфига, который сейчас торгует живьём
 }
+LIVE_SYNC_COOLDOWN_SEC   = 2 * 3600
+LIVE_SYNC_MIN_FIT_MARGIN = 0.03  # относительное улучшение, 3%
 _auto_trade_stop   = threading.Event()
 _auto_trade_thread = None
 
@@ -6036,6 +6059,13 @@ def run_optimizer():
                                          f"не удалась ({_stab_e}) — синкаю без неё")
                                     _flat_score, _flat_detail = None, None
                                     _fee_ok, _fee_detail = None, None
+                                with auto_trade_lock:
+                                    _last_sync_ts  = auto_trade_state.get("last_sync_ts", 0)
+                                    _last_sync_fit = auto_trade_state.get("last_sync_fit")
+                                _cooldown_left = LIVE_SYNC_COOLDOWN_SEC - (time.time() - _last_sync_ts)
+                                _margin_ok = (_last_sync_fit is None or _last_sync_fit <= 0
+                                              or nb_r["fitness"] >= _last_sync_fit * (1 + LIVE_SYNC_MIN_FIT_MARGIN))
+
                                 if _flat_score is not None and _flat_score < 0.55:
                                     olog(f"⏸ Новый best НЕ отправлен в авто-трейд {sym} {tf} — "
                                          f"похоже на острый переобученный пик ({_flat_detail}), "
@@ -6044,14 +6074,45 @@ def run_optimizer():
                                     olog(f"⏸ Новый best НЕ отправлен в авто-трейд {sym} {tf} — "
                                          f"не проходит стресс-тест по комиссии ({_fee_detail}), "
                                          f"живой конфиг оставлен прежним")
+                                elif _cooldown_left > 0:
+                                    olog(f"⏸ Новый best НЕ отправлен в авто-трейд {sym} {tf} — "
+                                         f"кулдаун смены live-конфига ещё {_cooldown_left/60:.0f} мин "
+                                         f"(fitness {nb_r['fitness']:.4f} vs текущий "
+                                         f"{_last_sync_fit if _last_sync_fit is not None else '—'})")
+                                elif not _margin_ok:
+                                    olog(f"⏸ Новый best НЕ отправлен в авто-трейд {sym} {tf} — "
+                                         f"улучшение fitness {nb_r['fitness']:.4f} vs "
+                                         f"{_last_sync_fit:.4f} меньше порога значимости "
+                                         f"{LIVE_SYNC_MIN_FIT_MARGIN*100:.0f}% (похоже на переподгонку "
+                                         f"под последние свечи, а не реальный прирост), живой конфиг "
+                                         f"оставлен прежним")
                                 else:
-                                    with auto_trade_lock:
-                                        auto_trade_state["params"] = dict(nb_p)
-                                    _flat_note = f" | {_flat_detail}" if _flat_score is not None else ""
-                                    _fee_note  = f" | {_fee_detail}" if _fee_ok is not None else ""
-                                    olog(f"🔁 Новый best отправлен в авто-трейд {sym} {tf} "
-                                         f"(swing={nb_p['swing_len']} SL={nb_p['sl_pct']}% TP={nb_p['tp_pct']}%)"
-                                         f"{_flat_note}{_fee_note}")
+                                    # v3.52.97: тот же OOS-гейт, что и перед реальным входом в
+                                    # сделку — новый конфиг должен подтвердиться на данных,
+                                    # которые оптимизатор не видел, а не только побеждать на
+                                    # тренировочном окне (которое как раз и содержит недавние
+                                    # убыточные сделки, под которые легко переподогнаться).
+                                    try:
+                                        _sync_wf_passed, _sync_wf_detail = _wf_validate(
+                                            sym, tf, nb_p, risk, train_days=days, train_offset=0,
+                                            n_trials=opt_state.get("trials", 0))
+                                    except Exception as _swfe:
+                                        _sync_wf_passed, _sync_wf_detail = None, str(_swfe)
+                                    if _sync_wf_passed is False:
+                                        olog(f"⏸ Новый best НЕ отправлен в авто-трейд {sym} {tf} — "
+                                             f"провален walk-forward OOS для live-синка: "
+                                             f"{_sync_wf_detail}, живой конфиг оставлен прежним")
+                                    else:
+                                        with auto_trade_lock:
+                                            auto_trade_state["params"]        = dict(nb_p)
+                                            auto_trade_state["last_sync_ts"]  = time.time()
+                                            auto_trade_state["last_sync_fit"] = nb_r["fitness"]
+                                        _flat_note = f" | {_flat_detail}" if _flat_score is not None else ""
+                                        _fee_note  = f" | {_fee_detail}" if _fee_ok is not None else ""
+                                        _wf_note   = f" | OOS: {_sync_wf_detail}" if _sync_wf_detail else ""
+                                        olog(f"🔁 Новый best отправлен в авто-трейд {sym} {tf} "
+                                             f"(swing={nb_p['swing_len']} SL={nb_p['sl_pct']}% TP={nb_p['tp_pct']}%)"
+                                             f"{_flat_note}{_fee_note}{_wf_note}")
 
                     steps_done += batch_size
                     if eco_mode:
